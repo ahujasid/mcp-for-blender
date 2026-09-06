@@ -250,10 +250,43 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             _blender_connection = None
         logger.info("BlenderMCP server shut down")
 
+# Guidance delivered to clients in the `initialize` response.
+#
+# The asset-library playbook lives in the asset_creation_strategy prompt, which
+# clients only receive if they call prompts/get. Many never do, so the rules that
+# keep generated scripts from breaking are repeated here. Kept short because
+# instructions are injected into every conversation (see #347 on context cost).
+SERVER_INSTRUCTIONS = """Blender MCP drives a live Blender instance. execute_blender_code runs
+arbitrary Python there, so scripts must not assume anything about the user's Blender.
+
+Before writing code, call get_addon_status() to read `blender_version` and get_scene_info() to
+see what already exists.
+
+When writing code:
+- Look shader nodes up by type, never by name. Node names are localized on a non-English Blender
+  UI, so `nodes["Principled BSDF"]` returns None there; use
+  `next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")` instead.
+- Never hardcode enum identifiers; they change between Blender versions. Read the valid values
+  first, e.g.
+  `[i.identifier for i in scene.render.image_settings.bl_rna.properties["file_format"].enum_items]`.
+- `scene.render.engine` is the exception: it is a dynamic enum and RNA under-reports it, because
+  engines registered by add-ons are not RNA enum items. Read the current value, which is always
+  valid, and if you must switch engines assign inside `try/except TypeError`; the error lists
+  every accepted identifier.
+- With `use_nodes` enabled (the default for new materials), set colors on the shader node inputs.
+  `material.diffuse_color` only drives viewport display and does not affect the render.
+
+After changing anything, call get_viewport_screenshot() to confirm the result looks right and
+get_scene_info() to confirm the objects exist.
+
+Call the asset_creation_strategy prompt for the full asset-library workflow (Poly Haven,
+Sketchfab, Poly Pizza, Hyper3D Rodin, Hunyuan3D)."""
+
 # Create the MCP server with lifespan support
 mcp = FastMCP(
     "BlenderMCP",
-    lifespan=server_lifespan
+    lifespan=server_lifespan,
+    instructions=SERVER_INSTRUCTIONS,
 )
 
 # Resource endpoints
@@ -1790,6 +1823,15 @@ def asset_creation_strategy() -> str:
     - Always call get_scene_info() after completing a task to verify the changes worked
     - When executing multiple operations, take intermediate screenshots to confirm each step
     - If something looks wrong in the screenshot or scene info, investigate and fix before proceeding
+
+    **Writing code that survives the user's Blender version and language:**
+    - Read `blender_version` from get_addon_status() before using version-sensitive APIs
+    - Look shader nodes up by type, not by name: `nodes["Principled BSDF"]` is None on a
+      localized (non-English) Blender UI
+    - Never hardcode enum identifiers; read the valid values from `bl_rna` first. `render.engine`
+      is the exception - RNA under-reports it, so read the current value or assign inside
+      `try/except TypeError` and use the identifiers listed in the error
+    - Set colors on shader node inputs; `material.diffuse_color` is viewport-only
     """
 
 # Main execution
