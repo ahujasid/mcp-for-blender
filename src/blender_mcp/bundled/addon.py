@@ -818,7 +818,8 @@ class BlenderMCPServer:
             hunyuan_handlers = {
                 "create_hunyuan_job": self.create_hunyuan_job,
                 "poll_hunyuan_job_status": self.poll_hunyuan_job_status,
-                "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan
+                "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan,
+                "texture_hunyuan_mesh": self.texture_hunyuan_job_local,
             }
             handlers.update(hunyuan_handlers)
 
@@ -3534,6 +3535,111 @@ class BlenderMCPServer:
             return {"error": str(e)}
         
     
+    def texture_hunyuan_job_local(
+        self,
+        object_name: str,
+        text_prompt: str = None,
+        image: str = None):
+        """Texture an existing mesh through the local Hunyuan3D-2 API.
+
+        Exports the named mesh as a GLB, sends it (base64) together with a text
+        prompt and/or reference image to the local /generate endpoint with
+        texture=True, then imports the textured result on a Blender timer,
+        matching the original object's transform and hiding the original.
+        Only valid in LOCAL_API mode (the cloud API does not accept a mesh).
+        """
+        try:
+            base_url = self._get_hunyuan3d_api_url().rstrip('/')
+            if not base_url:
+                return {"error": "API URL is not given"}
+
+            obj = bpy.data.objects.get(object_name)
+            if obj is None or obj.type != 'MESH':
+                return {"error": f"Mesh object '{object_name}' not found"}
+
+            octree_resolution = bpy.context.scene.blendermcp_hunyuan3d_octree_resolution
+            num_inference_steps = bpy.context.scene.blendermcp_hunyuan3d_num_inference_steps
+            guidance_scale = bpy.context.scene.blendermcp_hunyuan3d_guidance_scale
+
+            # Export the mesh to a temporary GLB and base64-encode it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as tf_in:
+                tmp_in = tf_in.name
+            try:
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.export_scene.gltf(filepath=tmp_in, use_selection=True)
+                with open(tmp_in, "rb") as f:
+                    mesh_b64 = base64.b64encode(f.read()).decode()
+            finally:
+                if os.path.exists(tmp_in):
+                    os.unlink(tmp_in)
+
+            data = {
+                "mesh": mesh_b64,
+                "octree_resolution": octree_resolution,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "texture": True,
+            }
+            if text_prompt:
+                data["text"] = text_prompt
+            if image:
+                if re.match(r'^https?://', image, re.IGNORECASE) is not None:
+                    try:
+                        res_img = requests.get(image)
+                        res_img.raise_for_status()
+                        data["image"] = base64.b64encode(res_img.content).decode("ascii")
+                    except Exception as e:
+                        return {"error": f"Failed to download or encode image: {str(e)}"}
+                else:
+                    try:
+                        with open(image, "rb") as f:
+                            data["image"] = base64.b64encode(f.read()).decode("ascii")
+                    except Exception as e:
+                        return {"error": f"Image encoding failed: {str(e)}"}
+
+            response = requests.post(f"{base_url}/generate", json=data)
+            if response.status_code != 200:
+                return {"error": f"Texturing failed: {response.text}"}
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as temp_file:
+                temp_file.write(response.content)
+                temp_out = temp_file.name
+
+            # Capture the original transform to apply to the textured result
+            src_loc = tuple(obj.location)
+            src_rot = tuple(obj.rotation_euler)
+            src_scl = tuple(obj.scale)
+
+            def import_handler():
+                before = set(bpy.data.objects)
+                bpy.ops.import_scene.gltf(filepath=temp_out)
+                if os.path.exists(temp_out):
+                    os.unlink(temp_out)
+                news = [o for o in bpy.data.objects if o not in before]
+                roots = [o for o in news if o.parent is None] or news
+                if roots:
+                    r0 = roots[0]
+                    r0.location = src_loc
+                    r0.rotation_euler = src_rot
+                    r0.scale = src_scl
+                src = bpy.data.objects.get(object_name)
+                if src is not None:
+                    src.hide_set(True)
+                    src.hide_render = True
+                return None
+
+            bpy.app.timers.register(import_handler)
+
+            return {
+                "status": "DONE",
+                "message": f"Textured mesh '{object_name}' and imported the result"
+            }
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return {"error": str(e)}
+
     def poll_hunyuan_job_status(self, *args, **kwargs):
         return self.poll_hunyuan_job_status_ai(*args, **kwargs)
     

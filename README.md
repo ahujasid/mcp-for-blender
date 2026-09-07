@@ -530,6 +530,22 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Search and download models from [Sketchfab](https://sketchfab.com/)
 - Search and download low-poly models from [Poly Pizza](https://poly.pizza/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/) and [Hunyuan3D](https://3d.hunyuan.tencent.com/)
+- Texture an existing mesh with a local [Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2) server (`texture_mesh_hunyuan3d`)
+
+#### Texturing an existing mesh with Hunyuan3D (local API mode)
+
+With **Tencent Hunyuan 3D** enabled and its mode set to **local api** (a local
+[Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2) API server running, default
+`http://localhost:8081`), Claude can paint a texture onto a mesh that is already in the scene
+instead of generating a new one:
+
+> *"Texture the object named Chair as weathered oak"*
+
+Claude calls `texture_mesh_hunyuan3d(object_name="Chair", text_prompt="weathered oak")`. The addon
+exports that mesh, sends it to the local server with the prompt (and/or a reference image via
+`input_image_url`), imports the textured result at the original object's transform and hides the
+original. This mirrors *Texture Selected Mesh* in the official Hunyuan3D-2 Blender addon and is not
+available with the cloud Official API.
 
 #### Poly Pizza
 
