@@ -5,6 +5,8 @@ import json
 import asyncio
 import logging
 import tempfile
+import shutil
+import subprocess
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
@@ -457,6 +459,27 @@ async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "")
         except Exception:
             pass
 
+def _blender_side_path(path: str) -> str:
+    """Translate a local temp path into one Blender can write to.
+
+    When this server runs in WSL and Blender runs on Windows (BLENDER_HOST is
+    not local), a POSIX path is meaningless to Blender: it resolves /tmp/x.png
+    against the current drive and silently writes C:\\tmp\\x.png, so the file
+    never appears where we look for it. The \\\\wsl.localhost UNC form of the
+    same file is writable from Windows and readable here.
+    """
+    if os.getenv("BLENDER_HOST", DEFAULT_HOST) in ("localhost", "127.0.0.1", "::1", ""):
+        return path
+    if not shutil.which("wslpath"):
+        return path
+    try:
+        out = subprocess.run(["wslpath", "-w", path], capture_output=True,
+                             text=True, check=True, timeout=5).stdout.strip()
+        return out or path
+    except Exception:
+        return path
+
+
 @mcp.tool()
 def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> Image:
     """
@@ -482,7 +505,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
         
         result = blender.send_command("get_viewport_screenshot", {
             "max_size": max_size,
-            "filepath": temp_path,
+            "filepath": _blender_side_path(temp_path),
             "format": "png"
         })
         
