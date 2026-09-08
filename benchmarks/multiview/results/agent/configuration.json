@@ -1,0 +1,109 @@
+{
+  "model": {
+    "id": "openai/gpt-5.6-terra",
+    "canonical_slug": "openai/gpt-5.6-terra-20260709",
+    "hugging_face_id": null,
+    "name": "OpenAI: GPT-5.6 Terra",
+    "created": 1783590857,
+    "description": "GPT-5.6 Terra is a balanced model in OpenAI's GPT-5.6 series, positioned between the flagship Sol tier and the cost-efficient Luna tier. It is suited for everyday coding, reasoning, and agentic...",
+    "context_length": 1050000,
+    "architecture": {
+      "modality": "text+image+file->text",
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "tokenizer": "GPT",
+      "instruct_type": null
+    },
+    "pricing": {
+      "prompt": "0.000002",
+      "completion": "0.000012",
+      "web_search": "0.01",
+      "input_cache_read": "0.0000002",
+      "input_cache_write": "0.0000025",
+      "overrides": [
+        {
+          "min_prompt_tokens": 272000,
+          "prompt": "0.000004",
+          "completion": "0.000018",
+          "input_cache_read": "0.0000004",
+          "input_cache_write": "0.000005"
+        }
+      ]
+    },
+    "top_provider": {
+      "context_length": 1050000,
+      "max_completion_tokens": 128000,
+      "is_moderated": true
+    },
+    "per_request_limits": null,
+    "supported_parameters": [
+      "include_reasoning",
+      "max_completion_tokens",
+      "max_tokens",
+      "reasoning",
+      "reasoning_effort",
+      "response_format",
+      "seed",
+      "structured_outputs",
+      "tool_choice",
+      "tools"
+    ],
+    "default_parameters": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "frequency_penalty": null,
+      "presence_penalty": null,
+      "repetition_penalty": null
+    },
+    "supported_voices": null,
+    "knowledge_cutoff": "2026-02-16",
+    "expiration_date": null,
+    "links": {
+      "details": "/api/v1/models/openai/gpt-5.6-terra-20260709/endpoints"
+    },
+    "benchmarks": {
+      "design_arena": [],
+      "artificial_analysis": {
+        "intelligence_index": 42.3,
+        "coding_index": 76.7,
+        "agentic_index": 43.7
+      }
+    },
+    "reasoning": {
+      "mandatory": false,
+      "default_enabled": true,
+      "supported_efforts": [
+        "max",
+        "xhigh",
+        "high",
+        "medium",
+        "low",
+        "none"
+      ],
+      "default_effort": "medium"
+    }
+  },
+  "budget_usd": 4.0,
+  "tasks": [
+    "Build a simple toy gantry. Use metres. Make two vertical blue posts, LeftPost and RightPost, centred at x=-1 and x=1, y=0, z=1, each 0.2 by 0.2 by 2.0. Add a blue top beam named Beam centred at (0,0,2.1), dimensions (2.2,0.2,0.2). Add a thin diagonal rear brace named RearBrace behind the frame at y=0.2. Keep the front opening clear. Inspect the result and fix visible placement mistakes before completing this step.",
+    "Raise the gantry by 0.5m without moving its feet: both posts should now be 2.5m tall with centres at z=1.25, and the beam centre should be at z=2.6. Update the brace to meet the upper structure. Inspect and correct attachment/position mistakes.",
+    "Add two small red square plates, FrontPlate and RearPlate, each (0.4,0.06,0.4). Their centres must be (0,-0.13,2.6) and (0,+0.13,2.6), touching opposite faces of the beam. Keep both posts unchanged. Inspect both plate attachments.",
+    "Remove the rear diagonal brace only. Preserve both plates, posts, and beam. Inspect the finished object from sufficient angles to check that the brace is gone and both plates remain attached. Report completion only when it matches."
+  ],
+  "repeats": 3,
+  "max_turns": 12,
+  "max_tokens": 4096,
+  "generation_parameters": {
+    "reasoning": {
+      "effort": "low"
+    }
+  },
+  "note": "Provider-reported totals; cached input is not treated as free."
+}

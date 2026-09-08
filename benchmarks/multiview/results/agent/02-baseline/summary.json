@@ -1,0 +1,30 @@
+{
+  "mode": "baseline",
+  "repeat": 2,
+  "model": "openai/gpt-5.6-terra",
+  "status": "completed",
+  "error": null,
+  "quality_checks": {
+    "LeftPost": true,
+    "RightPost": true,
+    "Beam": true,
+    "FrontPlate": true,
+    "RearPlate": true,
+    "brace_removed": true,
+    "no_extra_geometry": true
+  },
+  "passed": true,
+  "wall_s": 84.82797677300005,
+  "inference_calls": 19,
+  "tool_calls": 24,
+  "input_tokens": 152335,
+  "output_tokens": 5938,
+  "usage_complete": true,
+  "cached_tokens": 136213,
+  "reasoning_tokens": 1451,
+  "reported_cost_usd": 0.136569609,
+  "response_caching": "not explicitly enabled by this runner",
+  "cost_complete": true,
+  "inference_s": 82.86661696200099,
+  "tool_s": 1.9087622059960268
+}

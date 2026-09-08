@@ -1,0 +1,16 @@
+{
+  "kind": "native_blender_validation",
+  "passed": false,
+  "checks": [
+    "default nine-view GPU capture; unique views; complete viewport/selection restoration"
+  ],
+  "blender_version": "4.0.2",
+  "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+  "renderer": "llvmpipe (LLVM 20.1.2, 256 bits)",
+  "vendor": "Mesa",
+  "capture_trials": [],
+  "llm_calls": 0,
+  "llm_tokens": null,
+  "llm_cost_usd": null,
+  "error": "Traceback (most recent call last):\n  File \"/workspace/scratch/9b2e1d9de4ca/blender-mcp/benchmarks/multiview/native_validation.py\", line 85, in run\n    assert snapshot()==before, {k: (before[k], snapshot()[k]) for k in before if before[k] != snapshot()[k]}\n           ^^^^^^^^^^^^^^^^^^\nAssertionError: {'selection': (['Body', 'Detail', 'Foot', 'RearPeg'], ['RearPeg'])}\n"
+}

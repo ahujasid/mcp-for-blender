@@ -1,0 +1,17 @@
+{
+  "python": "3.12.13",
+  "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+  "upstream_commit": "5f8ddaf6e987c4aa0c3467fcc548838b28f64477",
+  "dependencies": {
+    "mcp": "1.30.0",
+    "httpx": "0.28.1",
+    "numpy": "2.5.3",
+    "Pillow": "12.3.0",
+    "pytest": "9.1.1",
+    "matplotlib": "3.11.1",
+    "socksio": "1.0.0"
+  },
+  "native_blender": "Ubuntu Blender 4.0.2; Mesa llvmpipe; GUI on Xvfb",
+  "native_python_home": "/usr",
+  "date_utc": "2026-09-08"
+}

@@ -561,6 +561,72 @@ is written onto each imported root object as the custom property `polypizza_attr
 survives the session. Filter with `licence="CC0"` if you would rather use models that need
 no credit.
 
+### Multi-view inspection
+
+`get_viewport_montage` returns one numbered PNG plus an exact text legend. It draws
+multiple virtual viewpoints with Blender's existing offscreen viewport API;
+it does not move the scene camera or the user's viewport. The default is a
+1536 × 1536, nine-view grid: current, front, right, back, left, top, bottom and
+two opposite three-quarter views. Generated views are fitted to evaluated bounds.
+
+For feedback immediately after a coherent group of edits, use the optional
+`inspect` argument on the existing execution tool:
+
+```python
+execute_blender_code(
+    code="bpy.data.objects['Body'].location.z += 0.1",
+    inspect={"target": ["Body", "Handle"]},
+    user_prompt="Move the body up slightly and check the handle attachment."
+)
+```
+
+Omitting `inspect` preserves the existing text-only behavior. `inspect={}` uses
+defaults. The edit and its observation run inside the same Blender command; a
+failed inspection never re-executes the edit. A successful edit with an inspection
+error explicitly says to retry **inspection only**.
+
+```python
+get_viewport_montage(
+    target=["Body", "Handle"],
+    views=[
+        "front", "back", "top",
+        {"azimuth": 35, "elevation": 15, "target": ["Handle"]},
+        {"view": "right", "target": ["Handle"], "isolate": True},
+    ],
+    max_size=1536,
+    shading="solid"
+)
+```
+
+Coordinates follow Blender's world axes: front is −Y, right is +X, top is +Z.
+Azimuth 0° is front, 90° is right; elevation is above the XY plane. Named cardinal
+views default to orthographic projection, while three-quarter and custom angles
+use perspective. Each view can override `target`, `projection`, `shading`, and
+`isolate`. The `current` view preserves the user's viewpoint rather than auto-fitting.
+
+Targets include their descendants and evaluated instances. With no explicit
+names, selection is used first, then visible geometry. Large floors or backdrop
+meshes can dominate automatic bounds; use explicit target names for close-ups.
+Isolation is opt-in: by default surrounding geometry stays visible so an isolated
+part cannot misleadingly appear attached. Multiple views improve coverage but do
+not guarantee that every surface is unoccluded.
+
+`max_size` is the longest side of the **whole** grid, not each tile. Tiles are
+32-pixel aligned; 1–16 views and 384–4096 overall pixels are accepted, subject to
+minimum tile size. Solid shading is the fast default. `material`, `wireframe`,
+and `current` are available; `current` can inherit an expensive rendered mode.
+Overlays, gizmos, shading and temporary visibility changes are restored on failure.
+The PNG travels as image content, not text, and uses no shared filesystem path
+between Blender and the MCP process (including Windows/WSL setups).
+
+Update both the MCP server and the Blender addon. A running GUI/GPU context is
+required; for Linux automation use `xvfb-run -a blender`, **not** `blender -b`.
+No model/provider-specific configuration or new runtime dependency is required.
+
+See [multi-view validation and benchmarks](benchmarks/multiview/README.md) for
+reproduction commands, recorded measurements, and the scope of the tests.
+
+
 ### Example Commands
 
 Here are some examples of what you can ask Claude to do:
