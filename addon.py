@@ -443,8 +443,18 @@ def get_blendermcp_addon_preferences(context=None):
     return addon.preferences if addon else None
 
 class BlenderMCPServer:
-    def __init__(self, host='localhost', port=9876):
-        self.host = host
+    # WSL reaches Windows over the network rather than through loopback, so the
+    # server has to bind 0.0.0.0 to be reachable at all. That is an exposed
+    # socket, so it stays opt-in and localhost remains the default.
+    WSL_NETWORKING_VALUES = {"1", "true", "yes", "on"}
+
+    @classmethod
+    def default_host(cls):
+        wsl_networking = os.getenv("WSL_NETWORKING", "").strip().lower()
+        return "0.0.0.0" if wsl_networking in cls.WSL_NETWORKING_VALUES else "localhost"
+
+    def __init__(self, host=None, port=9876):
+        self.host = host or self.default_host()
         self.port = port
         self.running = False
         self.socket = None
