@@ -526,6 +526,7 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Create, delete and modify shapes
 - Apply or create materials for objects
 - Execute any Python code in Blender
+- Look up a node type's property/socket schema (`describe_node_type`) and query the bpy RNA reference for types, properties, methods and operators (`bpy_api_lookup`), without guessing socket order or enum spelling
 - Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
 - Search and download models from [Sketchfab](https://sketchfab.com/)
 - Search and download low-poly models from [Poly Pizza](https://poly.pizza/)
@@ -560,6 +561,36 @@ is written onto each imported root object as the custom property `polypizza_attr
 (alongside `polypizza_id` and `polypizza_licence`), so it is saved into your `.blend` and
 survives the session. Filter with `licence="CC0"` if you would rather use models that need
 no credit.
+
+#### Node & API introspection
+
+Two read-only lookup tools exist purely to answer "what does this thing look like"
+questions before code is written, instead of after it fails:
+
+- **`describe_node_type(bl_idname, property_overrides={})`** — creates a throwaway node in a
+  scratch node tree, optionally applies `property_overrides`, then reports its non-default
+  properties (with enum values) and its input/output sockets (name, type, **index**, default
+  value), before deleting the scratch tree. Since socket layout on nodes like Mix depends on a
+  mode property, pass that mode via `property_overrides` (e.g. `{"data_type": "RGBA"}`) to see
+  the real layout for the case you're about to write code against.
+- **`bpy_api_lookup(query)`** — structured RNA reference lookup. Accepts a bare type
+  (`"ShaderNodeTexSky"`), a property path (`"ShaderNodeTexSky.sky_type"`), a method path
+  (`"Object.ray_cast"`), or an operator path (`"bpy.ops.mesh.primitive_cube_add"`), and returns
+  real types, required/optional flags, and enum identifiers as JSON — not `help()` text to
+  re-parse.
+
+Worked example:
+
+> *"What are the Mix node's sockets when set to RGBA, and what are Sky Texture's sky types?"*
+
+Claude calls `describe_node_type(bl_idname="ShaderNodeMix", property_overrides={"data_type": "RGBA"})`
+to get the exact input/output socket order for that mode, and
+`bpy_api_lookup(query="ShaderNodeTexSky.sky_type")` to get the enum identifiers
+(`SINGLE_SCATTERING`, `MULTIPLE_SCATTERING`, `PREETHAM`, `HOSEK_WILKIE`) instead of guessing.
+
+`execute_blender_code` errors are also now returned as structured JSON (`exception_type`,
+`message`, `traceback`) rather than a single flattened string, so a failure in a multi-line
+script can be traced back to the line that raised it.
 
 ### Example Commands
 

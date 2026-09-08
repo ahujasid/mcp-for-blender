@@ -587,6 +587,70 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -
         return f"Error executing code: {str(e)}"
 
 @mcp.tool()
+async def describe_node_type(ctx: Context, bl_idname: str, property_overrides: Dict[str, Any] = None, user_prompt: str = "") -> str:
+    """
+    Look up the property and socket schema of a Blender node type, without touching the current scene.
+
+    Answers exactly the questions that otherwise take several trial-and-error
+    execute_blender_code calls: what are this node's inputs/outputs (name,
+    type, socket index, default value), what non-default properties does it
+    have (e.g. data_type, blend_type, sky_type), and what enum values are
+    valid for each. Internally this creates a throwaway node in a scratch
+    node tree, optionally applies property_overrides, reads its schema, then
+    deletes the scratch tree - it never modifies anything the user can see.
+
+    Use this BEFORE writing code that indexes a node's sockets or sets an
+    enum property, instead of guessing socket order or enum spelling.
+
+    Parameters:
+    - bl_idname: The node's bl_idname, e.g. "ShaderNodeMix", "ShaderNodeTexSky", "ShaderNodeBsdfPrincipled".
+    - property_overrides: Optional dict of property values to set on the node before reading its sockets, e.g. {"data_type": "RGBA"} for a Mix node. Socket layout for many nodes depends on these mode-like properties, so set them here to see the real layout for the mode you intend to use.
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("describe_node_type", {
+            "bl_idname": bl_idname,
+            "property_overrides": property_overrides or {},
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error describing node type {bl_idname}: {str(e)}")
+        return f"Error describing node type '{bl_idname}': {str(e)}"
+
+
+@mcp.tool()
+async def bpy_api_lookup(ctx: Context, query: str, user_prompt: str = "") -> str:
+    """
+    Structured Blender RNA/API reference lookup: types, properties, functions, and operators.
+
+    Returns real signature data as JSON - argument names, types, whether
+    each is required, enum identifiers, min/max, defaults - instead of text
+    that has to be scraped out of help() output. Use this instead of
+    guessing an operator's argument names or a property's valid enum values.
+
+    Query forms:
+    - "ShaderNodeTexSky"                      -> full type schema: all properties + methods
+    - "ShaderNodeTexSky.sky_type"              -> one property's type, enum items, default
+    - "Object.ray_cast"                        -> one method's parameters and return values
+    - "bpy.ops.mesh.primitive_cube_add"        -> operator parameters (name, type, default, enum items)
+    A leading "bpy." / "bpy.types." is optional and stripped automatically.
+    If a name is not found, the result includes a "did_you_mean" list of close matches.
+
+    Parameters:
+    - query: The type, property, method, or operator path to look up (see forms above).
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("bpy_api_lookup", {"query": query})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error looking up '{query}': {str(e)}")
+        return f"Error looking up '{query}': {str(e)}"
+
+
+@mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
     """

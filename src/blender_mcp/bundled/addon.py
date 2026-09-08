@@ -37,7 +37,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 5
+ADDON_PROTOCOL_VERSION = 6
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -767,6 +767,8 @@ class BlenderMCPServer:
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
+            "describe_node_type": self.describe_node_type,
+            "bpy_api_lookup": self.bpy_api_lookup,
             "drain_human_activity": self.drain_human_activity,
             "get_telemetry_consent": self.get_telemetry_consent,
             "set_telemetry_consent": self.set_telemetry_consent,
@@ -851,6 +853,8 @@ class BlenderMCPServer:
                 "get_object_info",
                 "get_viewport_screenshot",
                 "execute_code",
+                "describe_node_type",
+                "bpy_api_lookup",
                 "drain_human_activity",
                 "get_telemetry_consent",
                 "set_telemetry_consent",
@@ -1379,9 +1383,321 @@ class BlenderMCPServer:
             captured_output = capture_buffer.getvalue()
             return {"executed": True, "result": captured_output}
         except Exception as e:
-            raise Exception(f"Code execution error: {str(e)}")
+            # Give the caller the same detail we have: exception type, message,
+            # and a full traceback (with line numbers into the submitted code),
+            # instead of collapsing everything into one string. Callers that ran
+            # a multi-line script otherwise cannot tell which line failed.
+            tb = traceback.format_exc()
+            raise Exception(
+                json.dumps({
+                    "exception_type": type(e).__name__,
+                    "message": str(e),
+                    "traceback": tb,
+                })
+            )
 
+    # ------------------------------------------------------------------
+    # Documentation / introspection helpers.
+    #
+    # These never touch the current scene or node tree - they exist purely
+    # to answer "what does this thing look like" questions (property names,
+    # types, enum values, socket order, function/operator signatures) so an
+    # LLM can get a structured answer in one call instead of guessing and
+    # discovering the shape of things via a chain of failed execute_code
+    # attempts.
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def _describe_property(prop):
+        """Structured description of a single bpy RNA property."""
+        entry = {
+            "identifier": prop.identifier,
+            "name": prop.name,
+            "type": prop.type,  # FLOAT, INT, BOOLEAN, STRING, ENUM, POINTER, COLLECTION
+            "description": prop.description,
+        }
+        for attr in ("is_required", "is_readonly", "is_argument_optional", "array_length"):
+            value = getattr(prop, attr, None)
+            if value is not None:
+                entry[attr] = value
+
+        if prop.type == 'ENUM':
+            try:
+                entry["enum_items"] = [item.identifier for item in prop.enum_items]
+            except Exception:
+                pass
+            try:
+                entry["default"] = prop.default
+            except Exception:
+                pass
+        elif prop.type in ('FLOAT', 'INT'):
+            try:
+                entry["default"] = (
+                    list(prop.default_array) if getattr(prop, "array_length", 0) else prop.default
+                )
+            except Exception:
+                pass
+            for attr in ("hard_min", "hard_max", "soft_min", "soft_max", "subtype", "unit", "step"):
+                value = getattr(prop, attr, None)
+                if value is not None:
+                    entry[attr] = value
+        elif prop.type == 'BOOLEAN':
+            try:
+                entry["default"] = prop.default
+            except Exception:
+                pass
+        elif prop.type == 'STRING':
+            try:
+                entry["default"] = prop.default
+            except Exception:
+                pass
+            max_length = getattr(prop, "max_length", None)
+            if max_length:
+                entry["max_length"] = max_length
+        elif prop.type == 'POINTER':
+            fixed_type = getattr(prop, "fixed_type", None)
+            if fixed_type is not None:
+                entry["pointer_type"] = fixed_type.identifier
+        elif prop.type == 'COLLECTION':
+            fixed_type = getattr(prop, "fixed_type", None)
+            if fixed_type is not None:
+                entry["collection_type"] = fixed_type.identifier
+        return entry
+
+    def describe_node_type(self, bl_idname, property_overrides=None):
+        """Describe a node type's properties and socket schema.
+
+        This is the fix for the single most common failure mode: guessing
+        socket names/indices and enum values instead of looking them up.
+        Since a node's sockets are only known once instantiated (and can
+        depend on mode-like properties, e.g. Mix's `data_type`), this
+        creates a throwaway node in a scratch node tree, optionally applies
+        `property_overrides` first (e.g. {"data_type": "RGBA"}) so the
+        caller can see the exact socket layout for the mode they intend to
+        use, then reports its properties/inputs/outputs, and finally
+        deletes the scratch tree. Nothing in the user's actual scene is
+        touched.
+        """
+        node_cls = getattr(bpy.types, bl_idname, None)
+        if node_cls is None or not (isinstance(node_cls, type) and issubclass(node_cls, bpy.types.Node)):
+            candidates = [
+                name for name in dir(bpy.types)
+                if "Node" in name and bl_idname.lower() in name.lower()
+            ]
+            return {
+                "error": f"Unknown node type: {bl_idname}",
+                "did_you_mean": sorted(candidates)[:15],
+            }
+
+        tree_type_candidates = [
+            "ShaderNodeTree", "GeometryNodeTree", "CompositorNodeTree", "TextureNodeTree",
+        ]
+        node = None
+        tree = None
+        used_tree_type = None
+        attempts = []
+        for tree_type in tree_type_candidates:
+            tmp_tree = None
+            try:
+                tmp_tree = bpy.data.node_groups.new(name="__mcp_introspect_tmp__", type=tree_type)
+                node = tmp_tree.nodes.new(type=bl_idname)
+                tree = tmp_tree
+                used_tree_type = tree_type
+                break
+            except Exception as e:
+                attempts.append(f"{tree_type}: {e}")
+                if tmp_tree is not None:
+                    try:
+                        bpy.data.node_groups.remove(tmp_tree)
+                    except Exception:
+                        pass
+
+        if node is None:
+            return {
+                "error": f"Could not instantiate node '{bl_idname}' in any node tree type",
+                "attempts": attempts,
+            }
+
+        try:
+            warnings = []
+            if property_overrides:
+                for key, value in property_overrides.items():
+                    try:
+                        setattr(node, key, value)
+                    except Exception as e:
+                        warnings.append(f"Could not set property '{key}' = {value!r}: {e}")
+
+            base_props = set(bpy.types.Node.bl_rna.properties.keys())
+            properties = [
+                self._describe_property(prop)
+                for prop in node.bl_rna.properties
+                if prop.identifier not in base_props
+            ]
+
+            def describe_sockets(sockets):
+                out = []
+                for index, socket in enumerate(sockets):
+                    entry = {
+                        "index": index,
+                        "identifier": socket.identifier,
+                        "name": socket.name,
+                        "type": socket.type,
+                        "is_multi_input": getattr(socket, "is_multi_input", False),
+                        "hide_value": getattr(socket, "hide_value", False),
+                        "is_linked": socket.is_linked,
+                    }
+                    if hasattr(socket, "default_value"):
+                        try:
+                            default_value = socket.default_value
+                            if hasattr(default_value, "__len__") and not isinstance(default_value, str):
+                                entry["default_value"] = list(default_value)
+                            else:
+                                entry["default_value"] = default_value
+                        except Exception:
+                            pass
+                    out.append(entry)
+                return out
+
+            result = {
+                "bl_idname": bl_idname,
+                "label": node.bl_label,
+                "instantiated_in": used_tree_type,
+                "properties": properties,
+                "inputs": describe_sockets(node.inputs),
+                "outputs": describe_sockets(node.outputs),
+                "applied_property_overrides": property_overrides or {},
+                "note": (
+                    "Sockets reflect the node's current property values (after any "
+                    "property_overrides applied above). Enum/mode-like properties "
+                    "(e.g. data_type, blend_type) can add, remove or reorder sockets - "
+                    "pass the mode you intend to use via property_overrides to see the "
+                    "real layout before writing code that indexes these sockets."
+                ),
+            }
+            if warnings:
+                result["warnings"] = warnings
+            return result
+        finally:
+            try:
+                bpy.data.node_groups.remove(tree)
+            except Exception:
+                pass
+
+    def bpy_api_lookup(self, query):
+        """Structured RNA reference lookup: types, properties, functions, operators.
+
+        Accepts things like:
+          - "ShaderNodeTexSky" or "bpy.types.ShaderNodeTexSky"       -> full type schema
+          - "ShaderNodeTexSky.sky_type"                              -> one property, with enum items
+          - "Object.ray_cast"                                        -> one method's parameters/returns
+          - "bpy.ops.mesh.primitive_cube_add"                        -> operator parameters
+        This replaces scraping `help()` text: every answer is structured
+        JSON with real type names, enum identifiers, and required/optional
+        flags, not something that has to be re-parsed out of a text blob.
+        """
+        query = (query or "").strip()
+        if not query:
+            return {"error": "Empty query"}
+
+        q = query[4:] if query.startswith("bpy.") else query
+
+        # bpy.ops.<category>.<operator_name>
+        if q.startswith("ops."):
+            op_parts = q[len("ops."):].split(".")
+            op_parts = [p.split("(")[0] for p in op_parts if p]
+            if len(op_parts) < 2:
+                return {"error": f"Incomplete operator path: bpy.{q}. Expected bpy.ops.<category>.<name>"}
+            category, op_name = op_parts[0], op_parts[1]
+            op_group = getattr(bpy.ops, category, None)
+            op = getattr(op_group, op_name, None) if op_group is not None else None
+            if op is None:
+                return {"error": f"Unknown operator: bpy.ops.{category}.{op_name}"}
+            try:
+                rna = op.get_rna_type()
+            except Exception as e:
+                return {"error": f"Could not introspect operator bpy.ops.{category}.{op_name}: {e}"}
+            parameters = [
+                self._describe_property(prop)
+                for prop in rna.properties
+                if prop.identifier != "rna_type"
+            ]
+            return {
+                "kind": "operator",
+                "idname": f"bpy.ops.{category}.{op_name}",
+                "label": rna.name,
+                "description": rna.description,
+                "parameters": parameters,
+            }
+
+        parts = [p for p in q.split(".") if p and p != "types"]
+        if not parts:
+            return {"error": "Empty query"}
+
+        type_name = parts[0]
+        node_cls = getattr(bpy.types, type_name, None)
+        if node_cls is None:
+            matches = sorted(
+                name for name in dir(bpy.types)
+                if type_name.lower() in name.lower()
+            )
+            return {
+                "error": f"Unknown type: {type_name}",
+                "did_you_mean": matches[:15],
+            }
+
+        if len(parts) == 1:
+            properties = [
+                self._describe_property(prop)
+                for prop in node_cls.bl_rna.properties
+                if prop.identifier != "rna_type"
+            ]
+            functions = []
+            for func in node_cls.bl_rna.functions:
+                functions.append({
+                    "identifier": func.identifier,
+                    "description": func.description,
+                    "parameters": [
+                        self._describe_property(p) for p in func.parameters if not p.is_output
+                    ],
+                    "returns": [
+                        self._describe_property(p) for p in func.parameters if p.is_output
+                    ],
+                })
+            return {
+                "kind": "type",
+                "bl_idname": type_name,
+                "description": node_cls.bl_rna.description,
+                "properties": properties,
+                "functions": functions,
+            }
+
+        # Type.member - could be a property or a function/method
+        member_name = parts[1]
+        prop = node_cls.bl_rna.properties.get(member_name)
+        if prop is not None:
+            entry = self._describe_property(prop)
+            entry["kind"] = "property"
+            entry["owner_type"] = type_name
+            return entry
+
+        func = node_cls.bl_rna.functions.get(member_name)
+        if func is not None:
+            return {
+                "kind": "function",
+                "owner_type": type_name,
+                "identifier": func.identifier,
+                "description": func.description,
+                "parameters": [self._describe_property(p) for p in func.parameters if not p.is_output],
+                "returns": [self._describe_property(p) for p in func.parameters if p.is_output],
+            }
+
+        available = sorted(
+            list(node_cls.bl_rna.properties.keys()) + list(node_cls.bl_rna.functions.keys())
+        )
+        return {
+            "error": f"'{type_name}' has no property or function named '{member_name}'",
+            "did_you_mean": [name for name in available if member_name.lower() in name.lower()][:15],
+        }
 
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""
