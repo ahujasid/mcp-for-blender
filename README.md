@@ -563,69 +563,47 @@ no credit.
 
 ### Multi-view inspection
 
-`get_viewport_montage` returns one numbered PNG plus an exact text legend. It draws
-multiple virtual viewpoints with Blender's existing offscreen viewport API;
-it does not move the scene camera or the user's viewport. The default is a
-1536 × 1536, nine-view grid: current, front, right, back, left, top, bottom and
-two opposite three-quarter views. Generated views are fitted to evaluated bounds.
-
-For feedback immediately after a coherent group of edits, use the optional
-`inspect` argument on the existing execution tool:
-
-```python
-execute_blender_code(
-    code="bpy.data.objects['Body'].location.z += 0.1",
-    inspect={"target": ["Body", "Handle"]},
-    user_prompt="Move the body up slightly and check the handle attachment."
-)
-```
-
-Omitting `inspect` preserves the existing text-only behavior. `inspect={}` uses
-defaults. The edit and its observation run inside the same Blender command; a
-failed inspection never re-executes the edit. A successful edit with an inspection
-error explicitly says to retry **inspection only**.
+`get_viewport_montage` returns one numbered PNG and a matching text legend without
+moving the camera or viewport. Defaults: a 1536 × 1536 grid of current, front,
+right, back, left, top, bottom and two opposite three-quarter views. Generated
+views fit evaluated target bounds, including descendants and instances.
 
 ```python
 get_viewport_montage(
     target=["Body", "Handle"],
-    views=[
-        "front", "back", "top",
-        {"azimuth": 35, "elevation": 15, "target": ["Handle"]},
-        {"view": "right", "target": ["Handle"], "isolate": True},
-    ],
-    max_size=1536,
-    shading="solid"
+    views=["front", "back", "top", {"azimuth": 35, "elevation": 15},
+           {"view": "right", "target": ["Handle"], "isolate": True}],
+)
+execute_blender_code(
+    code="bpy.data.objects['Body'].location.z += 0.1",
+    inspect={"target": ["Body", "Handle"]},
+    user_prompt="Move the body up slightly and check the handle attachment.",
 )
 ```
 
-Coordinates follow Blender's world axes: front is −Y, right is +X, top is +Z.
-Azimuth 0° is front, 90° is right; elevation is above the XY plane. Named cardinal
-views default to orthographic projection, while three-quarter and custom angles
-use perspective. Each view can override `target`, `projection`, `shading`, and
-`isolate`. The `current` view preserves the user's viewpoint rather than auto-fitting.
+`inspect={}` uses montage defaults; omitting it keeps text-only execution. Invalid
+options are rejected before editing. If capture fails after an edit, the result
+reports success and the capture error: retry inspection only, not the edit.
 
-Targets include their descendants and evaluated instances. With no explicit
-names, selection is used first, then visible geometry. Large floors or backdrop
-meshes can dominate automatic bounds; use explicit target names for close-ups.
-Isolation is opt-in: by default surrounding geometry stays visible so an isolated
-part cannot misleadingly appear attached. Multiple views improve coverage but do
-not guarantee that every surface is unoccluded.
+- `views`: 1–16 names or objects. Front is −Y, right +X, top +Z; azimuth 0° is
+  front, 90° right, and elevation is above XY. Cardinal views are orthographic;
+  three-quarter/custom views use perspective. `current` keeps the user's view.
+- `target`: object names; otherwise selection, then visible geometry. Use explicit
+  names for close-ups when floors/backdrops dominate framing. Per-view `target`,
+  `projection`, `shading` and `isolate` override defaults.
+- `max_size`: 384–4096 pixels along the whole grid's longest side; tiles align to
+  32 pixels. `padding` is the framing multiplier (default 1.15).
+- `shading`: `solid` (default), `material`, `wireframe`, or `current` (potentially
+  expensive). `isolate=True` hides surroundings temporarily; default false keeps
+  attachment context. Extra views do not guarantee unoccluded geometry.
 
-`max_size` is the longest side of the **whole** grid, not each tile. Tiles are
-32-pixel aligned; 1–16 views and 384–4096 overall pixels are accepted, subject to
-minimum tile size. Solid shading is the fast default. `material`, `wireframe`,
-and `current` are available; `current` can inherit an expensive rendered mode.
-Overlays, gizmos, shading and temporary visibility changes are restored on failure.
-The PNG travels as image content, not text, and uses no shared filesystem path
-between Blender and the MCP process (including Windows/WSL setups).
+Shading, overlays, gizmos, visibility and selection are restored even on failure.
+Update both server and addon; a GUI/GPU context is required (`xvfb-run -a blender`
+works, `blender -b` does not). No new runtime dependency or shared image path is needed.
 
-Update both the MCP server and the Blender addon. A running GUI/GPU context is
-required; for Linux automation use `xvfb-run -a blender`, **not** `blender -b`.
-No model/provider-specific configuration or new runtime dependency is required.
-
-See [multi-view validation and benchmarks](benchmarks/multiview/README.md) for
-reproduction commands, recorded measurements, and the scope of the tests.
-
+Tests: `pip install -e . pytest numpy Pillow && pytest`. For native capture and
+state-restoration checks in a disposable scene, run
+`xvfb-run -a blender --factory-startup --python tests/blender_multiview.py`.
 
 ### Example Commands
 

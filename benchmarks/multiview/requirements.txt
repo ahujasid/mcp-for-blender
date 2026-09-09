@@ -1,6 +1,0 @@
-# Development-only dependencies; no change to Blender MCP runtime requirements.
-pytest>=8
-numpy>=1.26
-Pillow>=10
-matplotlib>=3.8
-httpx[socks]>=0.27
