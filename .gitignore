@@ -21,3 +21,7 @@ local_tests/
 supabase/
 
 scripts/
+
+test-artifacts/
+outputs/
+optix7cache.db

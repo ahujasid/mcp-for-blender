@@ -29,7 +29,7 @@ from bpy.app.handlers import persistent
 bl_info = {
     "name": "MCP for Blender",
     "author": "BlenderMCP",
-    "version": (1, 6),
+    "version": (1, 6, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > MCP for Blender",
     "description": "Connect Blender to Claude via MCP",
@@ -761,6 +761,22 @@ class BlenderMCPServer:
 
         # Base handlers that are always available
         handlers = {
+            "inspect_scene": self.inspect_scene,
+            "validate_mesh": self.validate_mesh,
+            "inspect_motion": self.inspect_motion,
+            "create_checkpoint": self.create_checkpoint,
+            "restore_checkpoint": self.restore_checkpoint,
+            "preview_target": self.preview_target,
+            "preview_camera": self.preview_camera,
+            "inspect_rig": self.inspect_rig,
+            "validate_animation": self.validate_animation,
+            "inspect_sculpt": self.inspect_sculpt,
+            "sculpt_region": self.sculpt_region,
+            "compare_reference": self.compare_reference,
+            "export_asset": self.export_asset,
+            "validate_deformation": self.validate_deformation,
+            "get_quality_info": self.get_quality_info,
+            "preview_animation": self.preview_animation,
             "get_scene_info": self.get_scene_info,
             "get_world_state_snapshot": self.get_world_state_snapshot,
             "get_addon_info": self.get_addon_info,
@@ -854,9 +870,742 @@ class BlenderMCPServer:
                 "drain_human_activity",
                 "get_telemetry_consent",
                 "set_telemetry_consent",
+                "get_quality_info",
+                "inspect_scene", "validate_mesh", "inspect_motion", "inspect_rig",
+                "validate_animation", "validate_deformation", "inspect_sculpt", "sculpt_region",
+                "compare_reference", "export_asset", "preview_target", "preview_animation", "preview_camera",
+                "create_checkpoint", "restore_checkpoint",
             ]),
             "blender_version": bpy.app.version_string,
         }
+
+    def get_quality_info(self):
+        """Report live quality extension support rather than inferring it from the server version."""
+        return {"extension_version": 1, "blender_executable": bpy.app.binary_path,
+                "blender_version": bpy.app.version_string, "interactive": not bpy.app.background,
+                "file": bpy.data.filepath, "scene": bpy.context.scene.name,
+                "view_layer": bpy.context.view_layer.name, "mode": bpy.context.mode,
+                "frame": bpy.context.scene.frame_current, "unit_scale": bpy.context.scene.unit_settings.scale_length,
+                "fps": bpy.context.scene.render.fps, "fps_base": bpy.context.scene.render.fps_base,
+                "tools": ["inspect_scene", "validate_mesh", "inspect_motion", "preview_target",
+                          "create_checkpoint", "restore_checkpoint", "inspect_rig", "validate_animation",
+                          "inspect_sculpt", "sculpt_region", "compare_reference", "export_asset",
+                          "validate_deformation", "preview_animation", "preview_camera"],
+                "checkpoint_count": len(getattr(self, '_quality_checkpoints', {}))}
+
+    def preview_animation(self, name, frames, directory, view="three_quarter", max_size=512):
+        """Capture a bounded sequence of labeled frame images and restore the timeline."""
+        from pathlib import Path
+        if not isinstance(frames, list) or not 1 <= len(frames) <= 8 or any(type(f) is not int for f in frames):
+            raise ValueError("frames must contain 1–8 integer frame numbers")
+        directory = Path(directory)
+        if not directory.is_absolute() or not directory.is_dir():
+            raise ValueError("directory must be an existing absolute directory")
+        scene = bpy.context.scene
+        current, subframe = scene.frame_current, scene.frame_subframe
+        rows = []
+        center = radius = None
+        try:
+            for index, frame in enumerate(frames):
+                scene.frame_set(frame)
+                path = directory / f'frame-{index}.png'
+                if path.exists():
+                    raise ValueError("Preview output already exists")
+                result = self.preview_target(name, str(path), view, max_size, center, radius)
+                center, radius = result['center'], result['radius']
+                rows.append({"frame": frame, "path": str(path), "view": view,
+                             "center": result['center'], "radius": result['radius']})
+            return {"frames": rows, "limitations": ["Framing is locked to the first sample; later movement can leave the view.",
+                                                     "These are sampled poses, not continuous playback."]}
+        finally:
+            scene.frame_set(current, subframe=subframe)
+
+    def validate_deformation(self, name, frames, reference_frame, max_stretch=3.0, min_ratio=0.1):
+        """Inspect evaluated edge-length changes across poses without modifying animation."""
+        import math
+        import numpy as np
+        if not isinstance(frames, list) or not 1 <= len(frames) <= 100 or any(type(f) is not int for f in frames):
+            raise ValueError("frames must contain 1–100 integer frame numbers")
+        if type(reference_frame) is not int:
+            raise ValueError("reference_frame must be an integer")
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (max_stretch, min_ratio)) or not 0 <= min_ratio <= 1 <= max_stretch:
+            raise ValueError("Use 0 <= min_ratio <= 1 <= max_stretch")
+        obj = bpy.context.scene.objects.get(name)
+        if obj is None or obj.type != 'MESH' or obj.mode != 'OBJECT':
+            raise ValueError("Target must be an Object Mode scene mesh")
+        scene = bpy.context.scene
+        original_frame, original_subframe = scene.frame_current, scene.frame_subframe
+        def snapshot(frame):
+            scene.frame_set(frame)
+            evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+            mesh = evaluated.to_mesh()
+            try:
+                if len(mesh.vertices) * (len(frames) + 1) > 5000000:
+                    raise ValueError("Deformation sampling exceeds five million vertex samples")
+                coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+                mesh.vertices.foreach_get('co', coordinates)
+                coordinates = coordinates.reshape(-1, 3)
+                matrix = np.array(evaluated.matrix_world)
+                coordinates = coordinates @ matrix[:3, :3].T + matrix[:3, 3]
+                edges = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+                mesh.edges.foreach_get('vertices', edges)
+                edges = edges.reshape(-1, 2)
+                lengths = np.linalg.norm(coordinates[edges[:, 0]] - coordinates[edges[:, 1]], axis=1)
+                return edges, lengths, len(mesh.vertices)
+            finally:
+                evaluated.to_mesh_clear()
+        try:
+            base_edges, base_lengths, count = snapshot(reference_frame)
+            valid = base_lengths > 1e-10
+            rows = []
+            for frame in frames:
+                edges, lengths, vertices = snapshot(frame)
+                if vertices != count or not np.array_equal(edges, base_edges):
+                    rows.append({"frame": frame, "status": "incompatible_topology"})
+                    continue
+                ratios = lengths[valid] / base_lengths[valid]
+                bad = (ratios > max_stretch) | (ratios < min_ratio) | ~np.isfinite(ratios)
+                indices = np.flatnonzero(valid)[bad]
+                rows.append({"frame": frame, "status": "sampled", "flagged_edges": int(bad.sum()),
+                             "edge_examples": indices[:30].tolist(),
+                             "max_ratio": float(np.max(ratios)) if len(ratios) and np.isfinite(ratios).all() else None,
+                             "min_ratio": float(np.min(ratios)) if len(ratios) and np.isfinite(ratios).all() else None})
+            return {"object": name, "reference_frame": reference_frame, "samples": rows,
+                    "ignored_zero_length_reference_edges": int((~valid).sum()),
+                    "limitations": ["Edge stretch is a heuristic; intentional squash/stretch may be flagged.",
+                                    "No intersection, volume preservation, or visual deformation score.",
+                                    "Equal indices cannot prove semantic vertex correspondence after procedural remeshing."]}
+        finally:
+            scene.frame_set(original_frame, subframe=original_subframe)
+
+    def inspect_rig(self, name, offset=0, limit=50, mesh_name="", influence_limit=4):
+        """Read bones, constraint targets and deform-weight issues without posing the rig."""
+        import math
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("Use non-negative offset and limit 1–200")
+        if type(influence_limit) is not int or influence_limit < 1:
+            raise ValueError("influence_limit must be a positive integer")
+        rig = bpy.context.scene.objects.get(name)
+        if rig is None or rig.type != 'ARMATURE':
+            raise ValueError("Target must be an armature in the active scene")
+        bones = sorted(rig.pose.bones, key=lambda bone: bone.name)
+        rows = [{"name": bone.name, "parent": bone.parent.name if bone.parent else None,
+                 "deform": bone.bone.use_deform,
+                 "world_head": list(rig.matrix_world @ bone.head),
+                 "world_tail": list(rig.matrix_world @ bone.tail),
+                 "constraints": [{"name": c.name, "type": c.type, "influence": c.influence,
+                                  "target": getattr(getattr(c, 'target', None), 'name', None),
+                                  "subtarget": getattr(c, 'subtarget', None),
+                                  "valid": c.is_valid} for c in bone.constraints]}
+                for bone in bones[offset:offset + limit]]
+        weights = None
+        if mesh_name:
+            obj = bpy.context.scene.objects.get(mesh_name)
+            if obj is None or obj.type != 'MESH' or obj.mode != 'OBJECT':
+                raise ValueError("mesh_name must identify an Object Mode mesh")
+            deform = {bone.name for bone in rig.data.bones if bone.use_deform}
+            groups = {group.index for group in obj.vertex_groups if group.name in deform}
+            counts = {"unweighted": 0, "not_normalized": 0, "too_many_influences": 0, "invalid_weights": 0}
+            examples = []
+            for vertex in obj.data.vertices:
+                values = [g.weight for g in vertex.groups if g.group in groups and g.weight != 0]
+                issues = []
+                if not values:
+                    issues.append('unweighted')
+                elif any(not math.isfinite(w) or w < 0 for w in values):
+                    issues.append('invalid_weights')
+                elif abs(sum(values) - 1) > 1e-4:
+                    issues.append('not_normalized')
+                if len(values) > influence_limit:
+                    issues.append('too_many_influences')
+                for issue in issues:
+                    counts[issue] += 1
+                if issues and len(examples) < 30:
+                    examples.append({"vertex": vertex.index, "issues": issues})
+            weights = {"mesh": mesh_name, "counts": counts, "examples": examples,
+                       "armature_modifier_bound": any(m.type == 'ARMATURE' and m.object == rig for m in obj.modifiers)}
+        anim = rig.animation_data
+        return {"armature": name, "bones": rows, "total_bones": len(bones),
+                "next_offset": offset + len(rows) if offset + len(rows) < len(bones) else None,
+                "active_action": anim.action.name if anim and anim.action else None,
+                "nla_tracks": len(anim.nla_tracks) if anim else 0, "weights": weights,
+                "limitations": ["Weight normalization warnings are context-dependent; modifiers may normalize internally.",
+                                "No deformation stress poses or artistic motion judgment performed."]}
+
+    def validate_animation(self, name, frame_start, frame_end, step=1, reference_object="",
+                           reference_bone="", position_tolerance=0.01, loop=False,
+                           contact_start=None, contact_end=None, ground_z=None, rotation_tolerance=0.05):
+        """Assess sampled loop and fixed-attachment continuity, plus optional flat-ground contact."""
+        import math
+        from mathutils import Vector, Quaternion
+        if not isinstance(position_tolerance, (int, float)) or not math.isfinite(position_tolerance) or position_tolerance < 0:
+            raise ValueError("position_tolerance must be finite and non-negative")
+        if not isinstance(rotation_tolerance, (int, float)) or not math.isfinite(rotation_tolerance) or not 0 <= rotation_tolerance <= math.pi:
+            raise ValueError("rotation_tolerance must be finite radians between zero and pi")
+        def angle(first_rotation, last_rotation):
+            first_q, last_q = Quaternion(first_rotation), Quaternion(last_rotation)
+            first_q.normalize()
+            last_q.normalize()
+            return 2 * math.acos(min(1.0, abs(first_q.dot(last_q))))
+        if (contact_start is None) != (contact_end is None):
+            raise ValueError("Specify both contact_start and contact_end")
+        if contact_start is not None and (type(contact_start) is not int or type(contact_end) is not int
+                                          or not frame_start <= contact_start <= contact_end <= frame_end):
+            raise ValueError("Contact interval must be an integer range within the sampled range")
+        if ground_z is not None and (not isinstance(ground_z, (int, float)) or not math.isfinite(ground_z)):
+            raise ValueError("ground_z must be finite")
+        report = self.inspect_motion(name, frame_start, frame_end, step, reference_object, reference_bone)
+        samples = report['samples']
+        first, last = samples[0], samples[-1]
+        warnings = []
+        relative = [Vector(s['reference_position']) for s in samples if s['reference_position'] is not None]
+        if relative:
+            drift = max((p - relative[0]).length for p in relative)
+            if drift > position_tolerance:
+                warnings.append({"kind": "attachment_offset_changed", "maximum_reference_local_drift": drift})
+            rotation_drift = max(angle(first['reference_rotation_quaternion'], s['reference_rotation_quaternion']) for s in samples)
+            if rotation_drift > rotation_tolerance:
+                warnings.append({"kind": "attachment_rotation_changed", "maximum_radians": rotation_drift})
+        loop_result = None
+        if loop:
+            if last['frame'] != frame_end:
+                raise ValueError("Loop validation requires step to include the last frame")
+            loop_result = {"position_gap": (Vector(last['world_position']) - Vector(first['world_position'])).length,
+                           "rotation_gap_radians": angle(first['world_rotation_quaternion'], last['world_rotation_quaternion'])}
+            if loop_result['position_gap'] > position_tolerance:
+                warnings.append({"kind": "loop_position_gap", **loop_result})
+            if loop_result['rotation_gap_radians'] > rotation_tolerance:
+                warnings.append({"kind": "loop_rotation_gap", **loop_result})
+        contacts = [s for s in samples if contact_start is not None and contact_start <= s['frame'] <= contact_end]
+        if contact_start is not None and not contacts:
+            raise ValueError("No contact samples; reduce step")
+        if contacts:
+            anchor = Vector(contacts[0]['world_position'])
+            for sample in contacts:
+                point = Vector(sample['world_position'])
+                slide = math.hypot(point.x - anchor.x, point.y - anchor.y)
+                if slide > position_tolerance:
+                    warnings.append({"kind": "contact_origin_slide", "frame": sample['frame'], "distance": slide})
+                if ground_z is not None and point.z < ground_z - position_tolerance:
+                    warnings.append({"kind": "contact_origin_below_ground", "frame": sample['frame']})
+        return {"object": name, "sample_count": len(samples), "sample_step": step, "loop": loop_result,
+                "warnings": warnings[:100], "warning_count": len(warnings),
+                "limitations": ["Attachment check assumes a fixed offset for the whole interval; split intentional hand-offs.",
+                                "Contact uses the object's origin, not mesh surfaces; use an appropriate contact marker.",
+                                "Ground is a world-Z plane. No between-sample or artistic checks."]}
+
+    def get_sculpt_revision(self, obj):
+        """Fingerprint base geometry, mask and object transform for guarded sculpt edits."""
+        import hashlib
+        import json
+        from array import array
+        if len(obj.data.vertices) > 500000:
+            return None
+        digest = hashlib.sha256()
+        header = [obj.name, obj.as_pointer(), obj.data.as_pointer(), obj.data.users,
+                  obj.mode, [list(row) for row in obj.matrix_world],
+                  [(m.name, m.type, m.show_viewport) for m in obj.modifiers],
+                  obj.data.shape_keys is not None]
+        digest.update(json.dumps(header).encode('utf-8'))
+        for collection, key, size, kind in [(obj.data.vertices, 'co', 3, 'f'),
+                                            (obj.data.edges, 'vertices', 2, 'i'),
+                                            (obj.data.loops, 'vertex_index', 1, 'i')]:
+            values = array(kind, [0]) * (len(collection) * size)
+            collection.foreach_get(key, values)
+            digest.update(values.tobytes())
+        mask = obj.data.attributes.get('.sculpt_mask')
+        if mask and mask.domain == 'POINT' and mask.data_type == 'FLOAT':
+            values = array('f', [0]) * len(mask.data)
+            mask.data.foreach_get('value', values)
+            digest.update(values.tobytes())
+        return digest.hexdigest()
+
+    def inspect_sculpt(self, name):
+        """Inspect sculpt prerequisites and preservation risks."""
+        obj = bpy.context.scene.objects.get(name)
+        if obj is None or obj.type != 'MESH':
+            raise ValueError("Target must be a scene mesh")
+        return {"object": name, "mode": obj.mode, "vertices": len(obj.data.vertices),
+                "revision": self.get_sculpt_revision(obj),
+                "revision_scope": "Base geometry, mask, transform and edit prerequisites; not a full-scene revision",
+                "shared_mesh_users": obj.data.users,
+                "shape_keys": obj.data.shape_keys is not None,
+                "multires": [{"name": m.name, "levels": m.levels, "sculpt_levels": m.sculpt_levels,
+                              "total_levels": m.total_levels} for m in obj.modifiers if m.type == 'MULTIRES'],
+                "attributes": [{"name": a.name, "domain": a.domain, "type": a.data_type} for a in obj.data.attributes],
+                "supported_edit": "sculpt_region: bounded world-space radial displacement of base vertices",
+                "limitations": ["No native brush automation, dynamic topology or multires detail editing."]}
+
+    def sculpt_region(self, name, center, radius, displacement, max_vertices=100000,
+                      expected_revision="", operation_id=""):
+        """Experimental topology-preserving radial displacement with checkpoint and mask support."""
+        import math
+        import json
+        from mathutils import Vector
+        if not isinstance(expected_revision, str) or not isinstance(operation_id, str) or len(operation_id) > 100:
+            raise ValueError("Use a revision string and an optional operation_id of at most 100 characters")
+        request = json.dumps([name, center, radius, displacement, max_vertices, expected_revision], allow_nan=False)
+        ledger = getattr(self, '_quality_operations', {})
+        if operation_id and operation_id in ledger:
+            prior_request, result = ledger[operation_id]
+            if request != prior_request:
+                raise ValueError("operation_id was already used with different parameters")
+            return dict(result, replayed=True)
+        if operation_id and len(ledger) >= 64:
+            raise ValueError("Session operation ledger is full; start a new session before further guarded edits")
+        if type(max_vertices) is not int or not 1 <= max_vertices <= 500000:
+            raise ValueError("max_vertices must be 1–500000")
+        if any(not isinstance(v, (list, tuple)) or len(v) != 3 for v in (center, displacement)):
+            raise ValueError("center and displacement must have three components")
+        if not all(isinstance(x, (int, float)) and math.isfinite(x) for v in (center, displacement) for x in v):
+            raise ValueError("Coordinates must be finite numbers")
+        if not isinstance(radius, (int, float)) or not math.isfinite(radius) or radius <= 0:
+            raise ValueError("radius must be positive and finite")
+        obj = bpy.context.scene.objects.get(name)
+        if obj is None or obj.type != 'MESH' or obj.mode != 'OBJECT':
+            raise ValueError("Use an existing Object Mode mesh")
+        if obj.data.users != 1 or obj.data.shape_keys or len(obj.data.vertices) > max_vertices:
+            raise ValueError("Shared meshes, shape keys or meshes over the vertex cap are unsupported")
+        if any(m.type in {'MULTIRES', 'ARMATURE'} for m in obj.modifiers):
+            raise ValueError("Multires and rigged meshes require a different editing workflow")
+        if expected_revision and self.get_sculpt_revision(obj) != expected_revision:
+            raise ValueError("Target changed since inspection; inspect_sculpt again before editing")
+        center, displacement = Vector(center), Vector(displacement)
+        inverse = obj.matrix_world.inverted().to_3x3()
+        mask = obj.data.attributes.get('.sculpt_mask')
+        if mask and (mask.domain != 'POINT' or mask.data_type != 'FLOAT'):
+            raise ValueError("Unsupported sculpt mask representation")
+        edits = []
+        for vertex in obj.data.vertices:
+            distance = (obj.matrix_world @ vertex.co - center).length
+            if distance < radius:
+                weight = (1 - distance / radius) ** 2
+                if mask:
+                    weight *= 1 - min(1, max(0, mask.data[vertex.index].value))
+                if weight > 0 and displacement.length > 0:
+                    edits.append((vertex.index, vertex.co.copy(), inverse @ (displacement * weight)))
+        if not edits:
+            result = {"modified": False, "changed_vertices": 0, "replayed": False,
+                      "revision": self.get_sculpt_revision(obj)}
+            if operation_id:
+                ledger[operation_id] = (request, result)
+                self._quality_operations = ledger
+            return result
+        checkpoint = self.create_checkpoint('Before radial sculpt edit')
+        try:
+            for index, original, delta in edits:
+                obj.data.vertices[index].co = original + delta
+            obj.data.update()
+        except Exception:
+            for index, original, delta in edits:
+                obj.data.vertices[index].co = original
+            obj.data.update()
+            raise
+        result = {"modified": True, "changed_objects": [name], "changed_vertices": len(edits),
+                  "checkpoint": checkpoint, "revision": self.get_sculpt_revision(obj),
+                  "replayed": False,
+                  "limitations": ["Experimental radial displacement, not a native sculpt brush or automatic retopology."]}
+        if operation_id:
+            ledger[operation_id] = (request, result)
+            self._quality_operations = ledger
+        return result
+
+    def compare_reference(self, reference_path, preview_path, output_path, alignment_confirmed=False, mode="side_by_side"):
+        """Produce a side-by-side comparison from local images; no ungrounded accuracy score."""
+        import numpy as np
+        from pathlib import Path
+        if any(not Path(p).is_absolute() for p in (reference_path, preview_path, output_path)):
+            raise ValueError("Comparison paths must be absolute")
+        paths = [Path(p).resolve() for p in (reference_path, preview_path, output_path)]
+        if mode not in {'side_by_side', 'overlay'}:
+            raise ValueError("mode must be side_by_side or overlay")
+        if mode == 'overlay' and not alignment_confirmed:
+            raise ValueError("Overlay requires caller-confirmed camera alignment")
+        if paths[2] in paths[:2] or paths[2].exists():
+            raise ValueError("output_path must be a new file, distinct from both inputs")
+        images = []
+        output = None
+        try:
+            for path in paths[:2]:
+                image = bpy.data.images.load(str(path), check_existing=False)
+                images.append(image)
+                if image.size[0] * image.size[1] > 16777216:
+                    raise ValueError("Input images must be at most 16 megapixels")
+                width, height = image.size
+                if not width or not height:
+                    raise ValueError("Image could not be decoded")
+                factor = min(1, 768 / max(width, height))
+                image.scale(max(1, round(width * factor)), max(1, round(height * factor)))
+            if mode == 'overlay' and tuple(images[0].size) != tuple(images[1].size):
+                raise ValueError("Aligned overlay inputs must have the same dimensions after scaling")
+            width = sum(im.size[0] for im in images) if mode == 'side_by_side' else images[0].size[0]
+            height = max(im.size[1] for im in images)
+            canvas = np.zeros((height, width, 4), dtype=np.float32)
+            canvas[:, :, 3] = 1
+            left = 0
+            for image in images:
+                w, h = image.size
+                pixels = np.empty(w * h * 4, dtype=np.float32)
+                image.pixels.foreach_get(pixels)
+                if mode == 'overlay':
+                    canvas[:h, :w, :3] += pixels.reshape(h, w, 4)[:, :, :3] * 0.5
+                else:
+                    canvas[:h, left:left + w] = pixels.reshape(h, w, 4)
+                    left += w
+            output = bpy.data.images.new('MCP reference comparison', width=width, height=height, alpha=True)
+            output.pixels.foreach_set(canvas.ravel())
+            output.filepath_raw = str(paths[2])
+            output.file_format = 'PNG'
+            output.save()
+            return {"path": str(paths[2]), "mode": mode, "left": "reference", "right": "preview",
+                    "alignment_confirmed": alignment_confirmed, "accuracy_score": None,
+                    "limitations": ["No automatic camera fit or semantic resemblance score.",
+                                    "Hidden surfaces cannot be verified from a front-only reference."]}
+        finally:
+            if output:
+                bpy.data.images.remove(output)
+            for image in images:
+                bpy.data.images.remove(image)
+
+    def export_asset(self, names, filepath, animation_mode="SCENE", frame_start=None, frame_end=None):
+        """Export selected objects to a new GLB without applying changes to source meshes."""
+        from pathlib import Path
+        if not isinstance(names, list) or not names or len(names) > 200 or any(not isinstance(n, str) for n in names):
+            raise ValueError("names must contain 1–200 exact object names")
+        if not Path(filepath).is_absolute():
+            raise ValueError("filepath must be absolute")
+        path = Path(filepath).resolve()
+        if path.suffix.lower() != '.glb' or path.exists():
+            raise ValueError("Use a new .glb output path")
+        if bpy.context.mode != 'OBJECT':
+            raise ValueError("Export requires Object Mode")
+        if animation_mode not in {'SCENE', 'ACTIONS', 'NONE'}:
+            raise ValueError("animation_mode must be SCENE, ACTIONS or NONE")
+        if (frame_start is None) != (frame_end is None):
+            raise ValueError("Specify both export range endpoints or neither")
+        scene = bpy.context.scene
+        start = scene.frame_start if frame_start is None else frame_start
+        end = scene.frame_end if frame_end is None else frame_end
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end or end - start > 1999:
+            raise ValueError("Use an ordered nonnegative export range of at most 2000 frames")
+        properties = bpy.ops.export_scene.gltf.get_rna_type().properties
+        if animation_mode != 'NONE' and ('export_animation_mode' not in properties or
+                animation_mode not in properties['export_animation_mode'].enum_items.keys()):
+            raise ValueError("This Blender glTF exporter does not support the requested animation profile")
+        objects = [bpy.context.view_layer.objects.get(n) for n in names]
+        if any(o is None for o in objects):
+            raise ValueError("Every object must exist in the active view layer")
+        selected = list(bpy.context.selected_objects)
+        active = bpy.context.view_layer.objects.active
+        saved_range = scene.frame_start, scene.frame_end, scene.frame_current, scene.frame_subframe
+        try:
+            for obj in selected:
+                obj.select_set(False)
+            for obj in objects:
+                obj.select_set(True)
+            if any(not o.select_get() for o in objects):
+                raise ValueError("Some targets cannot be selected; unhide them before export")
+            scene.frame_start, scene.frame_end = start, end
+            settings = {'filepath': str(path), 'export_format': 'GLB', 'use_selection': True,
+                        'export_animations': animation_mode != 'NONE'}
+            if animation_mode != 'NONE':
+                settings.update(export_animation_mode=animation_mode, export_frame_range=True,
+                                export_force_sampling=True)
+                if animation_mode == 'SCENE':
+                    settings['export_anim_scene_split_object'] = False
+            result = bpy.ops.export_scene.gltf(**settings)
+            if 'FINISHED' not in result or not path.is_file():
+                raise RuntimeError("GLB export did not finish")
+            return {"path": str(path), "bytes": path.stat().st_size,
+                    "requested_objects": names, "target_engine_verified": False,
+                    "animation_mode": animation_mode, "frame_range": [start, end],
+                    "fps": scene.render.fps, "fps_base": scene.render.fps_base,
+                    "limitations": ["Include armatures and dependencies explicitly.",
+                                    "SCENE bakes one coordinated clip; ACTIONS exports separate clips.",
+                                    "Validate the exported file separately."]}
+        finally:
+            scene.frame_start, scene.frame_end = saved_range[:2]
+            scene.frame_set(saved_range[2], subframe=saved_range[3])
+            for obj in bpy.context.selected_objects:
+                obj.select_set(False)
+            for obj in selected:
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = active
+
+    def create_checkpoint(self, label=""):
+        """Save a recovery copy without changing the active file path."""
+        import tempfile
+        import uuid
+        from pathlib import Path
+        if not isinstance(label, str) or len(label) > 200:
+            raise ValueError("label must be at most 200 characters")
+        checkpoints = getattr(self, '_quality_checkpoints', {})
+        if len(checkpoints) >= 20:
+            raise ValueError("Session checkpoint limit reached (20); archive recovery copies before starting a new session")
+        folder = Path(tempfile.gettempdir()) / 'blender_mcp_recovery'
+        folder.mkdir(exist_ok=True)
+        identifier = uuid.uuid4().hex
+        path = folder / (identifier + '.blend')
+        original = bpy.data.filepath
+        result = bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True, check_existing=False)
+        if 'FINISHED' not in result or not path.is_file():
+            raise RuntimeError("Blender did not save the recovery copy")
+        record = {"checkpoint": identifier, "label": label, "path": str(path),
+                  "original_file": original, "bytes": path.stat().st_size}
+        checkpoints[identifier] = record
+        self._quality_checkpoints = checkpoints
+        return dict(record, limitations=["External files and remote jobs are not rolled back.",
+                                         "Temporary recovery files are not a permanent backup."])
+
+    def restore_checkpoint(self, checkpoint):
+        """Restore a session recovery copy after first saving the current scene."""
+        from pathlib import Path
+        record = getattr(self, '_quality_checkpoints', {}).get(checkpoint)
+        if record is None or not Path(record['path']).is_file():
+            raise ValueError("Unknown or missing session checkpoint")
+        rescue = self.create_checkpoint(label="Before checkpoint restore")
+        result = bpy.ops.wm.open_mainfile(filepath=record['path'], load_ui=False, use_scripts=False)
+        if 'FINISHED' not in result:
+            raise RuntimeError("Restore failed; the current-state rescue copy remains available")
+        return {"restored": checkpoint, "rescue_checkpoint": rescue,
+                "active_file": bpy.data.filepath,
+                "warning": "Active file is the recovery copy. Reconnect if file loading interrupts the bridge; use Save As for your working file."}
+
+    def preview_camera(self, camera_name, filepath, max_size=768):
+        """Render a neutral shape preview from an existing scene camera and restore render settings."""
+        from pathlib import Path
+        if type(max_size) is not int or not 128 <= max_size <= 2048:
+            raise ValueError("max_size must be between 128 and 2048")
+        path = Path(filepath)
+        if not path.is_absolute() or path.exists():
+            raise ValueError("Use a new absolute output file")
+        scene = bpy.context.scene
+        camera = scene.objects.get(camera_name)
+        if camera is None or camera.type != 'CAMERA':
+            raise ValueError("camera_name must identify a camera in the active scene")
+        render = scene.render
+        saved = (scene.camera, render.engine, render.filepath, render.resolution_x,
+                 render.resolution_y, render.resolution_percentage, render.image_settings.file_format,
+                 render.image_settings.color_mode, render.use_file_extension)
+        try:
+            factor = min(1, max_size / max(render.resolution_x, render.resolution_y))
+            scene.camera = camera
+            render.engine = 'BLENDER_WORKBENCH'
+            render.resolution_x = max(4, round(render.resolution_x * factor))
+            render.resolution_y = max(4, round(render.resolution_y * factor))
+            render.resolution_percentage = 100
+            render.filepath = str(path)
+            render.use_file_extension = False
+            render.image_settings.file_format = 'PNG'
+            render.image_settings.color_mode = 'RGBA'
+            result = bpy.ops.render.render(write_still=True)
+            if 'FINISHED' not in result or not path.is_file():
+                raise RuntimeError("Camera preview did not finish")
+            evaluated = camera.evaluated_get(bpy.context.evaluated_depsgraph_get())
+            return {"path": str(path), "camera": camera_name, "frame": scene.frame_current,
+                    "width": render.resolution_x, "height": render.resolution_y,
+                    "pixel_aspect": [render.pixel_aspect_x, render.pixel_aspect_y],
+                    "projection": camera.data.type, "lens_mm": camera.data.lens,
+                    "orthographic_scale": camera.data.ortho_scale,
+                    "shift": [camera.data.shift_x, camera.data.shift_y],
+                    "sensor_fit": camera.data.sensor_fit,
+                    "sensor_mm": [camera.data.sensor_width, camera.data.sensor_height],
+                    "world_matrix": [list(row) for row in evaluated.matrix_world],
+                    "limitations": ["Uses scene Workbench shading, not final materials or lighting.",
+                                    "Camera alignment must be established by the caller; hidden geometry is unverified.",
+                                    "Replaces the transient Render Result; all scene objects can appear."]}
+        finally:
+            (scene.camera, render.engine, render.filepath, render.resolution_x,
+             render.resolution_y, render.resolution_percentage, render.image_settings.file_format,
+             render.image_settings.color_mode, render.use_file_extension) = saved
+
+    def preview_target(self, name, filepath, view="front", max_size=1000, frame_center=None, frame_radius=None):
+        """Capture a repeatable orthographic view and restore the viewport afterward."""
+        if bpy.app.background:
+            raise ValueError("Target previews require interactive Blender, not background mode")
+        from mathutils import Vector
+        import math
+        if (frame_center is None) != (frame_radius is None):
+            raise ValueError("Specify both frame_center and frame_radius for locked framing")
+        if frame_center is not None:
+            if not isinstance(frame_center, (list, tuple)) or len(frame_center) != 3 or not all(
+                    isinstance(v, (int, float)) and math.isfinite(v) for v in frame_center):
+                raise ValueError("frame_center must contain three finite world coordinates")
+            if not isinstance(frame_radius, (int, float)) or not math.isfinite(frame_radius) or frame_radius <= 0:
+                raise ValueError("frame_radius must be a finite positive world-space radius")
+        directions = {"front": (0, -1, 0), "back": (0, 1, 0),
+                      "left": (-1, 0, 0), "right": (1, 0, 0),
+                      "top": (0, 0, 1), "three_quarter": (1, -1, 0.7)}
+        if view not in directions:
+            raise ValueError("Unsupported view")
+        if type(max_size) is not int or not 128 <= max_size <= 2048:
+            raise ValueError("max_size must be between 128 and 2048")
+        obj = bpy.context.scene.objects.get(name)
+        if obj is None:
+            raise ValueError("Target is missing from the active scene")
+        screen = bpy.context.screen
+        area = next((a for a in screen.areas if a.type == 'VIEW_3D'), None) if screen else None
+        if area is None:
+            raise ValueError("A 3D viewport is required; background rendering is not supported by this tool")
+        space = area.spaces.active
+        region = space.region_3d
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        corners = [evaluated.matrix_world @ Vector(c) for c in evaluated.bound_box]
+        center = sum(corners, Vector()) / 8
+        radius = max((c - center).length for c in corners)
+        if frame_center is not None:
+            center, radius = Vector(frame_center), frame_radius
+        radius = max(radius, 0.001)
+        saved = (region.view_location.copy(), region.view_rotation.copy(),
+                 region.view_distance, region.view_perspective,
+                 space.shading.type, space.overlay.show_overlays)
+        try:
+            region.view_location = center
+            region.view_rotation = Vector(directions[view]).to_track_quat('Z', 'Y')
+            region.view_distance = max(radius * 3, 0.1)
+            region.view_perspective = 'ORTHO'
+            space.shading.type = 'SOLID'
+            space.overlay.show_overlays = False
+            region.update()
+            result = self.get_viewport_screenshot(max_size=max_size, filepath=filepath)
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+            return dict(result, target=name, view=view, center=list(center), radius=radius,
+                        projection='ORTHO', limitations=["Other scene objects can occlude the target.",
+                                                        "Supply the same framing and viewport size for before/after comparisons."])
+        finally:
+            (region.view_location, region.view_rotation, region.view_distance,
+             region.view_perspective, space.shading.type, space.overlay.show_overlays) = saved
+            region.update()
+
+    def inspect_motion(self, name, frame_start, frame_end, step=1,
+                       reference_object="", reference_bone="", max_step_distance=None):
+        """Sample evaluated world and attachment-relative positions without editing keys."""
+        import math
+        if any(type(v) is not int for v in (frame_start, frame_end, step)):
+            raise ValueError("Frames and step must be integers")
+        if step < 1 or frame_end < frame_start:
+            raise ValueError("Frame range must be ordered and step positive")
+        frames = range(frame_start, frame_end + 1, step)
+        if len(frames) > 500:
+            raise ValueError("At most 500 samples are allowed; narrow the range or increase step")
+        if max_step_distance is not None and (not isinstance(max_step_distance, (int, float))
+                or not math.isfinite(max_step_distance) or max_step_distance < 0):
+            raise ValueError("max_step_distance must be finite and non-negative")
+        obj = bpy.context.scene.objects.get(name)
+        ref = bpy.context.scene.objects.get(reference_object) if reference_object else None
+        if obj is None or (reference_object and ref is None):
+            raise ValueError("Object or reference is missing from the active scene")
+        if reference_bone and (ref is None or ref.type != 'ARMATURE'
+                               or reference_bone not in ref.pose.bones):
+            raise ValueError("reference_bone requires an existing pose bone on the reference armature")
+        scene = bpy.context.scene
+        original_frame, original_subframe = scene.frame_current, scene.frame_subframe
+        samples, warnings = [], []
+        previous_world = previous_relative = None
+        try:
+            for frame in frames:
+                scene.frame_set(frame)
+                graph = bpy.context.evaluated_depsgraph_get()
+                world = obj.evaluated_get(graph).matrix_world.copy()
+                relative = None
+                if ref:
+                    evaluated_ref = ref.evaluated_get(graph)
+                    basis = evaluated_ref.matrix_world.copy()
+                    if reference_bone:
+                        basis = basis @ evaluated_ref.pose.bones[reference_bone].matrix
+                    relative = basis.inverted() @ world
+                position = world.translation.copy()
+                rel_position = relative.translation.copy() if relative is not None else None
+                distance = (position - previous_world).length if previous_world is not None else 0.0
+                drift = ((rel_position - previous_relative).length
+                         if rel_position is not None and previous_relative is not None else None)
+                samples.append({"frame": frame, "world_position": list(position),
+                                "world_rotation_quaternion": list(world.to_quaternion()),
+                                "reference_position": list(rel_position) if rel_position is not None else None,
+                                "reference_rotation_quaternion": list(relative.to_quaternion()) if relative is not None else None,
+                                "world_step_distance": distance, "reference_step_distance": drift})
+                if max_step_distance is not None and distance > max_step_distance:
+                    warnings.append({"frame": frame, "kind": "world_step_exceeds_threshold", "distance": distance})
+                previous_world, previous_relative = position, rel_position
+        finally:
+            scene.frame_set(original_frame, subframe=original_subframe)
+        return {"object": name, "reference_object": reference_object or None,
+                "reference_bone": reference_bone or None, "samples": samples, "warnings": warnings,
+                "distance_units": "Blender scene coordinate units; reference distances use reference-local space",
+                "unit_scale": scene.unit_settings.scale_length,
+                "limitations": ["Sampled discontinuities are warnings, not proof of incorrect motion.",
+                                "No between-sample, deformation, contact, or export checks performed.",
+                                "Changing frames evaluates existing scene handlers and simulations."]}
+
+    def inspect_scene(self, offset=0, limit=50, query="", object_type=""):
+        """Read a bounded page of scene objects, including context for edits."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if not isinstance(query, str) or not isinstance(object_type, str):
+            raise ValueError("query and object_type must be strings")
+        objects = sorted((o for o in bpy.context.scene.objects
+                          if query.casefold() in o.name.casefold()
+                          and (not object_type or o.type == object_type.upper())),
+                         key=lambda o: o.name)
+        rows = []
+        for obj in objects[offset:offset + limit]:
+            rows.append({"name": obj.name, "type": obj.type,
+                         "parent": obj.parent.name if obj.parent else None,
+                         "selected": obj.select_get(), "visible": obj.visible_get(),
+                         "dimensions": list(obj.dimensions),
+                         "world_position": list(obj.matrix_world.translation),
+                         "collections": [c.name for c in obj.users_collection],
+                         "modifiers": [{"name": m.name, "type": m.type}
+                                       for m in obj.modifiers]})
+        end = offset + len(rows)
+        return {"scene": bpy.context.scene.name, "mode": bpy.context.mode,
+                "blender_version": bpy.app.version_string,
+                "unit_system": bpy.context.scene.unit_settings.system,
+                "unit_scale": bpy.context.scene.unit_settings.scale_length,
+                "total_matches": len(objects), "offset": offset, "objects": rows,
+                "next_offset": end if end < len(objects) else None,
+                "reference_policy": "Names and geometry must be rechecked after edits."}
+
+    def validate_mesh(self, name, triangle_budget=None, area_epsilon=1e-12):
+        """Read-only diagnostics on an evaluated mesh; never repairs geometry."""
+        import math
+        if triangle_budget is not None and (type(triangle_budget) is not int or triangle_budget < 0):
+            raise ValueError("triangle_budget must be a non-negative integer")
+        if not isinstance(area_epsilon, (int, float)) or not math.isfinite(area_epsilon) or area_epsilon < 0:
+            raise ValueError("area_epsilon must be finite and non-negative")
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != 'MESH':
+            raise ValueError("Target must be an existing mesh object")
+        if obj.mode != 'OBJECT':
+            raise ValueError("Switch the target to Object Mode before validation")
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        try:
+            mesh.calc_loop_triangles()
+            uses = {}
+            for poly in mesh.polygons:
+                for edge in poly.edge_keys:
+                    key = tuple(sorted(edge))
+                    uses[key] = uses.get(key, 0) + 1
+            counts = {"vertices": len(mesh.vertices), "edges": len(mesh.edges),
+                      "polygons": len(mesh.polygons), "triangles": len(mesh.loop_triangles),
+                      "zero_area_faces": sum(p.area <= area_epsilon for p in mesh.polygons),
+                      "boundary_edges": sum(n == 1 for n in uses.values()),
+                      "overused_edges": sum(n > 2 for n in uses.values()),
+                      "loose_edges": sum(tuple(sorted(e.vertices)) not in uses for e in mesh.edges),
+                      "uv_layers": len(mesh.uv_layers)}
+            return {"object": name, "geometry": "evaluated", "counts": counts,
+                    "triangle_budget": triangle_budget,
+                    "within_triangle_budget": None if triangle_budget is None else counts['triangles'] <= triangle_budget,
+                    "area_space": "object-local squared units", "area_epsilon": area_epsilon,
+                    "modified": False,
+                    "limitations": ["Open boundaries may be intentional.",
+                                    "No self-intersection, appearance, animation, or export validation performed."]}
+        finally:
+            evaluated.to_mesh_clear()
 
     def get_scene_info(self):
         """Get information about the current Blender scene"""

@@ -1,6 +1,6 @@
 [project]
 name = "blender-mcp"
-version = "1.9.1"
+version = "1.9.1+quality.1"
 description = "Blender integration through the Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,7 @@ build-backend = "setuptools.build_meta"
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-blender_mcp = ["bundled/addon.py"]
+blender_mcp = ["bundled/addon.py", "bundled/validate_export.py"]
 
 [project.urls]
 "Homepage" = "https://github.com/ahujasid/blender-mcp"
