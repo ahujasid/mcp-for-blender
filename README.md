@@ -30,6 +30,12 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 
 ---
 
+## Modeling quality tools
+
+This development build adds eighteen tools for searchable scene inspection, mesh and animation diagnostics, checkpoints, repeatable previews, reference-image comparison, experimental sculpt edits, and GLB export validation. The tools expose detailed descriptions, parameters, and limitations through MCP discovery. See [implementation status and validation](IMPLEMENTATION_STATUS.md) for the supported behavior and [the research roadmap](IMPROVEMENT_PLAN.md) for proposals beyond this build.
+
+To use this extension, install this checkout in a Python virtual environment with `python -m pip install .`, run its `blender-mcp` command from your MCP client, and install the matching `addon.py` from this repository in Blender. Set `BLENDER_HOST` and `BLENDER_PORT` to match the Blender add-on. The `uvx blender-mcp` quickstart below uses the published package. To test changes that have not been released on PyPI, run the server from this checkout.
+
 ## Quickstart
 
 Three steps: install `uv`, point your MCP client at the server, install the Blender addon.

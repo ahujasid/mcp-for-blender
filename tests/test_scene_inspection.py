@@ -27,7 +27,7 @@ def scene_object(name, kind="MESH"):
 def inspection_context(objects, excluded=()):
     scene = SimpleNamespace(name="Scene", objects=objects,
                             unit_settings=SimpleNamespace(system="METRIC", scale_length=1))
-    layer = SimpleNamespace(objects={o.name: o for o in objects if o.name not in excluded})
+    layer = SimpleNamespace(objects={o.name: o for o in objects if o.name not in excluded}, update=Mock())
     return SimpleNamespace(context=SimpleNamespace(scene=scene, view_layer=layer, mode="OBJECT"),
                            app=SimpleNamespace(version_string="test"))
 

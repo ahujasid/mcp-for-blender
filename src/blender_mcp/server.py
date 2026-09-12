@@ -254,6 +254,9 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Create the MCP server with lifespan support
 mcp = FastMCP(
     "BlenderMCP",
+    instructions=("For modeling quality tools, call get_quality_capabilities to discover supported "
+                  "operations and limitations. Tool success does not establish visual quality. "
+                  "Use matching server and Blender add-on versions."),
     lifespan=server_lifespan
 )
 
@@ -414,6 +417,408 @@ async def get_scene_info(ctx: Context, user_prompt: str) -> str:
             )
         except Exception:
             pass
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def preview_animation(ctx: Context, name: str, frames: list[int], view: str = "three_quarter",
+                      max_size: int = 512) -> list:
+    """Inspect up to eight posed animation frames visually, with frame labels.
+
+    name identifies one scene object; frames contains 1 to 8 integers. view and max_size
+    follow preview_target. Requires interactive Blender. Restores frame and viewport;
+    no keyframes are edited. Returns labeled images with framing locked to the first
+    sample; later movement may leave the view. Use inspect_motion to measure drift.
+    Sampled poses cannot prove smooth timing or identify
+    every between-frame problem; request closer samples around suspicious frames.
+    """
+    from mcp.types import TextContent
+    with tempfile.TemporaryDirectory(prefix='blender_mcp_motion_preview_') as directory:
+        result = get_blender_connection().send_command('preview_animation', {
+            'name': name, 'frames': frames, 'directory': directory, 'view': view, 'max_size': max_size})
+        content = []
+        for frame in result['frames']:
+            content.append(TextContent(type='text', text=f"{name}: frame {frame['frame']}, view {frame['view']}"))
+            with open(frame['path'], 'rb') as handle:
+                content.append(Image(data=handle.read(), format='png').to_image_content())
+        return content
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def validate_deformation(ctx: Context, name: str, frames: list[int], reference_frame: int,
+                               max_stretch: float = 3.0, min_ratio: float = 0.1) -> dict:
+    """Check a mesh's evaluated deformation at specified animation or stress-pose frames.
+
+    frames contains 1 to 100 integers, reference_frame is a known good pose. Compares world
+    edge lengths to that pose; max_stretch and min_ratio are heuristic ratio thresholds
+    (0 <= min_ratio <= 1 <= max_stretch). Requires consistent topology and Object Mode.
+    Returns per-frame ratios and bounded suspicious-edge indices. Restores frame/subframe;
+    evaluates existing handlers. Does not edit the rig, judge anatomy, or prove good
+    animation. Follow flagged frames with visual previews. Up to five million vertex samples.
+    """
+    return get_blender_connection().send_command("validate_deformation", {
+        "name": name, "frames": frames, "reference_frame": reference_frame,
+        "max_stretch": max_stretch, "min_ratio": min_ratio})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def inspect_rig(ctx: Context, name: str, offset: int = 0, limit: int = 50,
+                      mesh_name: str = "", influence_limit: int = 4) -> dict:
+    """Inspect an armature before rig edits or diagnosing deformation.
+
+    name is an exact scene armature name; offset and limit (1 to 200) page sorted bones.
+    mesh_name optionally checks deform weights on an Object Mode mesh; influence_limit
+    is a project-specific positive cap. Returns bone hierarchy, evaluated constraint
+    validity, active action/NLA counts and bounded weight-issue examples. Read-only.
+    Control groups are excluded. Unnormalized weights may still deform correctly;
+    inspect deformation with validate_deformation before drawing conclusions.
+    """
+    return get_blender_connection().send_command("inspect_rig", {
+        "name": name, "offset": offset, "limit": limit, "mesh_name": mesh_name,
+        "influence_limit": influence_limit})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def validate_animation(ctx: Context, name: str, frame_start: int, frame_end: int,
+                             step: int = 1, reference_object: str = "", reference_bone: str = "",
+                             position_tolerance: float = 0.01, loop: bool = False,
+                             contact_start: int | None = None, contact_end: int | None = None,
+                             ground_z: float | None = None, rotation_tolerance: float = 0.05) -> dict:
+    """Check evaluated animation for loop gaps, fixed attachment drift and declared contact.
+
+    Uses inspect_motion's object, reference, and frame conventions, with at most 500
+    samples. A reference means a constant attachment offset is intended: split hand-offs
+    into separate ranges. position_tolerance is a distance in the corresponding world
+    or reference-local coordinates. rotation_tolerance is an angular tolerance in radians
+    from zero to pi; checks both loop and fixed attachment orientation. Quaternion signs
+    are treated as equivalent. loop requires an inclusive end sample. Optional
+    contact_start/end declare a stationary contact interval; ground_z is a world-Z plane.
+    Contact checks use the object's origin, so use a foot/contact marker, not a character
+    root. Returns explicit warnings and loop measurements. Does not edit keys. Sampling
+    evaluates handlers/simulations; frames are restored. No artistic pass score.
+    """
+    return get_blender_connection().send_command("validate_animation", {
+        "name": name, "frame_start": frame_start, "frame_end": frame_end, "step": step,
+        "reference_object": reference_object, "reference_bone": reference_bone,
+        "position_tolerance": position_tolerance, "loop": loop, "contact_start": contact_start,
+        "contact_end": contact_end, "ground_z": ground_z, "rotation_tolerance": rotation_tolerance})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def inspect_sculpt(ctx: Context, name: str) -> dict:
+    """Inspect a scene mesh before sculpting: vertex count, mode, shared users, shape
+    keys, masks/attributes and multires levels. Read-only. Exposes supported operations
+    and preservation risks; it does not judge anatomy, likeness, or topology quality.
+    Returns a revision token up to 500000 vertices, covering base geometry, transform,
+    mask and edit prerequisites. Pass it to sculpt_region to reject stale edits.
+    """
+    return get_blender_connection().send_command("inspect_sculpt", {"name": name})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def sculpt_region(ctx: Context, name: str, center: list[float], radius: float,
+                        displacement: list[float], max_vertices: int = 100000,
+                        expected_revision: str = "", operation_id: str = "") -> dict:
+    """Make an experimental local shape edit using radial displacement and quadratic falloff.
+
+    name is an Object Mode mesh; center and displacement each contain three finite
+    world-space coordinates; radius is a positive world-space distance. Honors the
+    .sculpt_mask point attribute. max_vertices is a cap (1 to 500000), not a target density.
+    Rejects shared mesh data, shape keys, armature and multires modifiers. Saves a
+    checkpoint before mutation and preserves topology/UVs. Returns changed vertex count
+    and recovery information. This is not a native brush, dyntopo, or retopology tool.
+    Inspect several preview angles and validate_mesh afterward; avoid blind repeat calls.
+    Pass inspect_sculpt's revision as expected_revision to reject changed targets. A unique
+    operation_id (up to 100 characters) deduplicates identical successful requests within
+    this add-on session (64 stored results); changing its parameters is rejected. Replayed
+    results describe the original edit, not current scene state. Re-inspect afterward.
+    """
+    return get_blender_connection().send_command("sculpt_region", {
+        "name": name, "center": center, "radius": radius, "displacement": displacement,
+        "max_vertices": max_vertices, "expected_revision": expected_revision, "operation_id": operation_id})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def compare_reference(ctx: Context, reference_path: str, preview_path: str,
+                      alignment_confirmed: bool = False, mode: str = "side_by_side") -> Image:
+    """View a local reference (left) and Blender preview (right) together to judge fidelity.
+
+    mode is side_by_side or overlay. Overlay requires alignment_confirmed and matching
+    image dimensions; it blends the aligned images equally, without fitting a camera.
+    Both paths must be absolute image paths accessible on the Blender host. Images are
+    scaled proportionally to at most 768 pixels per side. alignment_confirmed records
+    caller judgment; it does not fit a camera or compute an accuracy score. Camera,
+    silhouette and perspective must be compared separately from lighting/materials.
+    Hidden geometry cannot be verified from one front-only image. No source image or
+    scene geometry is edited. Returns a comparison image for visual inspection.
+    """
+    with tempfile.TemporaryDirectory(prefix="blender_mcp_comparison_") as directory:
+        path = os.path.join(directory, 'comparison.png')
+        get_blender_connection().send_command("compare_reference", {
+            "reference_path": reference_path, "preview_path": preview_path,
+            "output_path": path, "alignment_confirmed": alignment_confirmed, "mode": mode})
+        with open(path, 'rb') as handle:
+            return Image(data=handle.read(), format='png')
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def export_asset(ctx: Context, names: list[str], filepath: str, animation_mode: str = "SCENE",
+                       frame_start: int | None = None, frame_end: int | None = None) -> dict:
+    """Export specified active-view-layer objects to a new absolute GLB file.
+
+    Include armatures and dependencies explicitly in names (1 to 200). Requires Object
+    Mode and selectable targets. Rejects existing output files. Writes an export using
+    a deliberate animation profile without applying modifiers to the working mesh.
+    animation_mode SCENE bakes one coordinated clip (recommended for held-prop actions);
+    ACTIONS keeps separate clips; NONE exports without animation. Optional frame_start/end
+    must both be specified; otherwise uses the scene range. Range is nonnegative, ordered
+    and at most 2000 frames. Restores selection, active object, timeline and range.
+    Returns size and path, not target-engine
+    certification. Run validate_export on the result and inspect target-engine import.
+    """
+    return get_blender_connection().send_command("export_asset", {"names": names, "filepath": filepath,
+        "animation_mode": animation_mode, "frame_start": frame_start, "frame_end": frame_end})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def validate_export(ctx: Context, filepath: str, frames: list[int] | None = None,
+                          compare_object: str = "", reference_object: str = "", reference_bone: str = "",
+                          position_tolerance: float = 0.01, rotation_tolerance: float = 0.05) -> dict:
+    """Verify that a local GLB imports in a fresh Blender process, away from the working scene.
+
+    filepath must be an existing absolute .glb path on this local server host; maximum
+    100 MB. frames optionally requests up to 20 integer object-motion samples. Requires
+    a live matching add-on to identify its Blender executable. Runs a disposable process
+    with factory settings and automatic scripts disabled, with a 90-second timeout.
+    Returns imported objects, dimensions, triangle counts, bones, images and actions.
+    Optional compare_object matches one exact object name to the CURRENT scene at frames,
+    reporting world and optional reference-object/bone-local position/orientation errors.
+    Include that reference rig/object in the export. Uses the imported active actions;
+    multiple clips, renaming or changed source scenes require deliberate interpretation.
+    Tolerances are distances in the reported space and radians. Import success alone
+    does not prove visual equivalence, correct skinning, or target-engine compatibility.
+    """
+    import subprocess
+    import math
+    path = Path(filepath)
+    frames = [] if frames is None else frames
+    if not path.is_absolute() or not path.is_file() or path.suffix.lower() != '.glb':
+        raise ValueError('filepath must identify an existing absolute .glb file')
+    if path.stat().st_size > 100 * 1024 * 1024:
+        raise ValueError('Export validation is limited to 100 MB')
+    if not isinstance(frames, list) or len(frames) > 20 or any(type(f) is not int for f in frames):
+        raise ValueError('frames must contain at most 20 integers')
+    if compare_object and not frames:
+        raise ValueError('Comparison requires explicit sampled frames')
+    if reference_bone and not reference_object:
+        raise ValueError('reference_bone requires reference_object')
+    if not math.isfinite(position_tolerance) or position_tolerance < 0 or not math.isfinite(rotation_tolerance) or not 0 <= rotation_tolerance <= math.pi:
+        raise ValueError('Use nonnegative finite distance and angular tolerance from zero to pi')
+    info = get_blender_connection().send_command('get_quality_info')
+    source = []
+    if compare_object:
+        for frame in frames:
+            sample = get_blender_connection().send_command('inspect_motion', {
+                'name': compare_object, 'frame_start': frame, 'frame_end': frame,
+                'reference_object': reference_object, 'reference_bone': reference_bone})
+            source.append(sample['samples'][0])
+    executable = info['blender_executable']
+    worker = Path(__file__).parent / 'bundled' / 'validate_export.py'
+    with tempfile.TemporaryDirectory(prefix='blender_mcp_export_check_') as directory:
+        output = Path(directory) / 'report.json'
+        frame_file = Path(directory) / 'frames.json'
+        frame_file.write_text(json.dumps({'frames': frames, 'fps': info.get('fps', 24),
+                                         'fps_base': info.get('fps_base', 1), 'reference_object': reference_object,
+                                         'reference_bone': reference_bone}), encoding='utf-8')
+        args = [executable, '--background', '--factory-startup', '--disable-autoexec',
+                '--python-exit-code', '1', '--python', str(worker), '--', str(path), str(output), str(frame_file)]
+        def run():
+            try:
+                return subprocess.run(args, capture_output=True, text=True, timeout=90,
+                                      stdin=subprocess.DEVNULL,
+                                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError('Disposable Blender export check exceeded 90 seconds; working scene unchanged') from exc
+        process = await asyncio.to_thread(run)
+        if process.returncode != 0 or not output.is_file():
+            raise RuntimeError('Disposable Blender export check failed: ' + process.stderr[-1000:])
+        report = json.loads(output.read_text(encoding='utf-8'))
+        if not report.get('imported'):
+            raise RuntimeError(report.get('error', 'GLB import failed'))
+        if compare_object:
+            comparisons = []
+            def rotation_error(left, right):
+                scale = math.sqrt(sum(v * v for v in left) * sum(v * v for v in right))
+                if not scale or not math.isfinite(scale):
+                    raise ValueError('Cannot compare a non-finite or zero quaternion')
+                return 2 * math.acos(min(1, abs(sum(a * b for a, b in zip(left, right)) / scale)))
+            for original, imported in zip(source, report['motion']):
+                target = next((obj for obj in imported['objects'] if obj['name'] == compare_object), None)
+                if target is None:
+                    raise ValueError('Compared object name was not preserved in the export')
+                row = {'frame': original['frame'],
+                       'position_error': math.dist(original['world_position'], target['position']),
+                       'rotation_error_radians': rotation_error(original['world_rotation_quaternion'], target['rotation'])}
+                if reference_object:
+                    row['reference_position_error'] = math.dist(original['reference_position'], target['reference_position'])
+                    row['reference_rotation_error_radians'] = rotation_error(original['reference_rotation_quaternion'], target['reference_rotation'])
+                row['within_tolerance'] = all(value <= (rotation_tolerance if 'rotation' in key else position_tolerance)
+                                              for key, value in row.items() if 'error' in key)
+                comparisons.append(row)
+            report['source_comparison'] = {'object': compare_object, 'samples': comparisons,
+                                            'all_samples_within_tolerance': all(r['within_tolerance'] for r in comparisons),
+                                            'source': 'current scene; exact names and active imported actions',
+                                            'reference_object': reference_object or None, 'reference_bone': reference_bone or None}
+        return report
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_quality_capabilities(ctx: Context) -> dict:
+    """Discover this server's modeling-quality tools before planning Blender work.
+
+    No Blender connection is required. Returns available tool purposes, prerequisites,
+    and unimplemented checks. This describes the server, not the installed add-on:
+    use get_quality_status to check the live extension separately. It does not inspect a scene.
+    """
+    return {
+        "scope": "server-side capability catalog; matching add-on required",
+        "tools": {
+            "get_quality_status": "Check the live matching extension, scene, mode and units.",
+            "inspect_scene": "Read searchable pages of object names and editing context; follow next_offset.",
+            "validate_mesh": "Read evaluated mesh counts and topology warnings in Object Mode; never repairs.",
+            "inspect_motion": "Sample evaluated world/bone-relative motion; flags candidate position jumps.",
+            "create_checkpoint": "Save a temporary recovery copy before substantial edits; session limit 20.",
+            "restore_checkpoint": "Replace scene from a known checkpoint after saving a rescue copy.",
+            "preview_target": "Read an orthographic solid viewport image; interactive Blender required.",
+            "preview_camera": "Render a shape preview from an existing aligned scene camera.",
+            "preview_animation": "Inspect a labeled sequence of up to eight posed frames.",
+            "inspect_rig": "Inspect bones, constraints and deform-weight issues.",
+            "validate_deformation": "Compare evaluated edge stretch/collapse at posed frames.",
+            "validate_animation": "Check sampled loop gaps, fixed attachments and declared origin contact.",
+            "inspect_sculpt": "Inspect mesh and multires preservation risks.",
+            "sculpt_region": "Experimental masked radial displacement with a checkpoint.",
+            "compare_reference": "View local images side by side or as an aligned overlay.",
+            "export_asset": "Export selected objects to a new GLB.",
+            "validate_export": "Import a GLB in a disposable Blender process and report contents."},
+        "not_implemented": ["automatic artistic scoring", "automatic single-image 3D reconstruction",
+                            "native brush/dyntopo automation", "target-engine certification"],
+        "evidence_limits": "A completed call establishes only the checks explicitly returned."
+    }
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def get_quality_status(ctx: Context) -> dict:
+    """Check the connected Blender's quality extension before using these tools.
+
+    Returns live Blender and extension versions, supported operations, file, scene,
+    view layer, mode, units, frame and recovery-copy count. Use this after connecting
+    or restoring a checkpoint. An original upstream add-on without this extension
+    cannot serve these calls; install the matching fork add-on and server. Read-only;
+    does not claim the asset passed validation or enable optional cloud integrations.
+    """
+    return get_blender_connection().send_command('get_quality_info')
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_checkpoint(ctx: Context, label: str = "") -> dict:
+    """Save a scene recovery copy before substantial geometry, rig, or animation edits.
+
+    label: optional human-readable purpose, at most 200 characters. Returns a checkpoint
+    identifier, file path and original file path. Retain the identifier for restore_checkpoint.
+    Keeps the active project path, but writes a temporary .blend file. Maximum 20 per
+    add-on session; no automatic eviction. Copies are not permanent backups and do not
+    roll back external files or remote jobs. A successful save is not a quality check.
+    """
+    return get_blender_connection().send_command("create_checkpoint", {"label": label})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def restore_checkpoint(ctx: Context, checkpoint: str) -> dict:
+    """Replace the current scene with a known recovery checkpoint when rollback is intended.
+
+    checkpoint: identifier returned by create_checkpoint in this add-on session, not a
+    file path. First saves a rescue copy of current state; fails without loading if that
+    save fails. Returns restored identifier, rescue information and the new active path.
+    Loading changes the active file to the recovery copy and may interrupt the connection.
+    Re-inspect after reconnecting; do not blindly retry an uncertain restore. External
+    files/jobs are not restored. Use Save As before resuming saves to a working project.
+    """
+    return get_blender_connection().send_command("restore_checkpoint", {"checkpoint": checkpoint})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
+def preview_camera(ctx: Context, camera_name: str, max_size: int = 768, output_path: str = "") -> list:
+    """Render a reference-comparison image from an existing Blender scene camera.
+
+    camera_name is an exact active-scene camera name. Set its projection, transform,
+    lens/orthographic scale, shifts and scene aspect ratio to match the reference first.
+    max_size is 128 to 2048 pixels along the longest side. Uses Workbench shading and the
+    current frame, preserving render settings and active camera on success or failure.
+    Returns projection metadata and an image. Replaces transient Render Result. Shows
+    the scene's render-visible objects. No automatic camera fitting, material fidelity,
+    semantic likeness score, or verification of unseen surfaces. Keep camera and scene
+    shading unchanged to compare revisions. Optional output_path saves a new absolute
+    PNG on the Blender/server host for compare_reference; existing files are rejected.
+    """
+    from mcp.types import TextContent
+    with tempfile.TemporaryDirectory(prefix='blender_mcp_camera_') as directory:
+        path = output_path or os.path.join(directory, 'camera.png')
+        if output_path and Path(output_path).suffix.lower() != '.png':
+            raise ValueError('output_path must end in .png')
+        result = get_blender_connection().send_command('preview_camera', {
+            'camera_name': camera_name, 'filepath': path, 'max_size': max_size})
+        if not output_path:
+            result.pop('path', None)
+        with open(path, 'rb') as handle:
+            return [TextContent(type='text', text=json.dumps(result)),
+                    Image(data=handle.read(), format='png').to_image_content()]
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def preview_target(ctx: Context, name: str, view: str = "front", max_size: int = 1000,
+                   frame_center: list[float] | None = None, frame_radius: float | None = None) -> Image:
+    """Inspect an object's silhouette from a standard camera direction as an image.
+
+    name: exact active-scene object name. view: front, back, left, right, top, or
+    three_quarter in world axes (front looks from negative Y). max_size: 128 to 2048 pixels.
+    Requires an interactive 3D viewport; background mode is rejected. Frames evaluated
+    bounds in orthographic solid shading and restores view/shading/overlay settings even
+    on capture errors. Does not modify geometry or selection. Other objects can occlude
+    the target. Optional frame_center (three world coordinates) and frame_radius (positive
+    world distance) must be supplied together to lock framing across revisions. Keep the
+    viewport size unchanged too. Otherwise bounds are recomputed. This does not fit a
+    reference camera or judge materials or appearance. Call multiple views as needed.
+    """
+    with tempfile.TemporaryDirectory(prefix="blender_mcp_preview_") as directory:
+        path = os.path.join(directory, "preview.png")
+        result = get_blender_connection().send_command("preview_target", {
+            "name": name, "view": view, "max_size": max_size, "filepath": path,
+            "frame_center": frame_center, "frame_radius": frame_radius})
+        if "error" in result:
+            raise RuntimeError(result['error'])
+        with open(path, 'rb') as handle:
+            return Image(data=handle.read(), format='png')
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def inspect_motion(ctx: Context, name: str, frame_start: int, frame_end: int,
+                         step: int = 1, reference_object: str = "", reference_bone: str = "",
+                         max_step_distance: float | None = None) -> dict:
+    """Inspect suspected animation jumps or changing attachment offsets across frames.
+
+    name: active-scene object; frame_start/end: inclusive integers; step: positive frame
+    interval, at most 500 samples. reference_object optionally defines a relative frame;
+    reference_bone requires an armature reference and exact pose-bone name. An empty
+    reference returns world motion only. max_step_distance is an optional nonnegative
+    world-space distance between samples, NOT speed or a bone-offset tolerance.
+    Returns evaluated positions, world rotations, per-step distances and threshold warnings.
+    Restores frame/subframe and does not edit keys, but evaluates scene handlers/simulations.
+    Constraints are evaluated; sparse sampling can miss jumps. Relative positions use
+    reference-local units. No contact, deformation, artistic, or export validation is implied.
+    """
+    return get_blender_connection().send_command("inspect_motion", {
+        "name": name, "frame_start": frame_start, "frame_end": frame_end, "step": step,
+        "reference_object": reference_object, "reference_bone": reference_bone,
+        "max_step_distance": max_step_distance})
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def inspect_scene(ctx: Context, offset: int = 0, limit: int = 50,
