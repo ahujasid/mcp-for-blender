@@ -37,7 +37,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 5
+ADDON_PROTOCOL_VERSION = 6
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -761,6 +761,8 @@ class BlenderMCPServer:
 
         # Base handlers that are always available
         handlers = {
+            "inspect_scene": self.inspect_scene,
+            "validate_mesh": self.validate_mesh,
             "get_scene_info": self.get_scene_info,
             "get_world_state_snapshot": self.get_world_state_snapshot,
             "get_addon_info": self.get_addon_info,
@@ -846,6 +848,8 @@ class BlenderMCPServer:
             "protocol_version": ADDON_PROTOCOL_VERSION,
             "capabilities": sorted([
                 "get_scene_info",
+                "inspect_scene",
+                "validate_mesh",
                 "get_world_state_snapshot",
                 "get_addon_info",
                 "get_object_info",
@@ -857,6 +861,81 @@ class BlenderMCPServer:
             ]),
             "blender_version": bpy.app.version_string,
         }
+
+    def inspect_scene(self, offset=0, limit=50, query="", object_type=""):
+        """Read a bounded page of scene objects, including context for edits."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if not isinstance(query, str) or not isinstance(object_type, str):
+            raise ValueError("query and object_type must be strings")
+        objects = sorted((o for o in bpy.context.scene.objects
+                          if query.casefold() in o.name.casefold()
+                          and (not object_type or o.type == object_type.upper())),
+                         key=lambda o: o.name)
+        layer = bpy.context.view_layer
+        rows = []
+        for obj in objects[offset:offset + limit]:
+            in_view_layer = obj.name in layer.objects
+            rows.append({"name": obj.name, "type": obj.type,
+                         "parent": obj.parent.name if obj.parent else None,
+                         "in_view_layer": in_view_layer,
+                         "selected": obj.select_get(view_layer=layer) if in_view_layer else False,
+                         "visible": obj.visible_get(view_layer=layer) if in_view_layer else False,
+                         "dimensions": list(obj.dimensions),
+                         "world_position": list(obj.matrix_world.translation),
+                         "collections": [c.name for c in obj.users_collection],
+                         "modifiers": [{"name": m.name, "type": m.type}
+                                       for m in obj.modifiers]})
+        end = offset + len(rows)
+        return {"scene": bpy.context.scene.name, "mode": bpy.context.mode,
+                "blender_version": bpy.app.version_string,
+                "unit_system": bpy.context.scene.unit_settings.system,
+                "unit_scale": bpy.context.scene.unit_settings.scale_length,
+                "total_matches": len(objects), "offset": offset, "objects": rows,
+                "next_offset": end if end < len(objects) else None,
+                "reference_policy": "Names and geometry must be rechecked after edits."}
+
+    def validate_mesh(self, name, triangle_budget=None, area_epsilon=1e-12):
+        """Read-only diagnostics on an evaluated mesh; never repairs geometry."""
+        import math
+        if triangle_budget is not None and (type(triangle_budget) is not int or triangle_budget < 0):
+            raise ValueError("triangle_budget must be a non-negative integer")
+        if type(area_epsilon) not in (int, float) or not math.isfinite(area_epsilon) or area_epsilon < 0:
+            raise ValueError("area_epsilon must be finite and non-negative")
+        obj = bpy.context.scene.objects.get(name)
+        if obj is None or obj.type != 'MESH':
+            raise ValueError("Target must be a mesh in the active scene")
+        if obj.name not in bpy.context.view_layer.objects:
+            raise ValueError("Target must be in the active view layer")
+        if obj.mode != 'OBJECT':
+            raise ValueError("Switch the target to Object Mode before validation")
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        try:
+            mesh.calc_loop_triangles()
+            uses = {}
+            for poly in mesh.polygons:
+                for edge in poly.edge_keys:
+                    key = tuple(sorted(edge))
+                    uses[key] = uses.get(key, 0) + 1
+            counts = {"vertices": len(mesh.vertices), "edges": len(mesh.edges),
+                      "polygons": len(mesh.polygons), "triangles": len(mesh.loop_triangles),
+                      "zero_area_faces": sum(p.area <= area_epsilon for p in mesh.polygons),
+                      "boundary_edges": sum(n == 1 for n in uses.values()),
+                      "overused_edges": sum(n > 2 for n in uses.values()),
+                      "loose_edges": sum(tuple(sorted(e.vertices)) not in uses for e in mesh.edges),
+                      "uv_layers": len(mesh.uv_layers)}
+            return {"object": name, "geometry": "evaluated", "counts": counts,
+                    "triangle_budget": triangle_budget,
+                    "within_triangle_budget": None if triangle_budget is None else counts['triangles'] <= triangle_budget,
+                    "area_space": "object-local squared units", "area_epsilon": area_epsilon,
+                    "modified": False,
+                    "limitations": ["Open boundaries may be intentional.",
+                                    "No self-intersection, appearance, animation, or export validation performed."]}
+        finally:
+            evaluated.to_mesh_clear()
 
     def get_scene_info(self):
         """Get information about the current Blender scene"""

@@ -153,6 +153,12 @@ In Blender's 3D viewport, press `N` → open the **MCP for Blender** tab → cli
 | **Code execution** | Run arbitrary Python code in Blender from Claude |
 | **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Hyper3D Rodin and Hunyuan3D |
 
+### Scene and mesh inspection
+
+`inspect_scene` searches objects by name or Blender type and returns pages of up to 200 results. Follow `next_offset` until it is null. Each result includes dimensions, world position, parenting, collections, modifiers, and visibility in the active view layer.
+
+`validate_mesh` reports evaluated triangle counts, a caller-supplied triangle budget, zero-area faces, and boundary, loose, or overused edges. It checks the mesh after modifiers without applying them or editing geometry. Open boundaries can be intentional; these counts do not check self-intersections or visual quality. Both tools require the matching add-on with protocol 6.
+
 ## Components
 
 The system consists of two main components:

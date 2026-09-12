@@ -1,5 +1,6 @@
 # blender_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.types import ToolAnnotations
 import socket
 import json
 import asyncio
@@ -413,6 +414,41 @@ async def get_scene_info(ctx: Context, user_prompt: str) -> str:
             )
         except Exception:
             pass
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def inspect_scene(ctx: Context, offset: int = 0, limit: int = 50,
+                        query: str = "", object_type: str = "") -> dict:
+    """Find objects and inspect scene context before targeting an edit.
+
+    offset: nonnegative matched-object index; limit: 1 to 200; query: case-insensitive name
+    substring; object_type: optional Blender type such as MESH or ARMATURE. Results are
+    sorted by name and include total_matches and next_offset (null when finished).
+    Follow next_offset to see more than one page. Includes dimensions, world positions,
+    selection, visibility, view-layer membership, parenting, collections, modifiers,
+    units and mode. Excluded objects report selected=false and visible=false.
+    This does not validate geometry. Names are not persistent IDs; re-query after edits.
+    """
+    return get_blender_connection().send_command("inspect_scene", {
+        "offset": offset, "limit": limit, "query": query, "object_type": object_type})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def validate_mesh(ctx: Context, name: str, triangle_budget: int | None = None,
+                        area_epsilon: float = 1e-12) -> dict:
+    """Check a mesh after modifiers for triangle budgets and basic topology warnings.
+
+    name: exact mesh object name in the active scene and view layer, in Object Mode.
+    triangle_budget: optional nonnegative integer. area_epsilon: finite nonnegative threshold
+    in object-local squared units. Reports evaluated vertices/edges/polygons/triangles,
+    zero-area faces, boundary/overused/loose edges and UV-layer count. Budget result is
+    null when unspecified. Read-only: no repair, modifier application, or mesh mutation.
+    Boundary edges and missing UVs may be intentional. No self-intersection, material,
+    visual, animation or export validation is performed. Do not interpret this as an
+    overall pass/fail assessment; inspect previews and intended asset requirements too.
+    """
+    return get_blender_connection().send_command("validate_mesh", {
+        "name": name, "triangle_budget": triangle_budget, "area_epsilon": area_epsilon})
+
 
 @mcp.tool()
 @telemetry_tool("get_object_info")
