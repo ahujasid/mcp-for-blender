@@ -813,7 +813,8 @@ async def search_polyhaven_assets(
         
         for asset_id, asset_data in sorted_assets:
             formatted_output += f"- {asset_data.get('name', asset_id)} (ID: {asset_id})\n"
-            formatted_output += f"  Type: {['HDRI', 'Texture', 'Model'][asset_data.get('type', 0)]}\n"
+            asset_kind = {0: 'HDRI', 1: 'Texture', 2: 'Model'}.get(asset_data.get('type'), 'Unknown')
+            formatted_output += f"  Type: {asset_kind}\n"
             formatted_output += f"  Categories: {', '.join(asset_data.get('categories', []))}\n"
             formatted_output += f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n\n"
         
@@ -838,8 +839,13 @@ async def download_polyhaven_asset(
     Parameters:
     - asset_id: The ID of the asset to download
     - asset_type: The type of asset (hdris, textures, models)
-    - resolution: The resolution to download (e.g., 1k, 2k, 4k)
-    - file_format: Optional file format (e.g., hdr, exr for HDRIs; jpg, png for textures; gltf, fbx for models)
+    - resolution: The resolution to download. Poly Haven offers 1k, 2k, 4k and 8k for
+      most assets, and up to 16k or 24k for some HDRIs. File size grows roughly
+      fourfold per step, so prefer 1k-2k for background or filler assets and 4k for
+      anything held close to camera. If a resolution is unavailable, the error names
+      the ones that are.
+    - file_format: Optional. hdr (default) or exr for HDRIs; jpg (default), png or exr
+      for textures; gltf (default), fbx or blend for models.
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
     Returns a message indicating success or failure.
@@ -858,14 +864,18 @@ async def download_polyhaven_asset(
         
         if result.get("success"):
             message = result.get("message", "Asset downloaded and imported successfully")
-            
+
             # Add additional information based on asset type
             if asset_type == "hdris":
                 return f"{message}. The HDRI has been set as the world environment."
             elif asset_type == "textures":
                 material_name = result.get("material", "")
                 maps = ", ".join(result.get("maps", []))
-                return f"{message}. Created material '{material_name}' with maps: {maps}."
+                return (
+                    f"{message}. Created material '{material_name}' with maps: {maps}. "
+                    "It carries a fake user so it survives saving before anything uses it; "
+                    "call set_texture to apply it to an object."
+                )
             elif asset_type == "models":
                 return f"{message}. The model has been imported into the current scene."
             else:
@@ -884,7 +894,9 @@ async def set_texture(
     texture_id: str, user_prompt: str = "") -> str:
     """
     Apply a previously downloaded Polyhaven texture to an object.
-    
+
+    Replaces every existing material slot on the object, which cannot be undone.
+
     Parameters:
     - object_name: Name of the object to apply the texture to
     - texture_id: ID of the Polyhaven texture to apply (must be downloaded first)

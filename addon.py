@@ -256,6 +256,223 @@ def _polypizza_cdn_error(status_code, headers, content):
 
 #endregion
 
+#region Poly Haven constants and helpers
+
+POLYHAVEN_API_BASE = "https://api.polyhaven.com"
+
+# (connect, read). The read timeout applies per socket read rather than to the
+# whole transfer, so streaming a large HDRI never trips it - but a dead
+# connection no longer hangs Blender's main thread indefinitely.
+POLYHAVEN_API_TIMEOUT = (10, 30)
+POLYHAVEN_FILE_TIMEOUT = (10, 60)
+
+POLYHAVEN_CHUNK_SIZE = 1024 * 1024
+
+# What we can actually import, per asset type. Checked BEFORE downloading
+# anything: the API lists a `usd` entry for every model, which used to pass the
+# "is this format present?" guard, get downloaded in full, and only then be
+# rejected as an unsupported format.
+POLYHAVEN_SUPPORTED_FORMATS = {
+    "hdris": ("hdr", "exr"),
+    "textures": ("jpg", "png", "exr"),
+    "models": ("gltf", "fbx", "blend"),
+}
+
+POLYHAVEN_DEFAULT_FORMATS = {"hdris": "hdr", "textures": "jpg", "models": "gltf"}
+
+# Poly Haven's /files map keys, and what each map drives. Their casing is
+# inconsistent and load-bearing - "Diffuse", "Rough", "Metal" and
+# "Displacement" are capitalised while "nor_gl" and "arm" are not - so these
+# are matched exactly instead of being lower-cased and guessed at.
+#
+# This is deliberately the same set Poly Haven's own .blend materials
+# reference: diff, nor_gl, rough, disp, and metal where the asset has one.
+# Everything else the API offers is either a repacking of maps already here
+# ("arm" is ORM, "rough_ao" is roughness with AO baked in), the other normal
+# map convention ("nor_dx"), or has no Principled BSDF input to drive ("AO",
+# "spec", "Bump"). Downloading those as well - and then leaving them
+# unconnected - is what made one 1k texture cost 7.4MB instead of 1.9MB.
+POLYHAVEN_TEXTURE_MAPS = {
+    "Diffuse": "base_color",
+    "Rough": "roughness",
+    "Metal": "metallic",
+    "Displacement": "displacement",
+    "nor_gl": "normal",
+    "nor_dx": "normal",
+}
+
+# Only the albedo is colour data; every other map is values the shader reads.
+POLYHAVEN_COLOR_ROLES = {"base_color"}
+
+POLYHAVEN_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+
+def _polyhaven_api_get(path, params=None):
+    """GET a Poly Haven API endpoint, raising on anything but a 2xx."""
+    response = requests.get(
+        f"{POLYHAVEN_API_BASE}/{path}",
+        params=params,
+        headers=REQ_HEADERS,
+        timeout=POLYHAVEN_API_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _polyhaven_valid_slug(asset_id):
+    """Poly Haven slugs are always [A-Za-z0-9_-].
+
+    Asset ids arrive from the model and are used to build the names of the files
+    downloaded into the temporary directory, so they are checked once here
+    rather than escaped differently in each place.
+    """
+    return bool(POLYHAVEN_SLUG_RE.match(asset_id or ""))
+
+
+def _polyhaven_download(file_info, dest_path):
+    """Stream one file to dest_path, verifying the md5 the API published.
+
+    Streaming matters: resolution="24k", file_format="exr" is a valid call and
+    that file is 2.4GB, which the previous response.content read materialised
+    in memory in full before writing it back out again.
+    """
+    expected = file_info.get("md5")
+
+    response = requests.get(
+        file_info["url"],
+        headers=REQ_HEADERS,
+        stream=True,
+        timeout=POLYHAVEN_FILE_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    digest = hashlib.md5()
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=POLYHAVEN_CHUNK_SIZE):
+            if not chunk:
+                continue
+            digest.update(chunk)
+            f.write(chunk)
+
+    if expected and digest.hexdigest() != expected:
+        with suppress(OSError):
+            os.unlink(dest_path)
+        raise ValueError(
+            f"Checksum mismatch for {os.path.basename(dest_path)}: "
+            "the download was truncated or corrupted"
+        )
+    return dest_path
+
+
+def _polyhaven_resolution_rank(resolution):
+    """"4k" -> 4, so resolutions sort numerically rather than as strings."""
+    try:
+        return int(str(resolution).rstrip("k"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _polyhaven_sorted_resolutions(resolutions):
+    return sorted(resolutions, key=lambda res: (_polyhaven_resolution_rank(res) < 0,
+                                                _polyhaven_resolution_rank(res)))
+
+
+def _polyhaven_available(files_data, asset_type):
+    """Describe what an asset actually offers, for use in error messages.
+
+    The three "not available" errors this replaces were f-strings with nothing
+    interpolated into them, so an agent that guessed a resolution wrong had no
+    way to correct itself except to guess again - and each guess cost another
+    round trip.
+    """
+    supported = POLYHAVEN_SUPPORTED_FORMATS.get(asset_type, ())
+    resolutions, formats = set(), set()
+    for by_resolution in files_data.values():
+        if not isinstance(by_resolution, dict):
+            continue
+        for resolution, by_format in by_resolution.items():
+            if not isinstance(by_format, dict):
+                continue
+            present = {fmt for fmt in by_format if fmt in supported}
+            if present:
+                resolutions.add(resolution)
+                formats |= present
+
+    return (
+        "available resolutions: "
+        + (", ".join(_polyhaven_sorted_resolutions(resolutions)) or "none")
+        + "; formats: "
+        + (", ".join(sorted(formats)) or "none")
+    )
+
+
+def _polyhaven_select_texture_maps(files_data, resolution, file_format):
+    """The map keys worth downloading, in the order they should be laid out."""
+    selected = {}
+    for key, role in POLYHAVEN_TEXTURE_MAPS.items():
+        by_resolution = files_data.get(key)
+        if not isinstance(by_resolution, dict):
+            continue
+        if file_format in by_resolution.get(resolution, {}):
+            selected[key] = role
+
+    # OpenGL-convention normals are what Blender's Normal Map node expects.
+    # nor_dx is the same map with the green channel flipped, and is only worth
+    # fetching for the few assets that ship no nor_gl.
+    if "nor_gl" in selected:
+        selected.pop("nor_dx", None)
+
+    # A handful of textures name their albedo something other than "Diffuse" -
+    # the multi-variant fabrics ship col_1/col_2/col_03 instead of one map.
+    # Taking the first is a guess, but a material with no base colour at all is
+    # the failure this whole table exists to prevent.
+    if "base_color" not in selected.values():
+        for key in sorted(files_data):
+            if not key.lower().startswith(("col", "diff")):
+                continue
+            by_resolution = files_data.get(key)
+            if isinstance(by_resolution, dict) and file_format in by_resolution.get(resolution, {}):
+                selected[key] = "base_color"
+                break
+
+    return selected
+
+
+def _polyhaven_set_colorspace(image, is_color_data):
+    """Set a colorspace that exists on this Blender build.
+
+    The names moved around in 4.0, so each candidate is tried in turn rather
+    than assuming any one of them is present.
+    """
+    candidates = ("sRGB",) if is_color_data else ("Non-Color", "Linear Rec.709", "Linear")
+    for name in candidates:
+        try:
+            image.colorspace_settings.name = name
+            return name
+        except Exception:
+            continue
+    return image.colorspace_settings.name
+
+
+def _polyhaven_tag(datablocks, asset_id, resolution=None):
+    """Tag an image or material so set_texture can find it again.
+
+    This is the lookup key between downloading a texture and applying it. The
+    old code recovered the map type by parsing the image's name, taking the last
+    underscore-separated token - which turned "nor_gl" into "gl" and left the
+    download path and set_texture disagreeing about what a map was called.
+    """
+    for block in datablocks:
+        if block is None:
+            continue
+        with suppress(Exception):
+            block["polyhaven_id"] = asset_id
+            if resolution:
+                block["polyhaven_resolution"] = resolution
+
+#endregion
+
+
 #region Manual edit capture
 # Records what the human does in Blender while an MCP session is live.
 
@@ -1892,18 +2109,13 @@ class BlenderMCPServer:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
 
-            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS)
-            if response.status_code == 200:
-                return {"categories": response.json()}
-            else:
-                return {"error": f"API request failed with status code {response.status_code}"}
+            return {"categories": _polyhaven_api_get(f"categories/{quote(asset_type, safe='')}")}
         except Exception as e:
             return {"error": str(e)}
 
     def search_polyhaven_assets(self, asset_type=None, categories=None):
         """Search for assets from Polyhaven with optional filtering"""
         try:
-            url = "https://api.polyhaven.com/assets"
             params = {}
 
             if asset_type and asset_type != "all":
@@ -1914,665 +2126,469 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
-            response = requests.get(url, params=params, headers=REQ_HEADERS)
-            if response.status_code == 200:
-                # Limit the response size to avoid overwhelming Blender
-                assets = response.json()
-                # Return only the first 20 assets to keep response size manageable
-                limited_assets = {}
-                for i, (key, value) in enumerate(assets.items()):
-                    if i >= 20:  # Limit to 20 assets
-                        break
-                    limited_assets[key] = value
+            assets = _polyhaven_api_get("assets", params=params)
 
-                return {"assets": limited_assets, "total_count": len(assets), "returned_count": len(limited_assets)}
-            else:
-                return {"error": f"API request failed with status code {response.status_code}"}
+            # Rank before truncating. The previous order was whatever the API
+            # happened to return, which is sorted by slug - and because models
+            # are the only assets with capitalised slugs, the first 20 of an
+            # unfiltered list were 20 models. asset_type="all" could not return
+            # a single HDRI or texture, and the library's most downloaded assets
+            # were unreachable by any call.
+            ranked = sorted(
+                assets.items(),
+                key=lambda item: item[1].get("download_count", 0),
+                reverse=True,
+            )
+
+            limited_assets = dict(ranked[:20])
+
+            return {
+                "assets": limited_assets,
+                "total_count": len(assets),
+                "returned_count": len(limited_assets),
+            }
         except Exception as e:
             return {"error": str(e)}
 
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
         try:
-            # First get the files information
-            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS)
-            if files_response.status_code != 200:
-                return {"error": f"Failed to get asset files: {files_response.status_code}"}
+            if asset_type not in POLYHAVEN_SUPPORTED_FORMATS:
+                return {"error": f"Unsupported asset type: {asset_type}. Must be one of: hdris, textures, models"}
 
-            files_data = files_response.json()
+            if not _polyhaven_valid_slug(asset_id):
+                return {"error": f"Invalid asset id: {asset_id!r}. Poly Haven slugs are "
+                                 "letters, digits, underscores and hyphens."}
 
-            # Handle different asset types
+            supported = POLYHAVEN_SUPPORTED_FORMATS[asset_type]
+            file_format = (file_format or POLYHAVEN_DEFAULT_FORMATS[asset_type]).lower()
+            if file_format not in supported:
+                # Rejected before any transfer. `usd` is listed for every model
+                # and used to be downloaded in full before reaching the
+                # "unsupported format" branch at the end of the import.
+                return {
+                    "error": f"Unsupported {asset_type} format: {file_format}. "
+                             f"Supported formats: {', '.join(supported)}"
+                }
+
+            try:
+                files_data = _polyhaven_api_get(f"files/{quote(asset_id, safe='')}")
+            except Exception as e:
+                return {"error": f"Failed to get asset files for '{asset_id}': {str(e)}"}
+
             if asset_type == "hdris":
-                # For HDRIs, download the .hdr or .exr file
-                if not file_format:
-                    file_format = "hdr"  # Default format for HDRIs
-
-                if "hdri" in files_data and resolution in files_data["hdri"] and file_format in files_data["hdri"][resolution]:
-                    file_info = files_data["hdri"][resolution][file_format]
-                    file_url = file_info["url"]
-
-                    # For HDRIs, we need to save to a temporary file first
-                    # since Blender can't properly load HDR data directly from memory
-                    with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
-                        # Download the file
-                        response = requests.get(file_url, headers=REQ_HEADERS)
-                        if response.status_code != 200:
-                            return {"error": f"Failed to download HDRI: {response.status_code}"}
-
-                        tmp_file.write(response.content)
-                        tmp_path = tmp_file.name
-
-                    try:
-                        # Create a new world if none exists
-                        if not bpy.data.worlds:
-                            bpy.data.worlds.new("World")
-
-                        world = bpy.data.worlds[0]
-                        world.use_nodes = True
-                        node_tree = world.node_tree
-
-                        # Clear existing nodes
-                        for node in node_tree.nodes:
-                            node_tree.nodes.remove(node)
-
-                        # Create nodes
-                        tex_coord = node_tree.nodes.new(type='ShaderNodeTexCoord')
-                        tex_coord.location = (-800, 0)
-
-                        mapping = node_tree.nodes.new(type='ShaderNodeMapping')
-                        mapping.location = (-600, 0)
-
-                        # Load the image from the temporary file
-                        env_tex = node_tree.nodes.new(type='ShaderNodeTexEnvironment')
-                        env_tex.location = (-400, 0)
-                        env_tex.image = bpy.data.images.load(tmp_path)
-
-                        # Use a color space that exists in all Blender versions
-                        if file_format.lower() == 'exr':
-                            # Try to use Linear color space for EXR files
-                            try:
-                                env_tex.image.colorspace_settings.name = 'Linear'
-                            except:
-                                # Fallback to Non-Color if Linear isn't available
-                                env_tex.image.colorspace_settings.name = 'Non-Color'
-                        else:  # hdr
-                            # For HDR files, try these options in order
-                            for color_space in ['Linear', 'Linear Rec.709', 'Non-Color']:
-                                try:
-                                    env_tex.image.colorspace_settings.name = color_space
-                                    break  # Stop if we successfully set a color space
-                                except:
-                                    continue
-
-                        background = node_tree.nodes.new(type='ShaderNodeBackground')
-                        background.location = (-200, 0)
-
-                        output = node_tree.nodes.new(type='ShaderNodeOutputWorld')
-                        output.location = (0, 0)
-
-                        # Connect nodes
-                        node_tree.links.new(tex_coord.outputs['Generated'], mapping.inputs['Vector'])
-                        node_tree.links.new(mapping.outputs['Vector'], env_tex.inputs['Vector'])
-                        node_tree.links.new(env_tex.outputs['Color'], background.inputs['Color'])
-                        node_tree.links.new(background.outputs['Background'], output.inputs['Surface'])
-
-                        # Set as active world
-                        bpy.context.scene.world = world
-
-                        # Clean up temporary file
-                        try:
-                            tempfile._cleanup()  # This will clean up all temporary files
-                        except:
-                            pass
-
-                        return {
-                            "success": True,
-                            "message": f"HDRI {asset_id} imported successfully",
-                            "image_name": env_tex.image.name
-                        }
-                    except Exception as e:
-                        return {"error": f"Failed to set up HDRI in Blender: {str(e)}"}
-                else:
-                    return {"error": f"Requested resolution or format not available for this HDRI"}
-
-            elif asset_type == "textures":
-                if not file_format:
-                    file_format = "jpg"  # Default format for textures
-
-                downloaded_maps = {}
-
-                try:
-                    for map_type in files_data:
-                        if map_type not in ["blend", "gltf"]:  # Skip non-texture files
-                            if resolution in files_data[map_type] and file_format in files_data[map_type][resolution]:
-                                file_info = files_data[map_type][resolution][file_format]
-                                file_url = file_info["url"]
-
-                                # Use NamedTemporaryFile like we do for HDRIs
-                                with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
-                                    # Download the file
-                                    response = requests.get(file_url, headers=REQ_HEADERS)
-                                    if response.status_code == 200:
-                                        tmp_file.write(response.content)
-                                        tmp_path = tmp_file.name
-
-                                        # Load image from temporary file
-                                        image = bpy.data.images.load(tmp_path)
-                                        image.name = f"{asset_id}_{map_type}.{file_format}"
-
-                                        # Pack the image into .blend file
-                                        image.pack()
-
-                                        # Set color space based on map type
-                                        if map_type in ['color', 'diffuse', 'albedo']:
-                                            try:
-                                                image.colorspace_settings.name = 'sRGB'
-                                            except:
-                                                pass
-                                        else:
-                                            try:
-                                                image.colorspace_settings.name = 'Non-Color'
-                                            except:
-                                                pass
-
-                                        downloaded_maps[map_type] = image
-
-                                        # Clean up temporary file
-                                        try:
-                                            os.unlink(tmp_path)
-                                        except:
-                                            pass
-
-                    if not downloaded_maps:
-                        return {"error": f"No texture maps found for the requested resolution and format"}
-
-                    # Create a new material with the downloaded textures
-                    mat = bpy.data.materials.new(name=asset_id)
-                    mat.use_nodes = True
-                    nodes = mat.node_tree.nodes
-                    links = mat.node_tree.links
-
-                    # Clear default nodes
-                    for node in nodes:
-                        nodes.remove(node)
-
-                    # Create output node
-                    output = nodes.new(type='ShaderNodeOutputMaterial')
-                    output.location = (300, 0)
-
-                    # Create principled BSDF node
-                    principled = nodes.new(type='ShaderNodeBsdfPrincipled')
-                    principled.location = (0, 0)
-                    links.new(principled.outputs[0], output.inputs[0])
-
-                    # Add texture nodes based on available maps
-                    tex_coord = nodes.new(type='ShaderNodeTexCoord')
-                    tex_coord.location = (-800, 0)
-
-                    mapping = nodes.new(type='ShaderNodeMapping')
-                    mapping.location = (-600, 0)
-                    mapping.vector_type = 'TEXTURE'  # Changed from default 'POINT' to 'TEXTURE'
-                    links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
-
-                    # Position offset for texture nodes
-                    x_pos = -400
-                    y_pos = 300
-
-                    # Connect different texture maps
-                    for map_type, image in downloaded_maps.items():
-                        tex_node = nodes.new(type='ShaderNodeTexImage')
-                        tex_node.location = (x_pos, y_pos)
-                        tex_node.image = image
-
-                        # Set color space based on map type
-                        if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                            try:
-                                tex_node.image.colorspace_settings.name = 'sRGB'
-                            except:
-                                pass  # Use default if sRGB not available
-                        else:
-                            try:
-                                tex_node.image.colorspace_settings.name = 'Non-Color'
-                            except:
-                                pass  # Use default if Non-Color not available
-
-                        links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
-
-                        # Connect to appropriate input on Principled BSDF
-                        if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                            links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
-                        elif map_type.lower() in ['roughness', 'rough']:
-                            links.new(tex_node.outputs['Color'], principled.inputs['Roughness'])
-                        elif map_type.lower() in ['metallic', 'metalness', 'metal']:
-                            links.new(tex_node.outputs['Color'], principled.inputs['Metallic'])
-                        elif map_type.lower() in ['normal', 'nor']:
-                            # Add normal map node
-                            normal_map = nodes.new(type='ShaderNodeNormalMap')
-                            normal_map.location = (x_pos + 200, y_pos)
-                            links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
-                            links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
-                        elif map_type in ['displacement', 'disp', 'height']:
-                            # Add displacement node
-                            disp_node = nodes.new(type='ShaderNodeDisplacement')
-                            disp_node.location = (x_pos + 200, y_pos - 200)
-                            links.new(tex_node.outputs['Color'], disp_node.inputs['Height'])
-                            links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-
-                        y_pos -= 250
-
-                    return {
-                        "success": True,
-                        "message": f"Texture {asset_id} imported as material",
-                        "material": mat.name,
-                        "maps": list(downloaded_maps.keys())
-                    }
-
-                except Exception as e:
-                    return {"error": f"Failed to process textures: {str(e)}"}
-
-            elif asset_type == "models":
-                # For models, prefer glTF format if available
-                if not file_format:
-                    file_format = "gltf"  # Default format for models
-
-                if file_format in files_data and resolution in files_data[file_format]:
-                    file_info = files_data[file_format][resolution][file_format]
-                    file_url = file_info["url"]
-
-                    # Create a temporary directory to store the model and its dependencies
-                    temp_dir = tempfile.mkdtemp()
-                    main_file_path = ""
-
-                    try:
-                        # Download the main model file
-                        main_file_name = file_url.split("/")[-1]
-                        main_file_path = os.path.join(temp_dir, main_file_name)
-
-                        response = requests.get(file_url, headers=REQ_HEADERS)
-                        if response.status_code != 200:
-                            return {"error": f"Failed to download model: {response.status_code}"}
-
-                        with open(main_file_path, "wb") as f:
-                            f.write(response.content)
-
-                        # Check for included files and download them
-                        if "include" in file_info and file_info["include"]:
-                            for include_path, include_info in file_info["include"].items():
-                                # Get the URL for the included file - this is the fix
-                                include_url = include_info["url"]
-
-                                # Validate include_path — the API response controls these
-                                # dict keys; a malicious or MITM'd response could request an
-                                # absolute path or one containing ".." to escape temp_dir
-                                # and write arbitrary files (e.g. ~/.bashrc, authorized_keys).
-                                # Mirrors the zip-slip check in download_sketchfab_model.
-                                target_path = os.path.join(temp_dir, os.path.normpath(include_path))
-                                abs_temp_dir = os.path.abspath(temp_dir)
-                                abs_target_path = os.path.abspath(target_path)
-                                if (os.path.isabs(include_path)
-                                        or ".." in include_path
-                                        or not abs_target_path.startswith(abs_temp_dir + os.sep)):
-                                    print(f"Skipping include with unsafe path: {include_path}")
-                                    continue
-
-                                # Create the directory structure for the included file
-                                include_file_path = target_path
-                                os.makedirs(os.path.dirname(include_file_path), exist_ok=True)
-
-                                # Download the included file
-                                include_response = requests.get(include_url, headers=REQ_HEADERS)
-                                if include_response.status_code == 200:
-                                    with open(include_file_path, "wb") as f:
-                                        f.write(include_response.content)
-                                else:
-                                    print(f"Failed to download included file: {include_path}")
-
-                        # Import the model into Blender
-                        if file_format == "gltf" or file_format == "glb":
-                            bpy.ops.import_scene.gltf(filepath=main_file_path)
-                        elif file_format == "fbx":
-                            bpy.ops.import_scene.fbx(filepath=main_file_path)
-                        elif file_format == "obj":
-                            bpy.ops.import_scene.obj(filepath=main_file_path)
-                        elif file_format == "blend":
-                            # For blend files, we need to append or link
-                            with bpy.data.libraries.load(main_file_path, link=False) as (data_from, data_to):
-                                data_to.objects = data_from.objects
-
-                            # Link the objects to the scene
-                            for obj in data_to.objects:
-                                if obj is not None:
-                                    bpy.context.collection.objects.link(obj)
-                        else:
-                            return {"error": f"Unsupported model format: {file_format}"}
-
-                        # Get the names of imported objects
-                        imported_objects = [obj.name for obj in bpy.context.selected_objects]
-
-                        return {
-                            "success": True,
-                            "message": f"Model {asset_id} imported successfully",
-                            "imported_objects": imported_objects
-                        }
-                    except Exception as e:
-                        return {"error": f"Failed to import model: {str(e)}"}
-                    finally:
-                        # Clean up temporary directory
-                        with suppress(Exception):
-                            shutil.rmtree(temp_dir)
-                else:
-                    return {"error": f"Requested format or resolution not available for this model"}
-
-            else:
-                return {"error": f"Unsupported asset type: {asset_type}"}
+                return self._polyhaven_import_hdri(asset_id, files_data, resolution, file_format)
+            if asset_type == "textures":
+                return self._polyhaven_import_texture(asset_id, files_data, resolution, file_format)
+            return self._polyhaven_import_model(asset_id, files_data, resolution, file_format)
 
         except Exception as e:
+            traceback.print_exc()
             return {"error": f"Failed to download asset: {str(e)}"}
+
+    def _polyhaven_import_hdri(self, asset_id, files_data, resolution, file_format):
+        """Download an HDRI and set it up as the scene's world."""
+        file_info = files_data.get("hdri", {}).get(resolution, {}).get(file_format)
+        if not file_info:
+            return {
+                "error": f"HDRI '{asset_id}' has no {resolution} {file_format} - "
+                         f"{_polyhaven_available(files_data, 'hdris')}"
+            }
+
+        dest_dir = tempfile.mkdtemp(prefix="blender_mcp_polyhaven_")
+        dest_path = os.path.join(dest_dir, f"{asset_id}_{resolution}.{file_format}")
+
+        try:
+            _polyhaven_download(file_info, dest_path)
+        except Exception as e:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            return {"error": f"Failed to download HDRI: {str(e)}"}
+
+        try:
+            # The scene's own world, not bpy.data.worlds[0]. worlds[0] is the
+            # alphabetically first world datablock, which is very often somebody
+            # else's: wiping its nodes and then making it the active world
+            # destroyed hand-built world setups, with no undo step to get them
+            # back.
+            world = bpy.context.scene.world
+            if world is None:
+                world = bpy.data.worlds.new(f"PolyHaven {asset_id}")
+                bpy.context.scene.world = world
+
+            world.use_nodes = True
+            node_tree = world.node_tree
+            node_tree.nodes.clear()
+
+            tex_coord = node_tree.nodes.new(type='ShaderNodeTexCoord')
+            tex_coord.location = (-800, 0)
+
+            mapping = node_tree.nodes.new(type='ShaderNodeMapping')
+            mapping.location = (-600, 0)
+
+            env_tex = node_tree.nodes.new(type='ShaderNodeTexEnvironment')
+            env_tex.location = (-400, 0)
+            env_tex.image = bpy.data.images.load(dest_path, check_existing=True)
+            env_tex.image.name = f"{asset_id}_{resolution}"
+            # Colorspace is deliberately left as Blender's loader set it. It
+            # already tags .hdr/.exr as scene-linear, and forcing "Non-Color"
+            # here would mark radiance data as raw - identical under the stock
+            # OCIO config, a colour shift under any config whose working space
+            # is not Linear Rec.709.
+
+            # Pack before anything can remove the file underneath it. Without
+            # this the world points at a path in the OS temp directory for the
+            # life of the .blend: it renders now, and is a missing image the
+            # next time the file is opened here - or the first time it is opened
+            # anywhere else.
+            env_tex.image.pack()
+
+            background = node_tree.nodes.new(type='ShaderNodeBackground')
+            background.location = (-200, 0)
+
+            output = node_tree.nodes.new(type='ShaderNodeOutputWorld')
+            output.location = (0, 0)
+
+            node_tree.links.new(tex_coord.outputs['Generated'], mapping.inputs['Vector'])
+            node_tree.links.new(mapping.outputs['Vector'], env_tex.inputs['Vector'])
+            node_tree.links.new(env_tex.outputs['Color'], background.inputs['Color'])
+            node_tree.links.new(background.outputs['Background'], output.inputs['Surface'])
+
+            bpy.context.scene.world = world
+
+            return {
+                "success": True,
+                "message": f"HDRI {asset_id} imported successfully",
+                "image_name": env_tex.image.name,
+                "world": world.name,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to set up HDRI in Blender: {str(e)}"}
+        finally:
+            # The image is packed, so nothing needs the file any more.
+            shutil.rmtree(dest_dir, ignore_errors=True)
+
+    def _polyhaven_build_material(self, asset_id, maps):
+        """Build a Principled material from {map_key: (role, image)}.
+
+        Shared by download_polyhaven_asset and set_texture so there is exactly
+        one place that decides which map drives which input - set_texture used
+        to build its own tree in two passes over the same maps, silently
+        replacing every link it had just made and leaving the first pass's
+        Normal Map and Displacement nodes orphaned in the tree.
+        """
+        mat = bpy.data.materials.new(name=asset_id)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        output = nodes.new(type='ShaderNodeOutputMaterial')
+        output.location = (600, 0)
+
+        principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+        principled.location = (300, 0)
+        links.new(principled.outputs[0], output.inputs['Surface'])
+
+        tex_coord = nodes.new(type='ShaderNodeTexCoord')
+        tex_coord.location = (-1000, 0)
+
+        mapping = nodes.new(type='ShaderNodeMapping')
+        mapping.location = (-800, 0)
+        mapping.vector_type = 'TEXTURE'
+        links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
+
+        y_pos = 300
+        wired = []
+
+        for map_key, (role, image) in maps.items():
+            tex_node = nodes.new(type='ShaderNodeTexImage')
+            tex_node.location = (-500, y_pos)
+            tex_node.image = image
+            _polyhaven_set_colorspace(image, is_color_data=role in POLYHAVEN_COLOR_ROLES)
+            links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
+            y_pos -= 300
+
+            if role == "base_color":
+                links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
+            elif role == "roughness":
+                links.new(tex_node.outputs['Color'], principled.inputs['Roughness'])
+            elif role == "metallic":
+                links.new(tex_node.outputs['Color'], principled.inputs['Metallic'])
+            elif role == "normal":
+                normal_map = nodes.new(type='ShaderNodeNormalMap')
+                normal_map.location = (-200, tex_node.location[1])
+                links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
+                links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
+            elif role == "displacement":
+                disp_node = nodes.new(type='ShaderNodeDisplacement')
+                disp_node.location = (300, tex_node.location[1])
+                # Poly Haven's displacement maps are centred on 0.5, and the
+                # output is only used at all once the material is told to
+                # displace - otherwise the node sits there connected and inert.
+                disp_node.inputs['Midlevel'].default_value = 0.5
+                disp_node.inputs['Scale'].default_value = 0.1
+                links.new(tex_node.outputs['Color'], disp_node.inputs['Height'])
+                links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
+                # Moved off material.cycles in Blender 4.1; try both so the
+                # node is not left connected but inert on older versions.
+                if hasattr(mat, "displacement_method"):
+                    mat.displacement_method = 'BOTH'
+                else:
+                    with suppress(Exception):
+                        mat.cycles.displacement_method = 'BOTH'
+            else:
+                continue
+
+            wired.append(map_key)
+
+        return mat, wired
+
+    def _polyhaven_import_texture(self, asset_id, files_data, resolution, file_format):
+        """Download a texture's maps and build a material from them."""
+        wanted = _polyhaven_select_texture_maps(files_data, resolution, file_format)
+        if not wanted:
+            return {
+                "error": f"Texture '{asset_id}' has no maps at {resolution} {file_format} - "
+                         f"{_polyhaven_available(files_data, 'textures')}"
+            }
+
+        dest_dir = tempfile.mkdtemp(prefix="blender_mcp_polyhaven_")
+        maps = {}
+
+        try:
+            for map_key, role in wanted.items():
+                file_info = files_data[map_key][resolution][file_format]
+                dest_path = os.path.join(
+                    dest_dir, f"{asset_id}_{map_key}_{resolution}.{file_format}"
+                )
+                _polyhaven_download(file_info, dest_path)
+
+                image = bpy.data.images.load(dest_path, check_existing=True)
+                image.name = f"{asset_id}_{map_key}"
+                _polyhaven_set_colorspace(image, is_color_data=role in POLYHAVEN_COLOR_ROLES)
+                image.pack()
+                maps[map_key] = (role, image)
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to download texture maps: {str(e)}"}
+        finally:
+            # Every image is packed, so nothing needs the files any more.
+            shutil.rmtree(dest_dir, ignore_errors=True)
+
+        try:
+            mat, wired = self._polyhaven_build_material(asset_id, maps)
+
+            # A material with no users is purged the next time the file is
+            # saved and reopened, taking its packed images with it. This tool
+            # only downloads - set_texture is what applies it to an object - so
+            # a fake user is what keeps it alive in between.
+            mat.use_fake_user = True
+
+            _polyhaven_tag(
+                [mat] + [image for _role, image in maps.values()],
+                asset_id,
+                resolution=resolution,
+            )
+            for map_key, (role, image) in maps.items():
+                with suppress(Exception):
+                    image["polyhaven_map"] = map_key
+                    image["polyhaven_role"] = role
+
+            return {
+                "success": True,
+                "message": f"Texture {asset_id} imported as material",
+                "material": mat.name,
+                "maps": wired,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to build material: {str(e)}"}
+
+    def _polyhaven_import_model(self, asset_id, files_data, resolution, file_format):
+        """Download a model and its textures, then import it."""
+        file_info = files_data.get(file_format, {}).get(resolution, {}).get(file_format)
+        if not file_info:
+            return {
+                "error": f"Model '{asset_id}' has no {resolution} {file_format} - "
+                         f"{_polyhaven_available(files_data, 'models')}"
+            }
+
+        dest_dir = tempfile.mkdtemp(prefix="blender_mcp_polyhaven_")
+        main_file_path = os.path.join(dest_dir, os.path.basename(file_info["url"].split("?")[0]))
+
+        try:
+            _polyhaven_download(file_info, main_file_path)
+
+            for include_path, include_info in (file_info.get("include") or {}).items():
+                # Validate include_path - the API response controls these
+                # dict keys; a malicious or MITM'd response could request an
+                # absolute path or one containing ".." to escape dest_dir
+                # and write arbitrary files (e.g. ~/.bashrc, authorized_keys).
+                # Mirrors the zip-slip check in download_sketchfab_model.
+                target_path = os.path.join(dest_dir, os.path.normpath(include_path))
+                abs_dest_dir = os.path.abspath(dest_dir)
+                abs_target_path = os.path.abspath(target_path)
+                if (os.path.isabs(include_path)
+                        or ".." in include_path
+                        or not abs_target_path.startswith(abs_dest_dir + os.sep)):
+                    print(f"Skipping include with unsafe path: {include_path}")
+                    continue
+
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                _polyhaven_download(include_info, target_path)
+        except Exception as e:
+            traceback.print_exc()
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            return {"error": f"Failed to download model: {str(e)}"}
+
+        try:
+            # By name: bpy hands out a fresh Python wrapper per access, so
+            # holding on to the datablocks themselves invites identity bugs.
+            before = {obj.name for obj in bpy.data.objects}
+
+            if file_format == "gltf":
+                bpy.ops.import_scene.gltf(filepath=main_file_path)
+            elif file_format == "fbx":
+                bpy.ops.import_scene.fbx(filepath=main_file_path)
+            else:  # blend
+                with bpy.data.libraries.load(main_file_path, link=False) as (data_from, data_to):
+                    data_to.objects = data_from.objects
+
+                for obj in data_to.objects:
+                    if obj is not None:
+                        bpy.context.collection.objects.link(obj)
+
+            # Diffed rather than read off selected_objects, which the .blend
+            # branch never populates - it reported an empty list for every
+            # appended model.
+            imported = [obj for obj in bpy.data.objects if obj.name not in before]
+            imported_objects = [obj.name for obj in imported]
+
+            # Appended and FBX-imported images still reference the files in the
+            # temporary directory this deletes on the way out. A .glb carries
+            # its textures inside it, but a .gltf with sidecar files does not,
+            # so this is not a no-op there either.
+            for obj in imported:
+                for slot in getattr(obj, "material_slots", []):
+                    if slot.material is None or not slot.material.use_nodes:
+                        continue
+                    for node in slot.material.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
+                            with suppress(Exception):
+                                node.image.pack()
+
+            return {
+                "success": True,
+                "message": f"Model {asset_id} imported successfully",
+                "imported_objects": imported_objects,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to import model: {str(e)}"}
+        finally:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+
+    def _polyhaven_material_info(self, mat):
+        """Summarise a material's node tree for the caller."""
+        texture_nodes = []
+        for node in mat.node_tree.nodes:
+            if node.type != 'TEX_IMAGE' or node.image is None:
+                continue
+            connections = []
+            for link in mat.node_tree.links:
+                if link.from_node == node:
+                    connections.append(
+                        f"{link.from_socket.name} -> {link.to_node.name}.{link.to_socket.name}"
+                    )
+            texture_nodes.append({
+                "name": node.name,
+                "image": node.image.name,
+                "colorspace": node.image.colorspace_settings.name,
+                "connections": connections,
+            })
+
+        return {
+            "has_nodes": mat.use_nodes,
+            "node_count": len(mat.node_tree.nodes),
+            "texture_nodes": texture_nodes,
+        }
 
     def set_texture(self, object_name, texture_id):
         """Apply a previously downloaded Polyhaven texture to an object by creating a new material"""
         try:
-            # Get the object
             obj = bpy.data.objects.get(object_name)
             if not obj:
                 return {"error": f"Object not found: {object_name}"}
 
-            # Make sure object can accept materials
             if not hasattr(obj, 'data') or not hasattr(obj.data, 'materials'):
                 return {"error": f"Object {object_name} cannot accept materials"}
 
-            # Find all images related to this texture and ensure they're properly loaded
-            texture_images = {}
+            if not _polyhaven_valid_slug(texture_id):
+                return {"error": f"Invalid texture id: {texture_id!r}"}
+
+            # Identified by the custom property stamped at download time rather
+            # than by parsing the image's name. The old parser took the last
+            # underscore-separated token, which turned "nor_gl" into "gl" and
+            # left the two functions disagreeing about what a map was called.
+            maps = {}
             for img in bpy.data.images:
-                if img.name.startswith(texture_id + "_"):
-                    # Extract the map type from the image name
-                    map_type = img.name.split('_')[-1].split('.')[0]
+                if img.get("polyhaven_id") != texture_id:
+                    continue
+                map_key = img.get("polyhaven_map")
+                # Role first: assets whose albedo is not called "Diffuse" are
+                # not in the table, but were resolved at download time.
+                role = img.get("polyhaven_role") or POLYHAVEN_TEXTURE_MAPS.get(map_key)
+                if not role:
+                    continue
+                if not img.packed_file:
+                    img.pack()
 
-                    # Force a reload of the image
-                    img.reload()
+                # An asset downloaded at more than one resolution leaves several
+                # images per map, all carrying the same id. Take the largest
+                # rather than whichever happened to come last.
+                existing = maps.get(map_key)
+                if existing and _polyhaven_resolution_rank(
+                        existing[1].get("polyhaven_resolution")) >= _polyhaven_resolution_rank(
+                        img.get("polyhaven_resolution")):
+                    continue
+                maps[map_key] = (role, img)
 
-                    # Ensure proper color space
-                    if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                        try:
-                            img.colorspace_settings.name = 'sRGB'
-                        except:
-                            pass
-                    else:
-                        try:
-                            img.colorspace_settings.name = 'Non-Color'
-                        except:
-                            pass
+            if not maps:
+                return {
+                    "error": f"No texture images found for: {texture_id}. "
+                             "Download it first with download_polyhaven_asset."
+                }
 
-                    # Ensure the image is packed
-                    if not img.packed_file:
-                        img.pack()
-
-                    texture_images[map_type] = img
-                    print(f"Loaded texture map: {map_type} - {img.name}")
-
-                    # Debug info
-                    print(f"Image size: {img.size[0]}x{img.size[1]}")
-                    print(f"Color space: {img.colorspace_settings.name}")
-                    print(f"File format: {img.file_format}")
-                    print(f"Is packed: {bool(img.packed_file)}")
-
-            if not texture_images:
-                return {"error": f"No texture images found for: {texture_id}. Please download the texture first."}
-
-            # Create a new material
             new_mat_name = f"{texture_id}_material_{object_name}"
-
-            # Remove any existing material with this name to avoid conflicts
             existing_mat = bpy.data.materials.get(new_mat_name)
             if existing_mat:
                 bpy.data.materials.remove(existing_mat)
 
-            new_mat = bpy.data.materials.new(name=new_mat_name)
-            new_mat.use_nodes = True
+            new_mat, wired = self._polyhaven_build_material(texture_id, maps)
+            new_mat.name = new_mat_name
 
-            # Set up the material nodes
-            nodes = new_mat.node_tree.nodes
-            links = new_mat.node_tree.links
+            _polyhaven_tag([new_mat], texture_id)
 
-            # Clear default nodes
-            nodes.clear()
-
-            # Create output node
-            output = nodes.new(type='ShaderNodeOutputMaterial')
-            output.location = (600, 0)
-
-            # Create principled BSDF node
-            principled = nodes.new(type='ShaderNodeBsdfPrincipled')
-            principled.location = (300, 0)
-            links.new(principled.outputs[0], output.inputs[0])
-
-            # Add texture nodes based on available maps
-            tex_coord = nodes.new(type='ShaderNodeTexCoord')
-            tex_coord.location = (-800, 0)
-
-            mapping = nodes.new(type='ShaderNodeMapping')
-            mapping.location = (-600, 0)
-            mapping.vector_type = 'TEXTURE'  # Changed from default 'POINT' to 'TEXTURE'
-            links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
-
-            # Position offset for texture nodes
-            x_pos = -400
-            y_pos = 300
-
-            # Connect different texture maps
-            for map_type, image in texture_images.items():
-                tex_node = nodes.new(type='ShaderNodeTexImage')
-                tex_node.location = (x_pos, y_pos)
-                tex_node.image = image
-
-                # Set color space based on map type
-                if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                    try:
-                        tex_node.image.colorspace_settings.name = 'sRGB'
-                    except:
-                        pass  # Use default if sRGB not available
-                else:
-                    try:
-                        tex_node.image.colorspace_settings.name = 'Non-Color'
-                    except:
-                        pass  # Use default if Non-Color not available
-
-                links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
-
-                # Connect to appropriate input on Principled BSDF
-                if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                    links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
-                elif map_type.lower() in ['roughness', 'rough']:
-                    links.new(tex_node.outputs['Color'], principled.inputs['Roughness'])
-                elif map_type.lower() in ['metallic', 'metalness', 'metal']:
-                    links.new(tex_node.outputs['Color'], principled.inputs['Metallic'])
-                elif map_type.lower() in ['normal', 'nor', 'dx', 'gl']:
-                    # Add normal map node
-                    normal_map = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map.location = (x_pos + 200, y_pos)
-                    links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
-                    links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
-                elif map_type.lower() in ['displacement', 'disp', 'height']:
-                    # Add displacement node
-                    disp_node = nodes.new(type='ShaderNodeDisplacement')
-                    disp_node.location = (x_pos + 200, y_pos - 200)
-                    disp_node.inputs['Scale'].default_value = 0.1  # Reduce displacement strength
-                    links.new(tex_node.outputs['Color'], disp_node.inputs['Height'])
-                    links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-
-                y_pos -= 250
-
-            # Second pass: Connect nodes with proper handling for special cases
-            texture_nodes = {}
-
-            # First find all texture nodes and store them by map type
-            for node in nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    for map_type, image in texture_images.items():
-                        if node.image == image:
-                            texture_nodes[map_type] = node
-                            break
-
-            # Now connect everything using the nodes instead of images
-            # Handle base color (diffuse)
-            for map_name in ['color', 'diffuse', 'albedo']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Base Color'])
-                    print(f"Connected {map_name} to Base Color")
-                    break
-
-            # Handle roughness
-            for map_name in ['roughness', 'rough']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Roughness'])
-                    print(f"Connected {map_name} to Roughness")
-                    break
-
-            # Handle metallic
-            for map_name in ['metallic', 'metalness', 'metal']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Metallic'])
-                    print(f"Connected {map_name} to Metallic")
-                    break
-
-            # Handle normal maps
-            for map_name in ['gl', 'dx', 'nor']:
-                if map_name in texture_nodes:
-                    normal_map_node = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map_node.location = (100, 100)
-                    links.new(texture_nodes[map_name].outputs['Color'], normal_map_node.inputs['Color'])
-                    links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
-                    print(f"Connected {map_name} to Normal")
-                    break
-
-            # Handle displacement
-            for map_name in ['displacement', 'disp', 'height']:
-                if map_name in texture_nodes:
-                    disp_node = nodes.new(type='ShaderNodeDisplacement')
-                    disp_node.location = (300, -200)
-                    disp_node.inputs['Scale'].default_value = 0.1  # Reduce displacement strength
-                    links.new(texture_nodes[map_name].outputs['Color'], disp_node.inputs['Height'])
-                    links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-                    print(f"Connected {map_name} to Displacement")
-                    break
-
-            # Handle ARM texture (Ambient Occlusion, Roughness, Metallic)
-            if 'arm' in texture_nodes:
-                # Blender 4.0 removed ShaderNodeSeparateRGB (renamed to
-                # ShaderNodeSeparateColor, added in 3.3). Branch on the running
-                # Blender version so pre-4.0 behavior is untouched.
-                if bpy.app.version >= (4, 0):
-                    sep = nodes.new(type='ShaderNodeSeparateColor')  # defaults to mode='RGB'
-                    in_socket, ch_r, ch_g, ch_b = 'Color', 'Red', 'Green', 'Blue'
-                else:
-                    sep = nodes.new(type='ShaderNodeSeparateRGB')
-                    in_socket, ch_r, ch_g, ch_b = 'Image', 'R', 'G', 'B'
-                sep.location = (-200, -100)
-                links.new(texture_nodes['arm'].outputs['Color'], sep.inputs[in_socket])
-
-                # Connect Roughness (G) if no dedicated roughness map
-                if not any(map_name in texture_nodes for map_name in ['roughness', 'rough']):
-                    links.new(sep.outputs[ch_g], principled.inputs['Roughness'])
-                    print("Connected ARM.G to Roughness")
-
-                # Connect Metallic (B) if no dedicated metallic map
-                if not any(map_name in texture_nodes for map_name in ['metallic', 'metalness', 'metal']):
-                    links.new(sep.outputs[ch_b], principled.inputs['Metallic'])
-                    print("Connected ARM.B to Metallic")
-
-                # For AO (R channel), multiply with base color if we have one
-                base_color_node = None
-                for map_name in ['color', 'diffuse', 'albedo']:
-                    if map_name in texture_nodes:
-                        base_color_node = texture_nodes[map_name]
-                        break
-
-                if base_color_node:
-                    mix_node = nodes.new(type='ShaderNodeMixRGB')
-                    mix_node.location = (100, 200)
-                    mix_node.blend_type = 'MULTIPLY'
-                    mix_node.inputs['Fac'].default_value = 0.8  # 80% influence
-
-                    # Disconnect direct connection to base color
-                    for link in base_color_node.outputs['Color'].links:
-                        if link.to_socket == principled.inputs['Base Color']:
-                            links.remove(link)
-
-                    # Connect through the mix node
-                    links.new(base_color_node.outputs['Color'], mix_node.inputs[1])
-                    links.new(sep.outputs[ch_r], mix_node.inputs[2])
-                    links.new(mix_node.outputs['Color'], principled.inputs['Base Color'])
-                    print("Connected ARM.R to AO mix with Base Color")
-
-            # Handle AO (Ambient Occlusion) if separate
-            if 'ao' in texture_nodes:
-                base_color_node = None
-                for map_name in ['color', 'diffuse', 'albedo']:
-                    if map_name in texture_nodes:
-                        base_color_node = texture_nodes[map_name]
-                        break
-
-                if base_color_node:
-                    mix_node = nodes.new(type='ShaderNodeMixRGB')
-                    mix_node.location = (100, 200)
-                    mix_node.blend_type = 'MULTIPLY'
-                    mix_node.inputs['Fac'].default_value = 0.8  # 80% influence
-
-                    # Disconnect direct connection to base color
-                    for link in base_color_node.outputs['Color'].links:
-                        if link.to_socket == principled.inputs['Base Color']:
-                            links.remove(link)
-
-                    # Connect through the mix node
-                    links.new(base_color_node.outputs['Color'], mix_node.inputs[1])
-                    links.new(texture_nodes['ao'].outputs['Color'], mix_node.inputs[2])
-                    links.new(mix_node.outputs['Color'], principled.inputs['Base Color'])
-                    print("Connected AO to mix with Base Color")
-
-            # CRITICAL: Make sure to clear all existing materials from the object
+            # Note: this replaces every material slot on the object.
+            replaced = len(obj.data.materials)
             while len(obj.data.materials) > 0:
                 obj.data.materials.pop(index=0)
-
-            # Assign the new material to the object
             obj.data.materials.append(new_mat)
 
-            # CRITICAL: Make the object active and select it
             bpy.context.view_layer.objects.active = obj
             obj.select_set(True)
-
-            # CRITICAL: Force Blender to update the material
             bpy.context.view_layer.update()
 
-            # Get the list of texture maps
-            texture_maps = list(texture_images.keys())
-
-            # Get info about texture nodes for debugging
-            material_info = {
-                "name": new_mat.name,
-                "has_nodes": new_mat.use_nodes,
-                "node_count": len(new_mat.node_tree.nodes),
-                "texture_nodes": []
-            }
-
-            for node in new_mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    connections = []
-                    for output in node.outputs:
-                        for link in output.links:
-                            connections.append(f"{output.name} → {link.to_node.name}.{link.to_socket.name}")
-
-                    material_info["texture_nodes"].append({
-                        "name": node.name,
-                        "image": node.image.name,
-                        "colorspace": node.image.colorspace_settings.name,
-                        "connections": connections
-                    })
+            message = f"Created new material and applied texture {texture_id} to {object_name}"
+            if replaced:
+                message += f" (replaced {replaced} existing material slot{'s' if replaced != 1 else ''})"
 
             return {
                 "success": True,
-                "message": f"Created new material and applied texture {texture_id} to {object_name}",
+                "message": message,
                 "material": new_mat.name,
-                "maps": texture_maps,
-                "material_info": material_info
+                "maps": wired,
+                "material_info": self._polyhaven_material_info(new_mat),
             }
 
         except Exception as e:

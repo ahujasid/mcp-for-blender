@@ -1,0 +1,1009 @@
+"""Regression coverage for the Poly Haven integration.
+
+The traps this file guards against were all found against the live API:
+
+* The /files map keys are inconsistently cased and the casing is load-bearing -
+  "Diffuse", "Rough" and "Displacement" are capitalised while "nor_gl" and "arm"
+  are not. Matching them with `.lower() in ['normal', 'nor']` connected nothing,
+  so every texture imported perfectly flat, and a sibling branch that forgot
+  `.lower()` altogether did the same to displacement.
+* Every map an asset offers used to be downloaded whether or not anything
+  consumed it, costing roughly four times the bandwidth the material needed.
+* The API lists a `usd` entry for every model. It passed the "is this format
+  present?" guard, downloaded in full, and only then was rejected.
+* HDRI images were never packed, so the world pointed at a file in the OS temp
+  directory and the .blend lost its lighting the next time it was opened.
+
+Every request here is mocked; the suite never touches the network.
+"""
+import hashlib
+import importlib.util
+import sys
+import types
+
+import pytest
+
+from conftest import ROOT_ADDON as ADDON
+
+
+# --- a fake Blender good enough to inspect a node tree -----------------------
+
+# bl_idname -> node.type, for the nodes the Poly Haven paths create.
+NODE_TYPES = {
+    "ShaderNodeOutputMaterial": "OUTPUT_MATERIAL",
+    "ShaderNodeBsdfPrincipled": "BSDF_PRINCIPLED",
+    "ShaderNodeTexCoord": "TEX_COORD",
+    "ShaderNodeMapping": "MAPPING",
+    "ShaderNodeTexImage": "TEX_IMAGE",
+    "ShaderNodeNormalMap": "NORMAL_MAP",
+    "ShaderNodeDisplacement": "DISPLACEMENT",
+    "ShaderNodeTexEnvironment": "TEX_ENVIRONMENT",
+    "ShaderNodeBackground": "BACKGROUND",
+    "ShaderNodeOutputWorld": "OUTPUT_WORLD",
+}
+
+NODE_INPUTS = {
+    "ShaderNodeOutputMaterial": ["Surface", "Volume", "Displacement"],
+    "ShaderNodeBsdfPrincipled": ["Base Color", "Metallic", "Roughness", "IOR", "Alpha", "Normal"],
+    "ShaderNodeMapping": ["Vector", "Location", "Rotation", "Scale"],
+    "ShaderNodeTexImage": ["Vector"],
+    "ShaderNodeNormalMap": ["Strength", "Color"],
+    "ShaderNodeDisplacement": ["Height", "Midlevel", "Scale", "Normal"],
+    "ShaderNodeTexEnvironment": ["Vector"],
+    "ShaderNodeBackground": ["Color", "Strength"],
+    "ShaderNodeOutputWorld": ["Surface", "Volume"],
+}
+
+NODE_OUTPUTS = {
+    "ShaderNodeBsdfPrincipled": ["BSDF"],
+    "ShaderNodeTexCoord": ["Generated", "Normal", "UV", "Object", "Camera", "Window"],
+    "ShaderNodeMapping": ["Vector"],
+    "ShaderNodeTexImage": ["Color", "Alpha"],
+    "ShaderNodeNormalMap": ["Normal"],
+    "ShaderNodeDisplacement": ["Displacement"],
+    "ShaderNodeTexEnvironment": ["Color"],
+    "ShaderNodeBackground": ["Background"],
+}
+
+# Colorspaces a modern Blender build actually offers. _polyhaven_set_colorspace
+# walks a list of candidates, so anything outside this set has to raise.
+VALID_COLORSPACES = {"sRGB", "Non-Color", "Linear Rec.709", "ACEScg"}
+
+
+class FakeSocket:
+    def __init__(self, node, name):
+        self.node = node
+        self.name = name
+        self.default_value = None
+
+
+class FakeSocketCollection:
+    def __init__(self, node, names):
+        self.node = node
+        self._order = list(names)
+        self._sockets = {name: FakeSocket(node, name) for name in names}
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._sockets[self._order[key]]
+        if key not in self._sockets:
+            # Blender raises for a socket that does not exist, and so must this.
+            # Inventing one on demand meant a typo'd socket name passed here
+            # while every texture import failed in real Blender.
+            raise KeyError(f"{self.node.bl_idname} has no socket {key!r}")
+        return self._sockets[key]
+
+    def __contains__(self, key):
+        return key in self._sockets
+
+    def __iter__(self):
+        return iter(self._sockets[name] for name in self._order)
+
+
+class FakeNode:
+    def __init__(self, bl_idname):
+        self.bl_idname = bl_idname
+        self.type = NODE_TYPES.get(bl_idname, "UNKNOWN")
+        self.name = bl_idname
+        self.location = (0, 0)
+        self.image = None
+        self.vector_type = "POINT"
+        self.inputs = FakeSocketCollection(self, NODE_INPUTS.get(bl_idname, []))
+        self.outputs = FakeSocketCollection(self, NODE_OUTPUTS.get(bl_idname, []))
+
+
+class FakeLink:
+    def __init__(self, from_socket, to_socket):
+        self.from_socket = from_socket
+        self.to_socket = to_socket
+        self.from_node = from_socket.node
+        self.to_node = to_socket.node
+
+
+class FakeNodes(list):
+    def new(self, type=None):
+        node = FakeNode(type)
+        self.append(node)
+        return node
+
+    def clear(self):
+        del self[:]
+
+
+class FakeLinks(list):
+    def new(self, from_socket, to_socket):
+        # Blender allows one link per input socket: linking to an input that is
+        # already connected replaces the existing link rather than adding to it.
+        for existing in list(self):
+            if existing.to_socket is to_socket:
+                self.remove(existing)
+        link = FakeLink(from_socket, to_socket)
+        self.append(link)
+        return link
+
+
+class FakeNodeTree:
+    def __init__(self):
+        self.nodes = FakeNodes()
+        self.links = FakeLinks()
+
+
+class CustomPropMixin:
+    def __setitem__(self, key, value):
+        self.custom_properties[key] = value
+
+    def __getitem__(self, key):
+        return self.custom_properties[key]
+
+    def get(self, key, default=None):
+        return self.custom_properties.get(key, default)
+
+
+class FakeColorspace:
+    def __init__(self):
+        self._name = "sRGB"
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        if value not in VALID_COLORSPACES:
+            raise TypeError(f"enum {value!r} not found")
+        self._name = value
+
+
+class FakeImage(CustomPropMixin):
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.name = filepath.replace("\\", "/").rsplit("/", 1)[-1]
+        self.colorspace_settings = FakeColorspace()
+        self.packed_file = None
+        self.custom_properties = {}
+
+    def pack(self):
+        self.packed_file = object()
+
+
+class FakeMaterial(CustomPropMixin):
+    def __init__(self, name):
+        self.name = name
+        self.use_nodes = False
+        self.use_fake_user = False
+        self.displacement_method = "BUMP"
+        self.node_tree = FakeNodeTree()
+        self.custom_properties = {}
+
+
+class FakeWorld(CustomPropMixin):
+    def __init__(self, name):
+        self.name = name
+        self.use_nodes = False
+        self.node_tree = FakeNodeTree()
+        self.custom_properties = {}
+
+
+class FakeImages(list):
+    def load(self, filepath, check_existing=False):
+        if check_existing:
+            for image in self:
+                if image.filepath == filepath:
+                    return image
+        image = FakeImage(filepath)
+        self.append(image)
+        return image
+
+
+class FakeMaterials(list):
+    def new(self, name):
+        material = FakeMaterial(name)
+        self.append(material)
+        return material
+
+    def get(self, name):
+        return next((m for m in self if m.name == name), None)
+
+
+class FakeWorlds(list):
+    def new(self, name):
+        world = FakeWorld(name)
+        self.append(world)
+        return world
+
+
+class FakeMaterialSlots(list):
+    def pop(self, index=0):
+        # bpy collections take index as a keyword; a plain list does not.
+        return super().pop(index)
+
+
+class FakeMesh:
+    def __init__(self):
+        self.materials = FakeMaterialSlots()
+
+
+class FakeObject(CustomPropMixin):
+    def __init__(self, name):
+        self.name = name
+        self.type = "MESH"
+        self.data = FakeMesh()
+        self.custom_properties = {}
+        self.selected = False
+
+    def select_set(self, value):
+        self.selected = value
+
+
+class FakeObjects(list):
+    def get(self, name):
+        return next((o for o in self if o.name == name), None)
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, content=b"", streamed=False):
+        self.status_code = status_code
+        self._payload = payload
+        self._content = content
+        self._streamed = streamed
+
+    @property
+    def content(self):
+        # A streamed body must be consumed with iter_content. Serving .content
+        # here too would let the whole-file-into-memory regression - a 24k EXR
+        # is 2.4GB - pass the suite unnoticed.
+        if self._streamed:
+            raise AssertionError(
+                "a streamed download must use iter_content(), not response.content"
+            )
+        return self._content
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size=1):
+        for start in range(0, len(self._content), chunk_size):
+            yield self._content[start:start + chunk_size]
+
+
+def _load_addon(monkeypatch):
+    bpy = types.ModuleType("bpy")
+
+    bpy.data = types.SimpleNamespace(
+        images=FakeImages(),
+        materials=FakeMaterials(),
+        worlds=FakeWorlds(),
+        objects=FakeObjects(),
+    )
+    scene = types.SimpleNamespace(
+        world=None,
+        blendermcp_use_polyhaven=True,
+        blendermcp_use_hyper3d=False,
+        blendermcp_use_hunyuan3d=False,
+        blendermcp_use_sketchfab=False,
+        blendermcp_use_polypizza=False,
+    )
+    bpy.context = types.SimpleNamespace(
+        scene=scene,
+        selected_objects=[],
+        collection=types.SimpleNamespace(objects=types.SimpleNamespace(link=lambda _o: None)),
+        view_layer=types.SimpleNamespace(
+            update=lambda: None,
+            objects=types.SimpleNamespace(active=None),
+        ),
+    )
+    bpy.ops = types.SimpleNamespace(
+        import_scene=types.SimpleNamespace(
+            gltf=lambda **_kwargs: None, fbx=lambda **_kwargs: None
+        )
+    )
+    bpy.types = types.SimpleNamespace(
+        AddonPreferences=object,
+        Operator=object,
+        Panel=object,
+        Scene=type("Scene", (), {}),
+    )
+
+    props = types.ModuleType("bpy.props")
+    for name in ("BoolProperty", "EnumProperty", "FloatProperty", "IntProperty", "StringProperty"):
+        setattr(props, name, lambda **_kwargs: None)
+    bpy.props = props
+
+    handlers = types.ModuleType("bpy.app.handlers")
+    handlers.persistent = lambda fn: fn
+    handlers.undo_post = []
+    handlers.redo_post = []
+    handlers.depsgraph_update_post = []
+
+    app = types.ModuleType("bpy.app")
+    app.version = (4, 2, 0)
+    app.version_string = "4.2.0"
+    app.background = False
+    app.handlers = handlers
+    app.timers = types.SimpleNamespace(
+        is_registered=lambda *_a, **_k: False,
+        register=lambda *_a, **_k: None,
+        unregister=lambda *_a, **_k: None,
+    )
+    bpy.app = app
+
+    monkeypatch.setitem(sys.modules, "bpy", bpy)
+    monkeypatch.setitem(sys.modules, "bpy.props", props)
+    monkeypatch.setitem(sys.modules, "bpy.app", app)
+    monkeypatch.setitem(sys.modules, "bpy.app.handlers", handlers)
+    monkeypatch.setitem(sys.modules, "mathutils", types.ModuleType("mathutils"))
+
+    requests = types.ModuleType("requests")
+    requests.utils = types.SimpleNamespace(default_headers=dict)
+    requests.exceptions = types.SimpleNamespace(Timeout=TimeoutError)
+    monkeypatch.setitem(sys.modules, "requests", requests)
+
+    spec = importlib.util.spec_from_file_location("blender_mcp_polyhaven_test", ADDON)
+    addon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(addon)
+    return addon
+
+
+# --- fixtures in the shape the live API returns ------------------------------
+
+CDN = "https://dl.polyhaven.org/file/ph-assets"
+
+# Filled in by _file(): every fixture URL mapped to the bytes it serves, so the
+# md5 verification in _polyhaven_download is exercised for real.
+BODY_BY_URL = {}
+
+
+def _file(url, payload):
+    BODY_BY_URL[url] = payload
+    return {"url": url, "md5": hashlib.md5(payload).hexdigest(), "size": len(payload)}
+
+
+def _texture_map(slug, name):
+    # Distinct bodies per map, so a mixed-up map surfaces as a checksum failure
+    # rather than quietly passing.
+    payload = f"{slug}-{name}-bytes".encode()
+    return {"1k": {"jpg": _file(f"{CDN}/Textures/jpg/1k/{slug}/{slug}_{name}_1k.jpg", payload)}}
+
+
+TEXTURE_SLUG = "rock_wall_10"
+TEXTURE_FILES = {
+    "Diffuse": _texture_map(TEXTURE_SLUG, "diff"),
+    "nor_gl": _texture_map(TEXTURE_SLUG, "nor_gl"),
+    "nor_dx": _texture_map(TEXTURE_SLUG, "nor_dx"),
+    "Rough": _texture_map(TEXTURE_SLUG, "rough"),
+    "Displacement": _texture_map(TEXTURE_SLUG, "disp"),
+    "AO": _texture_map(TEXTURE_SLUG, "ao"),
+    "arm": _texture_map(TEXTURE_SLUG, "arm"),
+    # Containers, which carry their own format key rather than jpg/png/exr.
+    "blend": {"1k": {"blend": _file(f"{CDN}/Textures/blend/1k/x.blend", b"blend")}},
+    "gltf": {"1k": {"gltf": _file(f"{CDN}/Textures/gltf/1k/x.gltf", b"gltf")}},
+    "mtlx": {"1k": {"mtlx": _file(f"{CDN}/Textures/mtlx/1k/x.mtlx", b"mtlx")}},
+}
+
+# A multi-variant fabric: three colour options and no map called "Diffuse".
+VARIANT_FILES = {
+    "col_1": _texture_map("fabric_pattern_07", "col_1"),
+    "col_2": _texture_map("fabric_pattern_07", "col_2"),
+    "col_03": _texture_map("fabric_pattern_07", "col_03"),
+    "nor_gl": _texture_map("fabric_pattern_07", "nor_gl"),
+    "Rough": _texture_map("fabric_pattern_07", "rough"),
+    "AO": _texture_map("fabric_pattern_07", "ao"),
+}
+
+# An older asset that only ever shipped DirectX-convention normals.
+DX_ONLY_FILES = {
+    "Diffuse": _texture_map("dx_only", "diff"),
+    "nor_dx": _texture_map("dx_only", "nor_dx"),
+    "Rough": _texture_map("dx_only", "rough"),
+}
+
+HDRI_SLUG = "kloofendal_43d_clear_puresky"
+HDRI_FILES = {
+    "hdri": {
+        "1k": {"hdr": _file(f"{CDN}/HDRIs/hdr/1k/{HDRI_SLUG}_1k.hdr", b"fake-radiance-1k")},
+        "4k": {"hdr": _file(f"{CDN}/HDRIs/hdr/4k/{HDRI_SLUG}_4k.hdr", b"fake-radiance-4k")},
+        "8k": {"hdr": _file(f"{CDN}/HDRIs/hdr/8k/{HDRI_SLUG}_8k.hdr", b"fake-radiance-8k")},
+    },
+    # A flat file object, not a resolution map - it must not be mistaken for one.
+    "tonemapped": _file(f"{CDN}/HDRIs/extra/tonemapped.jpg", b"tonemapped"),
+}
+
+MODEL_SLUG = "potted_plant_02"
+def _gltf_with_includes(includes):
+    entry = _file(f"{CDN}/Models/gltf/1k/{MODEL_SLUG}.gltf", b"gltf-bytes")
+    entry["include"] = {
+        path: _file(f"{CDN}/Models/gltf/1k/{MODEL_SLUG}/{i}.png", f"include-{i}".encode())
+        for i, path in enumerate(includes)
+    }
+    return {"1k": {"gltf": entry}}
+
+
+MODEL_FILES = {
+    "gltf": {"1k": {"gltf": _file(f"{CDN}/Models/gltf/1k/{MODEL_SLUG}.gltf", b"gltf-bytes")}},
+    "fbx": {"1k": {"fbx": _file(f"{CDN}/Models/fbx/1k/{MODEL_SLUG}.fbx", b"fbx-bytes")}},
+    # Listed by the API for every model, and not something we can import.
+    "usd": {"1k": {"usd": _file(f"{CDN}/Models/usd/1k/{MODEL_SLUG}.usdc", b"usd-bytes" * 500)}},
+}
+
+# A response whose include keys try to escape the download directory - the
+# arbitrary-file-write reported as issue #257.
+HOSTILE_MODEL_FILES = {
+    "gltf": _gltf_with_includes([
+        "textures/fine.png",
+        "../../../../evil.png",
+        "/tmp/absolute.png",
+        "textures/../../escape.png",
+    ]),
+}
+
+INFO = {"authors": {"Rob Tuytel": "All"}, "name": "Rock Wall 10"}
+
+
+def _install_requests(monkeypatch, addon, files=None, info=None, assets=None, corrupt=False):
+    """Route requests by URL, and record every one of them."""
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None, stream=False):
+        calls.append({
+            "url": url,
+            "params": dict(params or {}),
+            "stream": stream,
+            "timeout": timeout,
+            "headers": dict(headers or {}),
+        })
+        if stream:
+            body = BODY_BY_URL.get(url)
+            if body is None:
+                return FakeResponse(status_code=404)
+            return FakeResponse(content=b"truncated" if corrupt else body, streamed=True)
+        if "/files/" in url:
+            return FakeResponse(payload=files if files is not None else {})
+        if "/info/" in url:
+            return FakeResponse(payload=info if info is not None else INFO)
+        if url.endswith("/assets"):
+            return FakeResponse(payload=assets if assets is not None else {})
+        return FakeResponse(payload={})
+
+    monkeypatch.setattr(addon.requests, "get", fake_get, raising=False)
+    return calls
+
+
+@pytest.fixture
+def server(monkeypatch, tmp_path):
+    addon = _load_addon(monkeypatch)
+    # Downloads go to a fresh mkdtemp that the addon removes on the way out;
+    # rooting it under tmp_path makes a leaked directory visible to the test.
+    monkeypatch.setattr(addon.tempfile, "gettempdir", lambda: str(tmp_path))
+    return addon, addon.BlenderMCPServer()
+
+
+def _downloaded(calls):
+    return [call["url"] for call in calls if call["stream"]]
+
+
+def _node_of_type(tree, node_type):
+    return next((n for n in tree.nodes if n.type == node_type), None)
+
+
+def _link_into(tree, node, socket_name):
+    """The single link feeding `socket_name` on `node`, or None."""
+    matches = [l for l in tree.links if l.to_node is node and l.to_socket.name == socket_name]
+    assert len(matches) <= 1, f"{socket_name} has {len(matches)} links; Blender allows one"
+    return matches[0] if matches else None
+
+
+def _material(addon, result):
+    return addon.bpy.data.materials.get(result["material"])
+
+
+# --- texture maps: what actually gets connected ------------------------------
+
+def test_normal_map_is_connected_to_the_principled_normal_input(server, monkeypatch):
+    """The API names these maps nor_gl and nor_dx, so a branch matching 'nor' or
+    'normal' never fired: the image was downloaded, a texture node was created
+    and wired to the Mapping node, and then nothing consumed it."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    assert result.get("success"), result
+
+    tree = _material(addon, result).node_tree
+    principled = _node_of_type(tree, "BSDF_PRINCIPLED")
+
+    normal_link = _link_into(tree, principled, "Normal")
+    assert normal_link is not None, "the normal map is not connected to anything"
+    assert normal_link.from_node.type == "NORMAL_MAP"
+
+    feeding_the_normal_map = _link_into(tree, normal_link.from_node, "Color")
+    assert feeding_the_normal_map.from_node.image.name.endswith("nor_gl")
+
+
+def test_displacement_is_connected_to_the_material_output(server, monkeypatch):
+    """The displacement branch was the one `elif` in the chain missing .lower(),
+    and the API's key is "Displacement"."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    tree = _material(addon, result).node_tree
+    output = _node_of_type(tree, "OUTPUT_MATERIAL")
+
+    disp_link = _link_into(tree, output, "Displacement")
+    assert disp_link is not None, "the displacement map is not connected to anything"
+    assert disp_link.from_node.type == "DISPLACEMENT"
+    assert disp_link.from_node.inputs["Midlevel"].default_value == 0.5
+    # A Displacement node connected to a material that is not told to displace
+    # does nothing at all.
+    assert _material(addon, result).displacement_method == "BOTH"
+
+
+def test_base_colour_roughness_and_metallic_are_connected(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    tree = _material(addon, result).node_tree
+    principled = _node_of_type(tree, "BSDF_PRINCIPLED")
+
+    assert _link_into(tree, principled, "Base Color").from_node.image.name.endswith("Diffuse")
+    assert _link_into(tree, principled, "Roughness").from_node.image.name.endswith("Rough")
+    assert set(result["maps"]) == {"Diffuse", "Rough", "Displacement", "nor_gl"}
+
+
+# --- what gets downloaded ----------------------------------------------------
+
+def test_only_the_maps_the_material_uses_are_downloaded(server, monkeypatch):
+    """AO, arm, nor_dx and the blend/gltf/mtlx containers were all fetched and
+    then left unconnected. For a real 1k texture that was 7.4MB of transfer to
+    build a material that needed 1.9MB."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    downloaded = _downloaded(calls)
+    assert len(downloaded) == 4
+    for unused in ("_ao_", "_arm_", "_nor_dx_", ".blend", ".gltf", ".mtlx"):
+        assert not any(unused in url for url in downloaded), f"{unused} should not be fetched"
+
+
+def test_nor_dx_is_used_only_when_the_asset_has_no_nor_gl(server, monkeypatch):
+    """OpenGL-convention normals are what Blender's Normal Map node expects, so
+    nor_dx is a fallback rather than a second download."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=DX_ONLY_FILES)
+
+    result = srv.download_polyhaven_asset("dx_only", "textures", "1k", "jpg")
+    assert result.get("success"), result
+
+    tree = _material(addon, result).node_tree
+    principled = _node_of_type(tree, "BSDF_PRINCIPLED")
+    normal_link = _link_into(tree, principled, "Normal")
+    assert normal_link is not None
+    assert any("_nor_dx_" in url for url in _downloaded(calls))
+
+
+def test_an_albedo_not_called_diffuse_is_still_connected(server, monkeypatch):
+    """A few textures ship col_1/col_2/col_03 variants instead of one Diffuse.
+    Exact-matching the map table would leave those materials with no base
+    colour at all - the exact failure the table exists to prevent."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=VARIANT_FILES)
+
+    result = srv.download_polyhaven_asset("fabric_pattern_07", "textures", "1k", "jpg")
+    assert result.get("success"), result
+
+    tree = _material(addon, result).node_tree
+    principled = _node_of_type(tree, "BSDF_PRINCIPLED")
+    base_colour = _link_into(tree, principled, "Base Color")
+    assert base_colour is not None, "no base colour was connected"
+
+    # One variant, not all three.
+    assert len([url for url in _downloaded(calls) if "_col" in url]) == 1
+
+
+def test_downloads_are_cleaned_up(server, monkeypatch, tmp_path):
+    """Every image is packed into the .blend, so nothing needs the files
+    afterwards. The old code leaked them: its cleanup called tempfile._cleanup(),
+    which does not exist in Python 3."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    assert srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg").get("success")
+    left = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file())
+    assert left == [], f"texture import left files behind: {left}"
+
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+    assert srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr").get("success")
+    left = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file())
+    assert left == [], f"hdri import left files behind: {left}"
+
+
+def test_every_request_carries_a_timeout(server, monkeypatch):
+    """Without one, a stalled connection hangs Blender's main thread forever -
+    there is no progress bar and no way to cancel."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    assert calls
+    assert all(call["timeout"] is not None for call in calls)
+
+
+def test_a_corrupt_download_is_rejected(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES, corrupt=True)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    assert "error" in result
+    assert "Checksum mismatch" in result["error"]
+
+
+# --- colour management -------------------------------------------------------
+
+def test_only_the_albedo_is_treated_as_colour(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    by_name = {img.name: img.colorspace_settings.name for img in addon.bpy.data.images}
+    assert by_name[f"{TEXTURE_SLUG}_Diffuse"] == "sRGB"
+    for map_key in ("Rough", "Displacement", "nor_gl"):
+        assert by_name[f"{TEXTURE_SLUG}_{map_key}"] == "Non-Color"
+
+
+# --- the material has to survive a save --------------------------------------
+
+def test_material_is_kept_alive_by_a_fake_user(server, monkeypatch):
+    """A material with no users is purged the next time the file is saved and
+    reopened, taking its packed images with it - and the tool reported success."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    assert _material(addon, result).use_fake_user is True
+
+
+def test_texture_images_are_packed(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    assert all(img.packed_file is not None for img in addon.bpy.data.images)
+
+
+# --- provenance --------------------------------------------------------------
+
+def test_images_are_tagged_so_set_texture_can_find_them(server, monkeypatch):
+    """The lookup key between downloading a texture and applying it. The old
+    code parsed it out of the image name, which turned "nor_gl" into "gl"."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    mat = _material(addon, result)
+
+    assert mat["polyhaven_id"] == TEXTURE_SLUG
+    assert mat["polyhaven_resolution"] == "1k"
+
+    for image in addon.bpy.data.images:
+        assert image["polyhaven_id"] == TEXTURE_SLUG
+        assert image["polyhaven_map"] in addon.POLYHAVEN_TEXTURE_MAPS
+
+
+# --- HDRIs -------------------------------------------------------------------
+
+def test_hdri_image_is_packed_so_the_blend_survives_reopening(server, monkeypatch):
+    """The image used to be left pointing at a file in the OS temp directory,
+    which made the .blend render correctly now and lose its lighting later."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+
+    result = srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr")
+    assert result.get("success"), result
+
+    image = next(img for img in addon.bpy.data.images if img.name == result["image_name"])
+    assert image.packed_file is not None
+
+
+def test_hdri_uses_the_scenes_own_world_and_leaves_others_alone(server, monkeypatch):
+    """bpy.data.worlds[0] is the alphabetically first world datablock, which is
+    very often somebody else's. Wiping its nodes and then making it active
+    destroyed hand-built world setups with no undo step to recover them."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+
+    someone_elses = addon.bpy.data.worlds.new("Aurora Studio Setup")
+    someone_elses.node_tree.nodes.new(type="ShaderNodeBackground")
+    scene_world = addon.bpy.data.worlds.new("Scene World")
+    addon.bpy.context.scene.world = scene_world
+
+    srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr")
+
+    assert len(someone_elses.node_tree.nodes) == 1, "an unrelated world was wiped"
+    assert addon.bpy.context.scene.world is scene_world
+    assert _node_of_type(scene_world.node_tree, "TEX_ENVIRONMENT") is not None
+
+
+def test_hdri_creates_a_world_when_the_scene_has_none(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+    addon.bpy.context.scene.world = None
+
+    result = srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr")
+
+    assert result.get("success"), result
+    assert addon.bpy.context.scene.world is not None
+
+
+def test_hdri_world_is_fully_wired(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+
+    srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr")
+    tree = addon.bpy.context.scene.world.node_tree
+
+    output = _node_of_type(tree, "OUTPUT_WORLD")
+    background_link = _link_into(tree, output, "Surface")
+    assert background_link.from_node.type == "BACKGROUND"
+    colour_link = _link_into(tree, background_link.from_node, "Color")
+    assert colour_link.from_node.type == "TEX_ENVIRONMENT"
+
+
+# --- formats and error messages ----------------------------------------------
+
+def test_unsupported_model_format_is_rejected_before_downloading(server, monkeypatch):
+    """`usd` is listed for every model, so it passed the "is this format
+    present?" guard, downloaded in full, and only then hit the unsupported
+    branch at the end of the import."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=MODEL_FILES)
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "usd")
+
+    assert "error" in result
+    assert "usd" in result["error"]
+    assert _downloaded(calls) == [], "the file was transferred before being rejected"
+
+
+def test_model_imports_and_reports_its_objects(server, monkeypatch):
+    """The .blend branch read selected_objects, which it never populates, so it
+    reported an empty list for every appended model."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+
+    def fake_gltf(filepath=None, **_kwargs):
+        addon.bpy.data.objects.append(FakeObject("potted_plant_02_pot"))
+        addon.bpy.data.objects.append(FakeObject("potted_plant_02_leaves"))
+
+    monkeypatch.setattr(addon.bpy.ops.import_scene, "gltf", fake_gltf)
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "gltf")
+
+    assert result.get("success"), result
+    assert set(result["imported_objects"]) == {"potted_plant_02_pot", "potted_plant_02_leaves"}
+
+
+def test_model_includes_cannot_escape_the_download_directory(server, monkeypatch, tmp_path):
+    """The API response controls these keys, so a malicious or MITM'd one could
+    write outside the download directory - issue #257. Mirrors
+    test_hunyuan_import_security.py for the sibling code path.
+
+    The download directory is nested deliberately deep: a "../../.." that got
+    through would then still land inside tmp_path, where this test can see it.
+    Asserting only that the escaped name is absent from the download directory
+    would pass whether the guard works or not, because a successful escape puts
+    the file somewhere the assertion never looks."""
+    addon, srv = server
+    sandbox = _mkdir(tmp_path / "a" / "b" / "c" / "d" / "e")
+    monkeypatch.setattr(addon.tempfile, "gettempdir", lambda: str(sandbox))
+    calls = _install_requests(monkeypatch, addon, files=HOSTILE_MODEL_FILES)
+    monkeypatch.setattr(addon.bpy.ops.import_scene, "gltf", lambda **_kwargs: None)
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "gltf")
+    assert result.get("success"), result
+
+    # The guard skips before downloading, so only the safe include is fetched.
+    includes = [url for url in _downloaded(calls) if url.endswith(".png")]
+    assert len(includes) == 1, f"expected 1 safe include, fetched {len(includes)}"
+
+    # The download directory is removed on the way out, so anything still on
+    # disk is a file that was written outside it.
+    leaked = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file())
+    assert leaked == [], f"files written outside the download directory: {leaked}"
+
+
+def _mkdir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_error_names_the_resolutions_that_do_exist(server, monkeypatch):
+    """The three errors this replaces were f-strings with nothing interpolated,
+    so an agent that guessed wrong could only guess again."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+
+    result = srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "16k", "hdr")
+
+    assert "error" in result
+    assert "1k, 4k, 8k" in result["error"]
+
+
+def test_resolutions_are_listed_in_numeric_order(server, monkeypatch):
+    addon, _ = server
+    assert addon._polyhaven_sorted_resolutions({"8k", "1k", "16k", "2k"}) == ["1k", "2k", "8k", "16k"]
+
+
+def test_unknown_asset_type_is_rejected(server, monkeypatch):
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "furniture", "1k", None)
+
+    assert "Unsupported asset type" in result["error"]
+    assert calls == [], "an unknown asset type must not reach the network"
+
+
+def test_an_asset_id_cannot_escape_the_cache_directory(server, monkeypatch):
+    """asset_id arrives from the model and lands in a filesystem path. Upstream
+    used mkdtemp, whose name no caller can influence; a stable cache directory
+    has to check the slug instead."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    for hostile in ("../../pwned", "/etc/cron.d/x", "a/../../b", "rock wall"):
+        result = srv.download_polyhaven_asset(hostile, "textures", "1k", "jpg")
+        assert "Invalid asset id" in result.get("error", ""), hostile
+
+    assert calls == [], "a rejected asset id must not reach the network"
+    # Real slugs still pass.
+    assert addon._polyhaven_valid_slug("rock_wall_10")
+    assert addon._polyhaven_valid_slug("kloofendal_43d_clear_puresky")
+
+
+# --- search ------------------------------------------------------------------
+
+def _asset(name, asset_type, downloads):
+    return {"name": name, "type": asset_type, "categories": [], "download_count": downloads}
+
+
+def test_search_ranks_before_truncating(server, monkeypatch):
+    """The list arrives sorted by slug, and models are the only assets with
+    capitalised slugs - so the first 20 of an unfiltered list were 20 models,
+    and the library's most downloaded assets were unreachable by any call."""
+    addon, srv = server
+    assets = {f"AModel_{i:02d}": _asset(f"Model {i}", 2, i) for i in range(20)}
+    assets["kloofendal_puresky"] = _asset("Kloofendal", 0, 865144)
+    assets["rock_wall_10"] = _asset("Rock Wall 10", 1, 50826)
+    _install_requests(monkeypatch, addon, assets=assets)
+
+    result = srv.search_polyhaven_assets(asset_type="all")
+
+    returned = result["assets"]
+    assert result["total_count"] == 22
+    assert result["returned_count"] == 20
+    assert "kloofendal_puresky" in returned, "the most downloaded asset was truncated away"
+    assert "rock_wall_10" in returned
+    assert list(returned)[0] == "kloofendal_puresky"
+
+
+def test_search_rejects_an_unknown_type_without_a_request(server, monkeypatch):
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets={})
+
+    result = srv.search_polyhaven_assets(asset_type="furniture")
+
+    assert "error" in result
+    assert calls == []
+
+
+# --- set_texture -------------------------------------------------------------
+
+def test_set_texture_wires_each_input_exactly_once(server, monkeypatch):
+    """set_texture used to build its tree in two passes over the same maps.
+    Blender allows one link per input, so the second pass replaced every link
+    the first had made, leaving the first pass's Normal Map and Displacement
+    nodes orphaned in the tree."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    obj = FakeObject("Cube")
+    addon.bpy.data.objects.append(obj)
+
+    result = srv.set_texture("Cube", TEXTURE_SLUG)
+    assert result.get("success"), result
+
+    tree = addon.bpy.data.materials.get(result["material"]).node_tree
+    principled = _node_of_type(tree, "BSDF_PRINCIPLED")
+
+    # _link_into asserts at most one link per input.
+    assert _link_into(tree, principled, "Normal") is not None
+    assert _link_into(tree, principled, "Base Color") is not None
+
+    normal_maps = [n for n in tree.nodes if n.type == "NORMAL_MAP"]
+    displacements = [n for n in tree.nodes if n.type == "DISPLACEMENT"]
+    assert len(normal_maps) == 1, "an orphaned Normal Map node was left in the tree"
+    assert len(displacements) == 1, "an orphaned Displacement node was left in the tree"
+
+    assert obj.data.materials == [tree_material(addon, result)]
+
+
+def tree_material(addon, result):
+    return addon.bpy.data.materials.get(result["material"])
+
+
+def test_set_texture_reports_the_node_tree_it_built(server, monkeypatch):
+    """The MCP layer renders this back to the caller, so an empty summary would
+    read as "no texture nodes found" on a material that has four."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    addon.bpy.data.objects.append(FakeObject("Cube"))
+
+    info = srv.set_texture("Cube", TEXTURE_SLUG)["material_info"]
+
+    assert info["has_nodes"] is True
+    assert info["node_count"] > 0
+    assert len(info["texture_nodes"]) == 4
+    assert all(node["connections"] for node in info["texture_nodes"])
+
+
+def test_set_texture_reports_the_slots_it_replaced(server, monkeypatch):
+    """It clears every material slot on the object, which cannot be undone -
+    the agent had no way to know that from the old message."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    obj = FakeObject("Cube")
+    obj.data.materials.extend([object(), object()])
+    addon.bpy.data.objects.append(obj)
+
+    result = srv.set_texture("Cube", TEXTURE_SLUG)
+
+    assert "replaced 2 existing material slots" in result["message"]
+
+
+def test_set_texture_needs_the_texture_downloaded_first(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    addon.bpy.data.objects.append(FakeObject("Cube"))
+
+    result = srv.set_texture("Cube", TEXTURE_SLUG)
+
+    assert "error" in result
+    assert "download_polyhaven_asset" in result["error"]
+
+
