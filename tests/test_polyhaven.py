@@ -1573,3 +1573,87 @@ def test_the_taxonomy_is_cached(server, monkeypatch):
     srv.get_polyhaven_categories("textures")
 
     assert len([c for c in calls if "/taxonomy/" in c["url"]]) == 1
+
+
+# --- previews: looking before downloading ------------------------------------
+
+THUMB = ("https://cdn.polyhaven.com/asset_img/thumbs/rusty_metal.png"
+         "?width=256&height=256&v=d9ab12e4")
+
+PREVIEWABLE = {"rusty_metal": _asset("Rusty Metal", 1, 300000, thumbnail_url=THUMB)}
+
+
+def _install_preview(monkeypatch, addon, assets=None, info=None, body=b"\x89PNG-bytes"):
+    calls = _install_requests(monkeypatch, addon, assets=assets, info=info)
+    inner = addon.requests.get
+
+    def fake_get(url, headers=None, params=None, timeout=None, stream=False):
+        if "cdn.polyhaven.com" in url:
+            calls.append({"url": url, "params": dict(params or {}), "stream": False,
+                          "timeout": timeout, "headers": dict(headers or {})})
+            return FakeResponse(content=body, headers={"Content-Type": "image/png"})
+        return inner(url, headers=headers, params=params, timeout=timeout, stream=stream)
+
+    monkeypatch.setattr(addon.requests, "get", fake_get, raising=False)
+    return calls
+
+
+def test_a_preview_keeps_the_thumbnails_cache_busting_version(server, monkeypatch):
+    """thumbnail_url carries a `v` holding a hash of the asset's images. Bunny
+    serves images with a year-long max-age, so a URL rebuilt without it can be
+    answered from cache with a thumbnail for renders that have been replaced
+    since."""
+    addon, srv = server
+    calls = _install_preview(monkeypatch, addon, info=PREVIEWABLE["rusty_metal"])
+
+    result = srv.get_polyhaven_asset_preview("rusty_metal")
+
+    assert result["success"]
+    requested = next(c["url"] for c in calls if "cdn.polyhaven.com" in c["url"])
+    assert "v=d9ab12e4" in requested
+    assert "width=512" in requested and "height=512" in requested
+
+
+def test_a_preview_reuses_the_cached_asset_list(server, monkeypatch):
+    """/info is the same record plus a few internal fields, so it is only worth
+    a request when the list has not already been fetched."""
+    addon, srv = server
+    calls = _install_preview(monkeypatch, addon, assets=PREVIEWABLE)
+
+    srv.search_polyhaven_assets(asset_type="textures")
+    result = srv.get_polyhaven_asset_preview("rusty_metal")
+
+    assert result["success"]
+    assert [c for c in calls if "/info/" in c["url"]] == []
+
+
+def test_a_preview_reports_the_asset_it_is_showing(server, monkeypatch):
+    addon, srv = server
+    _install_preview(monkeypatch, addon, info=PREVIEWABLE["rusty_metal"])
+
+    result = srv.get_polyhaven_asset_preview("rusty_metal")
+
+    assert result["name"] == "Rusty Metal"
+    assert result["authors"] == ["Rob Tuytel"]
+    assert result["url"] == "https://polyhaven.com/a/rusty_metal"
+    assert result["format"] == "png"
+
+
+def test_a_preview_rejects_a_bad_slug_without_a_request(server, monkeypatch):
+    addon, srv = server
+    calls = _install_preview(monkeypatch, addon, info=PREVIEWABLE["rusty_metal"])
+
+    result = srv.get_polyhaven_asset_preview("../../etc/passwd")
+
+    assert "error" in result
+    assert calls == []
+
+
+def test_an_asset_with_no_thumbnail_says_so(server, monkeypatch):
+    addon, srv = server
+    _install_preview(monkeypatch, addon, info=_asset("No Thumb", 1, 1))
+
+    result = srv.get_polyhaven_asset_preview("rock_wall_10")
+
+    assert "error" in result
+    assert "thumbnail" in result["error"]

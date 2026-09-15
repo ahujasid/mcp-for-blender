@@ -22,7 +22,7 @@ from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
 from collections import deque
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
@@ -329,6 +329,10 @@ POLYHAVEN_SEARCH_MAX_LIMIT = 50
 # everything nested beneath it.
 POLYHAVEN_TAXONOMY_DEPTH_ALL = 2
 
+# Poly Haven publishes thumbnails at 256px. The CDN resizes from the query
+# string, so a preview worth looking at costs no stored file.
+POLYHAVEN_PREVIEW_SIZE = 512
+
 
 class PolyHavenAPIError(Exception):
     """A non-2xx from the Poly Haven API, with the status kept.
@@ -548,6 +552,37 @@ def _polyhaven_taxonomy(asset_type, depth=None):
 
 def _polyhaven_asset_url(slug):
     return f"{POLYHAVEN_SITE}/a/{quote(slug, safe='')}"
+
+
+def _polyhaven_asset_record(slug):
+    """One asset's metadata, taken from the cached asset list where possible.
+
+    /info/{id} is the same record plus a few internal fields, so it is only
+    worth a request when the list has not already been fetched.
+    """
+    for entry in _polyhaven_cache.values():
+        payload = entry.get("payload")
+        if isinstance(payload, dict):
+            record = payload.get(slug)
+            if isinstance(record, dict) and "name" in record:
+                return record
+    return _polyhaven_api_get(f"info/{quote(slug, safe='')}", cache=True)
+
+
+def _polyhaven_preview_url(thumbnail_url, size=POLYHAVEN_PREVIEW_SIZE):
+    """Resize the published thumbnail without losing its cache-busting `v`.
+
+    Poly Haven's CDN resizes from the query string, so a larger preview costs no
+    stored file - but `thumbnail_url` also carries a `v` holding a hash of the
+    asset's images, and a URL rebuilt by hand without it can be served a
+    year-old thumbnail for an asset whose renders have since been replaced.
+    """
+    parts = urlparse(thumbnail_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if "width" in params or "height" in params:
+        params["width"] = str(size)
+        params["height"] = str(size)
+    return urlunparse(parts._replace(query=urlencode(params)))
 
 
 def _polyhaven_summarize_asset(slug, record):
@@ -1373,6 +1408,7 @@ class BlenderMCPServer:
                 "get_polyhaven_categories": self.get_polyhaven_categories,
                 "search_polyhaven_assets": self.search_polyhaven_assets,
                 "download_polyhaven_asset": self.download_polyhaven_asset,
+                "get_polyhaven_asset_preview": self.get_polyhaven_asset_preview,
                 "set_texture": self.set_texture,
             }
             handlers.update(polyhaven_handlers)
@@ -2445,6 +2481,47 @@ class BlenderMCPServer:
             }
         except Exception as e:
             return {"error": str(e)}
+    def get_polyhaven_asset_preview(self, asset_id):
+        """Fetch an asset's thumbnail, so it can be looked at before downloading.
+
+        A thumbnail is a few hundred kilobytes against a 4k texture's 24MB, so
+        checking one first is cheaper for everybody than importing the wrong rock.
+        """
+        try:
+            if not _polyhaven_valid_slug(asset_id):
+                return {"error": f"Invalid asset id: {asset_id!r}. Poly Haven slugs are "
+                                 "letters, digits, underscores and hyphens."}
+
+            record = _polyhaven_asset_record(asset_id)
+            thumbnail_url = record.get("thumbnail_url")
+            if not thumbnail_url:
+                return {"error": f"No thumbnail is published for '{asset_id}'"}
+
+            response = requests.get(
+                _polyhaven_preview_url(thumbnail_url),
+                headers=REQ_HEADERS,
+                timeout=POLYHAVEN_API_TIMEOUT,
+            )
+            if response.status_code >= 400:
+                return {"error": f"Failed to fetch the thumbnail: HTTP {response.status_code}"}
+
+            content_type = getattr(response, "headers", {}).get("Content-Type", "")
+            image_format = "png" if "png" in content_type or ".png" in thumbnail_url else "jpeg"
+
+            authors = record.get("authors") or {}
+            return {
+                "success": True,
+                "image_data": base64.b64encode(response.content).decode("ascii"),
+                "format": image_format,
+                "asset_id": asset_id,
+                "name": record.get("name") or asset_id,
+                "authors": sorted(authors) if isinstance(authors, dict) else authors,
+                "url": _polyhaven_asset_url(asset_id),
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to get asset preview: {str(e)}"}
+
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
         try:
             if asset_type not in POLYHAVEN_SUPPORTED_FORMATS:
