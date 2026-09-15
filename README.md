@@ -664,7 +664,7 @@ For headless setups or CI, credentials can also be injected by environment varia
 |---|---|
 | **Connection issues** | Make sure the Blender addon server is running, and the MCP server is configured on Claude. **Do not** run the `uvx` command in the terminal. Sometimes the first command won't go through, but after that it starts working. |
 | **Timeout errors** | Try simplifying your requests or breaking them into smaller steps. |
-| **Poly Haven integration** | Claude is sometimes erratic with its behaviour. |
+| **Blender freezes during a Poly Haven download** | Assets are downloaded on Blender's main thread, so the UI stops responding until the transfer finishes. File size grows roughly fourfold per resolution step, so ask for 1k or 2k unless the asset is held close to camera. |
 | **Poly Pizza download fails with a Cloudflare challenge** | `static.poly.pizza` is behind bot protection and blocks datacenter, VPN and cloud IPs. Your API key is fine - the CDN never sees it. Retry from a normal connection, or download the `.glb` by hand and use **File → Import → glTF 2.0**. |
 | **Have you tried turning it off and on again?** | If you're still having connection errors, try restarting both Claude and the Blender server. |
 
