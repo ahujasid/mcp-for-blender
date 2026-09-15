@@ -1475,3 +1475,101 @@ def test_the_result_limit_is_capped(server, monkeypatch):
     result = srv.search_polyhaven_assets(limit=1000)
 
     assert result["returned_count"] == addon.POLYHAVEN_SEARCH_MAX_LIMIT
+
+
+# --- taxonomy: the flat category list is deprecated --------------------------
+
+TAXONOMY = {
+    "type": "textures",
+    "categories": [
+        {"name": "Metal", "path": "Metal", "slugPath": "metal", "id": "uuid-1",
+         "description": "Metallic surfaces.", "children": [
+             {"name": "Sheet", "path": "Metal/Sheet", "slugPath": "metal/sheet",
+              "id": "uuid-2", "description": "", "children": [
+                  {"name": "Flat Sheet", "path": "Metal/Sheet/Flat Sheet",
+                   "slugPath": "metal/sheet/flat-sheet", "id": "uuid-3", "children": []}]}]},
+        {"name": "Stone", "path": "Stone", "slugPath": "stone", "id": "uuid-4", "children": []},
+    ],
+    "attributes": {
+        "condition": {"type": "string[]", "enum": ["clean", "rusted"],
+                      "description": "How worn the surface is."},
+        "aerial": {"type": "boolean", "description": "Captured by drone."},
+    },
+}
+
+
+def _install_taxonomy(monkeypatch, addon):
+    calls = _install_requests(monkeypatch, addon)
+    inner = addon.requests.get
+
+    def fake_get(url, headers=None, params=None, timeout=None, stream=False):
+        if "/taxonomy/" in url:
+            calls.append({"url": url, "params": dict(params or {}), "stream": False,
+                          "timeout": timeout, "headers": dict(headers or {})})
+            return FakeResponse(payload=dict(TAXONOMY, type=url.rsplit("/", 1)[-1]))
+        return inner(url, headers=headers, params=params, timeout=timeout, stream=stream)
+
+    monkeypatch.setattr(addon.requests, "get", fake_get, raising=False)
+    return calls
+
+
+def test_categories_come_from_the_taxonomy_endpoint(server, monkeypatch):
+    """The flat /categories list is deprecated. /taxonomy carries the single-path
+    tree an asset's `category` field actually uses, plus the attribute schema."""
+    addon, srv = server
+    calls = _install_taxonomy(monkeypatch, addon)
+
+    result = srv.get_polyhaven_categories("textures")
+
+    assert [c["url"] for c in calls] == ["https://api.polyhaven.com/taxonomy/textures"]
+    taxonomy = result["taxonomy"][0]
+    assert taxonomy["categories"] == ["Metal", "Metal/Sheet", "Metal/Sheet/Flat Sheet", "Stone"]
+    assert taxonomy["attributes"]["condition"]["enum"] == ["clean", "rusted"]
+    assert taxonomy["attributes"]["aerial"]["type"] == "boolean"
+
+
+def test_the_taxonomy_is_trimmed_to_what_a_filter_needs(server, monkeypatch):
+    """The raw response is 60-80KB per type, most of it UUIDs and URL slugs that
+    nothing here uses."""
+    addon, srv = server
+    _install_taxonomy(monkeypatch, addon)
+
+    taxonomy = srv.get_polyhaven_categories("textures")["taxonomy"][0]
+
+    assert all(isinstance(path, str) for path in taxonomy["categories"])
+    assert set(taxonomy["attributes"]["condition"]) <= {"type", "enum", "description"}
+
+
+def test_asking_for_every_type_returns_only_the_top_levels(server, monkeypatch):
+    """Three full trees at once is 30KB of paths. Category filtering is
+    inclusive, so the top two levels still select everything beneath them."""
+    addon, srv = server
+    _install_taxonomy(monkeypatch, addon)
+
+    result = srv.get_polyhaven_categories("all")
+
+    assert result["truncated"] is True
+    assert [t["type"] for t in result["taxonomy"]] == ["hdris", "textures", "models"]
+    for taxonomy in result["taxonomy"]:
+        assert "Metal/Sheet/Flat Sheet" not in taxonomy["categories"]
+        assert "Metal/Sheet" in taxonomy["categories"]
+
+
+def test_an_unknown_type_is_rejected_without_a_request(server, monkeypatch):
+    addon, srv = server
+    calls = _install_taxonomy(monkeypatch, addon)
+
+    result = srv.get_polyhaven_categories("hdri")
+
+    assert "error" in result
+    assert calls == []
+
+
+def test_the_taxonomy_is_cached(server, monkeypatch):
+    addon, srv = server
+    calls = _install_taxonomy(monkeypatch, addon)
+
+    srv.get_polyhaven_categories("textures")
+    srv.get_polyhaven_categories("textures")
+
+    assert len([c for c in calls if "/taxonomy/" in c["url"]]) == 1

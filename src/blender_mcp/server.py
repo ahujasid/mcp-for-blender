@@ -739,10 +739,20 @@ async def bpy_api_lookup(ctx: Context, query: str, user_prompt: str = "") -> str
 @telemetry_tool("get_polyhaven_categories")
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
     """
-    Get a list of categories for a specific asset type on Polyhaven.
+    Get the categories and attributes you can filter Poly Haven assets by.
+
+    Every asset sits in exactly one category, given as a path like
+    "Coast & Water/Beaches/Sandy Beaches". Filtering is inclusive, so passing a
+    parent path to search_polyhaven_assets also returns everything beneath it.
+
+    Categories describe what an asset IS. Qualities like weather, condition or
+    material are separate attributes, listed here with the values each accepts -
+    HDRIs carry time_of_day, weather and season; textures carry surface_use and
+    condition; models carry material, rigged and lods.
 
     Parameters:
-    - asset_type: The type of asset to get categories for (hdris, textures, models, all)
+    - asset_type: hdris, textures, models, or all. Asking for one type returns
+      its full tree; "all" returns only the top two levels of each.
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
     """
     try:
@@ -751,25 +761,33 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
         if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
-        
+
         if "error" in result:
             return f"Error: {result['error']}"
-        
-        # Format the categories in a more readable way
-        categories = result["categories"]
-        formatted_output = f"Categories for {asset_type}:\n\n"
-        
-        # Sort categories by count (descending)
-        sorted_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)
-        
-        for category, count in sorted_categories:
-            formatted_output += f"- {category}: {count} assets\n"
-        
-        return formatted_output
+
+        lines = []
+        for taxonomy in result["taxonomy"]:
+            lines.append(f"{taxonomy['type']} categories:")
+            for path in taxonomy["categories"]:
+                lines.append(f"  {path}")
+            if result.get("truncated"):
+                lines.append("  (top two levels only - ask for a single asset type for the rest)")
+            lines.append("")
+
+            if taxonomy["attributes"]:
+                lines.append(f"{taxonomy['type']} attributes:")
+                for key, spec in taxonomy["attributes"].items():
+                    values = spec.get("enum")
+                    allowed = ", ".join(values) if values else spec.get("type", "")
+                    lines.append(f"  {key}: {allowed}")
+                    if spec.get("description"):
+                        lines.append(f"    {spec['description']}")
+                lines.append("")
+
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error getting Polyhaven categories: {str(e)}")
         return f"Error getting Polyhaven categories: {str(e)}"
-
 @mcp.tool()
 @telemetry_tool("search_polyhaven_assets")
 async def search_polyhaven_assets(

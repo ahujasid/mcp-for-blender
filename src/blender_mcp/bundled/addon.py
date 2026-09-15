@@ -324,6 +324,11 @@ POLYHAVEN_ASSET_TYPES = {0: "hdris", 1: "textures", 2: "models"}
 POLYHAVEN_SEARCH_LIMIT = 20
 POLYHAVEN_SEARCH_MAX_LIMIT = 50
 
+# Levels of the category tree returned when every asset type is asked for at
+# once. Filtering on a category is inclusive, so a parent still selects
+# everything nested beneath it.
+POLYHAVEN_TAXONOMY_DEPTH_ALL = 2
+
 
 class PolyHavenAPIError(Exception):
     """A non-2xx from the Poly Haven API, with the status kept.
@@ -502,6 +507,43 @@ def _polyhaven_blend_version(path):
         return int(head[9:10]), int(head[10:12])
     except (ValueError, IndexError):
         return None
+
+
+def _polyhaven_category_paths(nodes, depth=None, _level=1):
+    """Flatten the category tree to its paths, which is what filters take."""
+    paths = []
+    for node in nodes or []:
+        if node.get("path"):
+            paths.append(node["path"])
+        if depth is None or _level < depth:
+            paths.extend(_polyhaven_category_paths(node.get("children"), depth, _level + 1))
+    return paths
+
+
+def _polyhaven_taxonomy(asset_type, depth=None):
+    """The category tree and attribute schema for one asset type, trimmed.
+
+    The raw response is 60-80KB per type, most of it descriptions, UUIDs and
+    URL slugs that nothing here uses. The paths are what a `categories` filter
+    takes, and matching on them is inclusive, so a parent path selects
+    everything beneath it.
+    """
+    payload = _polyhaven_api_get(f"taxonomy/{quote(asset_type, safe='')}", cache=True)
+
+    attributes = {}
+    for key, spec in (payload.get("attributes") or {}).items():
+        if isinstance(spec, dict):
+            attributes[key] = {
+                field: spec[field]
+                for field in ("type", "enum", "description")
+                if field in spec
+            }
+
+    return {
+        "type": payload.get("type") or asset_type,
+        "categories": _polyhaven_category_paths(payload.get("categories"), depth),
+        "attributes": attributes,
+    }
 
 
 def _polyhaven_asset_url(slug):
@@ -2314,12 +2356,24 @@ class BlenderMCPServer:
         }
 
     def get_polyhaven_categories(self, asset_type):
-        """Get categories for a specific asset type from Polyhaven"""
+        """Get the category taxonomy and attribute schema for an asset type."""
         try:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
 
-            return {"categories": _polyhaven_api_get(f"categories/{quote(asset_type, safe='')}")}
+            if asset_type == "all":
+                # Three full trees at once is 30KB of paths, so this one is cut
+                # to the top two levels. Filtering is inclusive, so those still
+                # select everything beneath them.
+                return {
+                    "taxonomy": [
+                        _polyhaven_taxonomy(one, depth=POLYHAVEN_TAXONOMY_DEPTH_ALL)
+                        for one in ("hdris", "textures", "models")
+                    ],
+                    "truncated": True,
+                }
+
+            return {"taxonomy": [_polyhaven_taxonomy(asset_type)], "truncated": False}
         except Exception as e:
             return {"error": str(e)}
 
