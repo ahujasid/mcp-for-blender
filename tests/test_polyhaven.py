@@ -238,6 +238,79 @@ class FakeMaterialSlots(list):
         return super().pop(index)
 
 
+class FakeCollection(CustomPropMixin):
+    def __init__(self, name):
+        self.name = name
+        self.objects = FakeObjects()
+        self.children = FakeCollections()
+        self.custom_properties = {}
+
+
+class FakeCollections(list):
+    def get(self, name):
+        return next((c for c in self if c.name == name), None)
+
+    def new(self, name):
+        collection = FakeCollection(name)
+        self.append(collection)
+        return collection
+
+    def link(self, collection):
+        self.append(collection)
+
+
+class FakeLibraryLoad:
+    """bpy.data.libraries.load: names go in, appended datablocks come out.
+
+    Inside the `with` block data_from lists what the file holds, by name. You
+    assign the names you want to data_to, and on exit Blender has replaced them
+    with the datablocks it appended.
+    """
+
+    def __init__(self, data, contents):
+        self._data = data
+        self._contents = contents
+
+    def __enter__(self):
+        self.data_from = types.SimpleNamespace(
+            collections=list(self._contents.get("collections", {})),
+            objects=list(self._contents.get("objects", [])),
+        )
+        self.data_to = types.SimpleNamespace(collections=[], objects=[])
+        return self.data_from, self.data_to
+
+    def __exit__(self, *_exc):
+        appended = []
+        for name in self.data_to.collections:
+            collection = self._data.collections.new(name)
+            for obj_name in self._contents["collections"][name]:
+                obj = FakeObject(obj_name)
+                self._data.objects.append(obj)
+                collection.objects.append(obj)
+            appended.append(collection)
+        self.data_to.collections = appended
+
+        objects = []
+        for name in self.data_to.objects:
+            obj = FakeObject(name)
+            self._data.objects.append(obj)
+            objects.append(obj)
+        self.data_to.objects = objects
+        return False
+
+
+class FakeLibraries:
+    """Serves whatever BLEND_CONTENTS says the downloaded file holds."""
+
+    def __init__(self, data):
+        self._data = data
+        self.contents = {}
+
+    def load(self, filepath, link=False):
+        assert link is False, "Poly Haven models are appended, not linked"
+        return FakeLibraryLoad(self._data, self.contents)
+
+
 class FakeMesh:
     def __init__(self):
         self.materials = FakeMaterialSlots()
@@ -298,9 +371,12 @@ def _load_addon(monkeypatch):
         materials=FakeMaterials(),
         worlds=FakeWorlds(),
         objects=FakeObjects(),
+        collections=FakeCollections(),
     )
+    bpy.data.libraries = FakeLibraries(bpy.data)
     scene = types.SimpleNamespace(
         world=None,
+        collection=types.SimpleNamespace(children=FakeCollections(), objects=FakeObjects()),
         blendermcp_use_polyhaven=True,
         blendermcp_use_hyper3d=False,
         blendermcp_use_hunyuan3d=False,
@@ -433,26 +509,81 @@ HDRI_FILES = {
 }
 
 MODEL_SLUG = "potted_plant_02"
-def _gltf_with_includes(includes):
-    entry = _file(f"{CDN}/Models/gltf/1k/{MODEL_SLUG}.gltf", b"gltf-bytes")
+def _blend_with_includes(includes):
+    entry = _file(f"{CDN}/Models/blend/1k/{MODEL_SLUG}_hostile.blend",
+                  _blend_bytes(b"BLENDER-v293"))
     entry["include"] = {
-        path: _file(f"{CDN}/Models/gltf/1k/{MODEL_SLUG}/{i}.png", f"include-{i}".encode())
+        path: _file(f"{CDN}/Models/blend/1k/{MODEL_SLUG}/{i}.png", f"include-{i}".encode())
         for i, path in enumerate(includes)
     }
-    return {"1k": {"gltf": entry}}
+    return {"1k": {"blend": entry}}
 
+
+def _blend_bytes(header):
+    """A .blend prefix the header parser can read. Published files are
+    compressed, but the parser handles that separately and this keeps the
+    fixture legible."""
+    return header + b"REND" + b"\x00" * 32
+
+
+# Up to Blender 4.4 the version is three characters, from 4.5 it is four and the
+# header carries its own length. Both layouts are in the published library:
+# the oldest models were saved in 2.93, the newest in 5.0.
+BLEND_HEADER_293 = b"BLENDER-v293"
+BLEND_HEADER_500 = b"BLENDER17-01v0500"
 
 MODEL_FILES = {
+    "blend": {"1k": {"blend": _file(f"{CDN}/Models/blend/1k/{MODEL_SLUG}.blend",
+                                    _blend_bytes(BLEND_HEADER_293))}},
     "gltf": {"1k": {"gltf": _file(f"{CDN}/Models/gltf/1k/{MODEL_SLUG}.gltf", b"gltf-bytes")}},
     "fbx": {"1k": {"fbx": _file(f"{CDN}/Models/fbx/1k/{MODEL_SLUG}.fbx", b"fbx-bytes")}},
     # Listed by the API for every model, and not something we can import.
     "usd": {"1k": {"usd": _file(f"{CDN}/Models/usd/1k/{MODEL_SLUG}.usdc", b"usd-bytes" * 500)}},
 }
 
+# A model saved by a Blender newer than the one running: unopenable, so the
+# import falls back to glTF rather than failing.
+FUTURE_MODEL_FILES = {
+    "blend": {"1k": {"blend": _file(f"{CDN}/Models/blend/1k/future.blend",
+                                    _blend_bytes(BLEND_HEADER_500))}},
+    "gltf": {"1k": {"gltf": _file(f"{CDN}/Models/gltf/1k/future.gltf", b"future-gltf-bytes")}},
+}
+
+# The same, for the one published model that has no glTF at all.
+FUTURE_ONLY_BLEND_FILES = {
+    "blend": {"1k": {"blend": _file(f"{CDN}/Models/blend/1k/lonely.blend",
+                                    _blend_bytes(BLEND_HEADER_500))}},
+}
+
+# What the downloaded .blend is pretending to contain. Every published model has
+# a collection named exactly the slug, and models with levels of detail carry
+# them beneath it.
+MODEL_WITH_LODS = {
+    "collections": {
+        MODEL_SLUG: [],
+        f"{MODEL_SLUG}_LOD0": [f"{MODEL_SLUG}_pot_LOD0", f"{MODEL_SLUG}_leaves_LOD0"],
+        f"{MODEL_SLUG}_LOD1": [f"{MODEL_SLUG}_pot_LOD1", f"{MODEL_SLUG}_leaves_LOD1"],
+        f"{MODEL_SLUG}_LOD2": [f"{MODEL_SLUG}_pot_LOD2", f"{MODEL_SLUG}_leaves_LOD2"],
+    },
+    "objects": [f"{MODEL_SLUG}_pot_LOD0", f"{MODEL_SLUG}_leaves_LOD0",
+                f"{MODEL_SLUG}_pot_LOD1", f"{MODEL_SLUG}_leaves_LOD1",
+                f"{MODEL_SLUG}_pot_LOD2", f"{MODEL_SLUG}_leaves_LOD2"],
+}
+
+# Several published models ship a second, unrelated model alongside the asset -
+# wooden_ladder's file also holds wooden_step_ladder.
+MODEL_WITH_A_STOWAWAY = {
+    "collections": {
+        MODEL_SLUG: [f"{MODEL_SLUG}_pot", f"{MODEL_SLUG}_leaves"],
+        "someone_elses_model": ["someone_elses_model"],
+    },
+    "objects": [f"{MODEL_SLUG}_pot", f"{MODEL_SLUG}_leaves", "someone_elses_model"],
+}
+
 # A response whose include keys try to escape the download directory - the
 # arbitrary-file-write reported as issue #257.
 HOSTILE_MODEL_FILES = {
-    "gltf": _gltf_with_includes([
+    "blend": _blend_with_includes([
         "textures/fine.png",
         "../../../../evil.png",
         "/tmp/absolute.png",
@@ -782,18 +913,33 @@ def test_hdri_world_is_fully_wired(server, monkeypatch):
 
 # --- formats and error messages ----------------------------------------------
 
-def test_unsupported_model_format_is_rejected_before_downloading(server, monkeypatch):
+def test_formats_other_than_blend_are_rejected_before_downloading(server, monkeypatch):
     """`usd` is listed for every model, so it passed the "is this format
     present?" guard, downloaded in full, and only then hit the unsupported
-    branch at the end of the import."""
+    branch at the end of the import. glTF and FBX are refused for a different
+    reason: both are generated from the .blend and lose material detail that
+    ships with the asset."""
+    addon, srv = server
+
+    for fmt in ("usd", "gltf", "fbx"):
+        calls = _install_requests(monkeypatch, addon, files=MODEL_FILES)
+        result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", fmt)
+
+        assert "error" in result, fmt
+        assert fmt in result["error"]
+        assert "blend" in result["error"], "the error should name what is supported"
+        assert _downloaded(calls) == [], f"{fmt} was transferred before being rejected"
+
+
+def test_models_default_to_blend(server, monkeypatch):
     addon, srv = server
     calls = _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = MODEL_WITH_A_STOWAWAY
 
-    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "usd")
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k")
 
-    assert "error" in result
-    assert "usd" in result["error"]
-    assert _downloaded(calls) == [], "the file was transferred before being rejected"
+    assert result.get("success"), result
+    assert _downloaded(calls) == [MODEL_FILES["blend"]["1k"]["blend"]["url"]]
 
 
 def test_model_imports_and_reports_its_objects(server, monkeypatch):
@@ -801,17 +947,125 @@ def test_model_imports_and_reports_its_objects(server, monkeypatch):
     reported an empty list for every appended model."""
     addon, srv = server
     _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = MODEL_WITH_A_STOWAWAY
 
-    def fake_gltf(filepath=None, **_kwargs):
-        addon.bpy.data.objects.append(FakeObject("potted_plant_02_pot"))
-        addon.bpy.data.objects.append(FakeObject("potted_plant_02_leaves"))
-
-    monkeypatch.setattr(addon.bpy.ops.import_scene, "gltf", fake_gltf)
-
-    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "gltf")
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
 
     assert result.get("success"), result
-    assert set(result["imported_objects"]) == {"potted_plant_02_pot", "potted_plant_02_leaves"}
+    assert set(result["imported_objects"]) == {
+        f"{MODEL_SLUG}_pot", f"{MODEL_SLUG}_leaves"}
+
+
+def test_only_the_assets_own_collection_is_appended(server, monkeypatch):
+    """Several published .blends hold a second, unrelated model beside the asset
+    - wooden_ladder's file also contains wooden_step_ladder. Appending
+    data_from.objects wholesale brought it along."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = MODEL_WITH_A_STOWAWAY
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert result.get("success"), result
+    assert "someone_elses_model" not in result["imported_objects"]
+    assert [c.name for c in addon.bpy.context.scene.collection.children] == [MODEL_SLUG]
+
+
+def test_only_lod0_is_linked_into_the_scene(server, monkeypatch):
+    """A model with levels of detail carries every one of them in the same file.
+    Appending them all put three copies of the model on top of each other."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = MODEL_WITH_LODS
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert result.get("success"), result
+    assert set(result["imported_objects"]) == {
+        f"{MODEL_SLUG}_pot_LOD0", f"{MODEL_SLUG}_leaves_LOD0"}
+    assert [c.name for c in addon.bpy.context.scene.collection.children] == [
+        f"{MODEL_SLUG}_LOD0"]
+
+
+def test_a_blend_with_no_matching_collection_still_imports(server, monkeypatch):
+    """Every published model has a collection named after its slug, but the
+    import should not return an empty scene if one ever does not."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = {
+        "collections": {"Collection": ["loose_mesh"]},
+        "objects": ["loose_mesh"],
+    }
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert result.get("success"), result
+    assert result["imported_objects"] == ["loose_mesh"]
+
+
+def test_a_blend_newer_than_this_blender_falls_back_to_gltf(server, monkeypatch):
+    """Poly Haven's models were each saved by whichever Blender compiled them,
+    from 2.93 to 5.0, and Blender cannot open a file newer than itself. glTF is
+    a worse record of the material, but it beats no model at all."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=FUTURE_MODEL_FILES)
+    assert addon.bpy.app.version[:2] < (5, 0), "fixture assumes an older Blender"
+
+    imported = []
+    monkeypatch.setattr(
+        addon.bpy.ops.import_scene, "gltf",
+        lambda filepath=None, **_k: (imported.append(filepath),
+                                     addon.bpy.data.objects.append(FakeObject("from_gltf"))))
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert result.get("success"), result
+    assert result["imported_objects"] == ["from_gltf"]
+    assert "5.0" in result["message"] and "glTF" in result["message"], result["message"]
+    assert _downloaded(calls) == [
+        FUTURE_MODEL_FILES["blend"]["1k"]["blend"]["url"],
+        FUTURE_MODEL_FILES["gltf"]["1k"]["gltf"]["url"],
+    ]
+
+
+def test_a_newer_blend_with_no_gltf_says_so(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=FUTURE_ONLY_BLEND_FILES)
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert "error" in result
+    assert "5.0" in result["error"], result["error"]
+    assert "glTF" in result["error"], result["error"]
+
+
+@pytest.mark.parametrize("header, expected", [
+    (b"BLENDER-v293", (2, 93)),       # the oldest published models
+    (b"BLENDER-v302", (3, 2)),
+    (b"BLENDER-v402", (4, 2)),
+    (b"BLENDER17-01v0500", (5, 0)),   # the header grew in Blender 4.5
+    (b"BLENDER17-01v0502", (5, 2)),
+    (b"not a blend file at all", None),
+])
+def test_blend_header_versions_are_read(server, tmp_path, header, expected):
+    addon, _srv = server
+    path = tmp_path / "sample.blend"
+    path.write_bytes(_blend_bytes(header))
+
+    assert addon._polyhaven_blend_version(str(path)) == expected
+
+
+def test_a_compressed_blend_header_is_read(server, tmp_path):
+    """Published .blend files are compressed - gzip up to 2.93, zstd after - so
+    the version is not sitting in the first bytes of the file."""
+    import zlib
+
+    addon, _srv = server
+    path = tmp_path / "compressed.blend"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    path.write_bytes(compressor.compress(_blend_bytes(b"BLENDER-v293")) + compressor.flush())
+
+    assert addon._polyhaven_blend_version(str(path)) == (2, 93)
 
 
 def test_model_includes_cannot_escape_the_download_directory(server, monkeypatch, tmp_path):
@@ -828,9 +1082,9 @@ def test_model_includes_cannot_escape_the_download_directory(server, monkeypatch
     sandbox = _mkdir(tmp_path / "a" / "b" / "c" / "d" / "e")
     monkeypatch.setattr(addon.tempfile, "gettempdir", lambda: str(sandbox))
     calls = _install_requests(monkeypatch, addon, files=HOSTILE_MODEL_FILES)
-    monkeypatch.setattr(addon.bpy.ops.import_scene, "gltf", lambda **_kwargs: None)
+    addon.bpy.data.libraries.contents = MODEL_WITH_A_STOWAWAY
 
-    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "gltf")
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
     assert result.get("success"), result
 
     # The guard skips before downloading, so only the safe include is fetched.
@@ -841,8 +1095,6 @@ def test_model_includes_cannot_escape_the_download_directory(server, monkeypatch
     # disk is a file that was written outside it.
     leaked = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file())
     assert leaked == [], f"files written outside the download directory: {leaked}"
-
-
 def _mkdir(path):
     path.mkdir(parents=True, exist_ok=True)
     return path

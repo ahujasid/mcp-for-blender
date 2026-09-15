@@ -845,7 +845,9 @@ async def download_polyhaven_asset(
       anything held close to camera. If a resolution is unavailable, the error names
       the ones that are.
     - file_format: Optional. hdr (default) or exr for HDRIs; jpg (default), png or exr
-      for textures; gltf (default), fbx or blend for models.
+      for textures. Models are always imported from .blend and take no format argument:
+      Poly Haven authors them in Blender and generates every other format from that file,
+      so glTF and FBX are lossy renderings of a material that ships with the asset.
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
     Returns a message indicating success or failure.

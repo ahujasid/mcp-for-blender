@@ -275,10 +275,20 @@ POLYHAVEN_CHUNK_SIZE = 1024 * 1024
 POLYHAVEN_SUPPORTED_FORMATS = {
     "hdris": ("hdr", "exr"),
     "textures": ("jpg", "png", "exr"),
-    "models": ("gltf", "fbx", "blend"),
+    "models": ("blend",),
 }
 
-POLYHAVEN_DEFAULT_FORMATS = {"hdris": "hdr", "textures": "jpg", "models": "gltf"}
+POLYHAVEN_DEFAULT_FORMATS = {"hdris": "hdr", "textures": "jpg", "models": "blend"}
+
+# Models are imported from the .blend and nothing else. Poly Haven authors its
+# models in Blender and generates every other format from that file, so glTF and
+# FBX are lossy renderings of a material that is sitting right there - node
+# groups collapse to a base colour, and procedural setups do not survive at all.
+#
+# glTF stays as a fallback for one case only: a .blend written by a newer
+# Blender than the one running, which cannot be opened at all. See
+# _polyhaven_blend_version.
+POLYHAVEN_MODEL_FALLBACK_FORMAT = "gltf"
 
 # Poly Haven's /files map keys, and what each map drives. Their casing is
 # inconsistent and load-bearing - "Diffuse", "Rough", "Metal" and
@@ -362,6 +372,61 @@ def _polyhaven_download(file_info, dest_path):
             "the download was truncated or corrupted"
         )
     return dest_path
+
+
+def _polyhaven_uncompress_head(raw):
+    """The start of a .blend, which is usually compressed on disk.
+
+    Blender wrote gzip up to 2.93 and zstd from 3.0. Both decompressors are
+    incremental, so a truncated prefix decompresses to a shorter prefix rather
+    than raising.
+    """
+    if raw[:7] == b"BLENDER":
+        return raw
+    if raw[:2] == b"\x1f\x8b":
+        with suppress(Exception):
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw)
+        return None
+    try:
+        import zstandard
+    except ImportError:
+        # Not bundled with every Blender build. Without it the version cannot be
+        # read, and the import falls back to trying the append and handling the
+        # failure - which is the same outcome, one download later.
+        return None
+    with suppress(Exception):
+        return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    return None
+
+
+def _polyhaven_blend_version(path):
+    """(major, minor) of the Blender that wrote this .blend, or None.
+
+    Blender cannot open a file written by a newer version than itself, and Poly
+    Haven's models span 2.93 to 5.0 because each was saved by whichever Blender
+    compiled it. The version is in the file header, in one of two layouts:
+
+        up to Blender 4.4:   BLENDER-v293
+        from Blender 4.5:    BLENDER17-01v0502
+
+    where the digits straight after BLENDER are the header's own length, and the
+    version field grows from three characters to four.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = _polyhaven_uncompress_head(f.read(1 << 16))
+    except OSError:
+        return None
+
+    if not head or not head.startswith(b"BLENDER"):
+        return None
+
+    try:
+        if head[7:9].isdigit():
+            return int(head[13:15]), int(head[15:17])
+        return int(head[9:10]), int(head[10:12])
+    except (ValueError, IndexError):
+        return None
 
 
 def _polyhaven_resolution_rank(resolution):
@@ -2404,70 +2469,140 @@ class BlenderMCPServer:
             traceback.print_exc()
             return {"error": f"Failed to build material: {str(e)}"}
 
-    def _polyhaven_import_model(self, asset_id, files_data, resolution, file_format):
-        """Download a model and its textures, then import it."""
+    def _polyhaven_fetch_model_files(self, files_data, resolution, file_format, dest_dir):
+        """Download a model's main file and its sidecar textures into dest_dir."""
         file_info = files_data.get(file_format, {}).get(resolution, {}).get(file_format)
         if not file_info:
+            return None
+
+        main_file_path = os.path.join(dest_dir, os.path.basename(file_info["url"].split("?")[0]))
+        _polyhaven_download(file_info, main_file_path)
+
+        for include_path, include_info in (file_info.get("include") or {}).items():
+            # Validate include_path - the API response controls these
+            # dict keys; a malicious or MITM'd response could request an
+            # absolute path or one containing ".." to escape dest_dir
+            # and write arbitrary files (e.g. ~/.bashrc, authorized_keys).
+            # Mirrors the zip-slip check in download_sketchfab_model.
+            target_path = os.path.join(dest_dir, os.path.normpath(include_path))
+            abs_dest_dir = os.path.abspath(dest_dir)
+            abs_target_path = os.path.abspath(target_path)
+            if (os.path.isabs(include_path)
+                    or ".." in include_path
+                    or not abs_target_path.startswith(abs_dest_dir + os.sep)):
+                print(f"Skipping include with unsafe path: {include_path}")
+                continue
+
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            _polyhaven_download(include_info, target_path)
+
+        return main_file_path
+
+    def _polyhaven_append_blend(self, blend_path, asset_id):
+        """Append the asset's own collection out of a Poly Haven model .blend.
+
+        Every published model holds a collection named exactly the slug - it is
+        an error in Poly Haven's own asset checker if it does not - and models
+        with levels of detail carry them as `<slug>_LOD0`, `_LOD1` and so on
+        beneath it. Appending `data_from.objects` wholesale, as this used to,
+        linked every LOD on top of each other plus whatever else the file
+        happened to hold, which for some assets is a second model.
+        """
+        with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+            available = list(data_from.collections)
+            # LOD0 is the full-detail version. Taking it directly leaves the
+            # coarser ones in the file rather than in the scene.
+            wanted = next(
+                (name for name in (f"{asset_id}_LOD0", asset_id) if name in available), None)
+            if wanted:
+                data_to.collections = [wanted]
+            else:
+                # Nothing to key off. Fall back to the old behaviour rather than
+                # importing nothing at all.
+                data_to.objects = data_from.objects
+
+        linked = False
+        for collection in data_to.collections:
+            if collection is not None:
+                bpy.context.scene.collection.children.link(collection)
+                linked = True
+        if not linked:
+            for obj in data_to.objects:
+                if obj is not None:
+                    bpy.context.collection.objects.link(obj)
+
+    def _polyhaven_import_model(self, asset_id, files_data, resolution, file_format):
+        """Download a model and its textures, then import it."""
+        if not files_data.get(file_format, {}).get(resolution, {}).get(file_format):
             return {
-                "error": f"Model '{asset_id}' has no {resolution} {file_format} - "
+                "error": f"Model {asset_id!r} has no {resolution} {file_format} - "
                          f"{_polyhaven_available(files_data, 'models')}"
             }
 
         dest_dir = tempfile.mkdtemp(prefix="blender_mcp_polyhaven_")
-        main_file_path = os.path.join(dest_dir, os.path.basename(file_info["url"].split("?")[0]))
+        fallback_note = ""
 
         try:
-            _polyhaven_download(file_info, main_file_path)
-
-            for include_path, include_info in (file_info.get("include") or {}).items():
-                # Validate include_path - the API response controls these
-                # dict keys; a malicious or MITM'd response could request an
-                # absolute path or one containing ".." to escape dest_dir
-                # and write arbitrary files (e.g. ~/.bashrc, authorized_keys).
-                # Mirrors the zip-slip check in download_sketchfab_model.
-                target_path = os.path.join(dest_dir, os.path.normpath(include_path))
-                abs_dest_dir = os.path.abspath(dest_dir)
-                abs_target_path = os.path.abspath(target_path)
-                if (os.path.isabs(include_path)
-                        or ".." in include_path
-                        or not abs_target_path.startswith(abs_dest_dir + os.sep)):
-                    print(f"Skipping include with unsafe path: {include_path}")
-                    continue
-
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                _polyhaven_download(include_info, target_path)
+            main_file_path = self._polyhaven_fetch_model_files(
+                files_data, resolution, file_format, dest_dir)
         except Exception as e:
             traceback.print_exc()
             shutil.rmtree(dest_dir, ignore_errors=True)
             return {"error": f"Failed to download model: {str(e)}"}
 
+        # By name: bpy hands out a fresh Python wrapper per access, so holding on
+        # to the datablocks themselves invites identity bugs.
+        before = {obj.name for obj in bpy.data.objects}
+
         try:
-            # By name: bpy hands out a fresh Python wrapper per access, so
-            # holding on to the datablocks themselves invites identity bugs.
-            before = {obj.name for obj in bpy.data.objects}
-
-            if file_format == "gltf":
+            if file_format == "blend":
+                written_by = _polyhaven_blend_version(main_file_path)
+                if written_by and written_by > bpy.app.version[:2]:
+                    raise RuntimeError("written by Blender %d.%d" % written_by)
+                self._polyhaven_append_blend(main_file_path, asset_id)
+            else:
                 bpy.ops.import_scene.gltf(filepath=main_file_path)
-            elif file_format == "fbx":
-                bpy.ops.import_scene.fbx(filepath=main_file_path)
-            else:  # blend
-                with bpy.data.libraries.load(main_file_path, link=False) as (data_from, data_to):
-                    data_to.objects = data_from.objects
+        except Exception as blend_error:
+            if file_format != "blend":
+                traceback.print_exc()
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                return {"error": f"Failed to import model: {str(blend_error)}"}
 
-                for obj in data_to.objects:
-                    if obj is not None:
-                        bpy.context.collection.objects.link(obj)
+            # A .blend written by a newer Blender than this one cannot be opened
+            # at all, and Poly Haven's oldest models were saved in 2.93 while its
+            # newest were saved in 5.0. glTF is a poorer record of the material,
+            # but it is the difference between a worse model and no model.
+            print(f"Poly Haven: .blend import failed ({blend_error}), falling back to glTF")
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            dest_dir = tempfile.mkdtemp(prefix="blender_mcp_polyhaven_")
+            fallback_note = (
+                f" Imported from glTF rather than .blend, because the .blend was {blend_error}"
+                f" and this is Blender {bpy.app.version_string.split()[0]}. Its materials are a"
+                " conversion rather than the ones the artist built."
+            )
+            try:
+                before = {obj.name for obj in bpy.data.objects}
+                fallback_path = self._polyhaven_fetch_model_files(
+                    files_data, resolution, POLYHAVEN_MODEL_FALLBACK_FORMAT, dest_dir)
+                if not fallback_path:
+                    raise RuntimeError(f"no {resolution} glTF is published for it")
+                bpy.ops.import_scene.gltf(filepath=fallback_path)
+            except Exception as e:
+                traceback.print_exc()
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                return {
+                    "error": f"Model {asset_id!r} is {blend_error}, which this Blender cannot "
+                             f"open, and the glTF fallback failed too: {str(e)}"
+                }
 
-            # Diffed rather than read off selected_objects, which the .blend
-            # branch never populates - it reported an empty list for every
-            # appended model.
+        try:
             imported = [obj for obj in bpy.data.objects if obj.name not in before]
             imported_objects = [obj.name for obj in imported]
 
-            # Appended and FBX-imported images still reference the files in the
-            # temporary directory this deletes on the way out. A .glb carries
-            # its textures inside it, but a .gltf with sidecar files does not,
-            # so this is not a no-op there either.
+            # Appended and glTF-imported images still reference the files in the
+            # temporary directory this deletes on the way out. A .glb carries its
+            # textures inside it, but a .gltf with sidecar files does not, and an
+            # appended .blend never does.
             for obj in imported:
                 for slot in getattr(obj, "material_slots", []):
                     if slot.material is None or not slot.material.use_nodes:
@@ -2479,7 +2614,7 @@ class BlenderMCPServer:
 
             return {
                 "success": True,
-                "message": f"Model {asset_id} imported successfully",
+                "message": f"Model {asset_id} imported successfully.{fallback_note}",
                 "imported_objects": imported_objects,
             }
         except Exception as e:
@@ -2487,7 +2622,6 @@ class BlenderMCPServer:
             return {"error": f"Failed to import model: {str(e)}"}
         finally:
             shutil.rmtree(dest_dir, ignore_errors=True)
-
     def _polyhaven_material_info(self, mat):
         """Summarise a material's node tree for the caller."""
         texture_nodes = []
