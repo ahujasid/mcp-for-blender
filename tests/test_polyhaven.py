@@ -334,11 +334,12 @@ class FakeObjects(list):
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None, content=b"", streamed=False):
+    def __init__(self, status_code=200, payload=None, content=b"", streamed=False, headers=None):
         self.status_code = status_code
         self._payload = payload
         self._content = content
         self._streamed = streamed
+        self.headers = dict(headers or {})
 
     @property
     def content(self):
@@ -594,8 +595,15 @@ HOSTILE_MODEL_FILES = {
 INFO = {"authors": {"Rob Tuytel": "All"}, "name": "Rock Wall 10"}
 
 
+ASSETS_ETAG = 'W/"a1b2c3"'
+
+
 def _install_requests(monkeypatch, addon, files=None, info=None, assets=None, corrupt=False):
-    """Route requests by URL, and record every one of them."""
+    """Route requests by URL, and record every one of them.
+
+    /assets answers with an ETag and honours If-None-Match, the way the real API
+    does, so the cache is exercised rather than assumed.
+    """
     calls = []
 
     def fake_get(url, headers=None, params=None, timeout=None, stream=False):
@@ -616,7 +624,10 @@ def _install_requests(monkeypatch, addon, files=None, info=None, assets=None, co
         if "/info/" in url:
             return FakeResponse(payload=info if info is not None else INFO)
         if url.endswith("/assets"):
-            return FakeResponse(payload=assets if assets is not None else {})
+            if (headers or {}).get("If-None-Match") == ASSETS_ETAG:
+                return FakeResponse(status_code=304, headers={"ETag": ASSETS_ETAG})
+            return FakeResponse(payload=assets if assets is not None else {},
+                                headers={"ETag": ASSETS_ETAG})
         return FakeResponse(payload={})
 
     monkeypatch.setattr(addon.requests, "get", fake_get, raising=False)
@@ -1259,3 +1270,70 @@ def test_set_texture_needs_the_texture_downloaded_first(server, monkeypatch):
     assert "download_polyhaven_asset" in result["error"]
 
 
+
+
+# --- the asset list is 2.44MB, and used to be re-fetched every call ----------
+
+SEARCH_ASSETS = {
+    # The API returns assets sorted by slug, and models are the only ones with a
+    # capitalised slug, so an unranked first-20 slice is 20 models.
+    "ArmChair_01": {"name": "Arm Chair 01", "type": 2, "download_count": 900,
+                    "categories": ["furniture"]},
+    "Barrel_01": {"name": "Barrel 01", "type": 2, "download_count": 800,
+                  "categories": ["furniture"]},
+    "moonless_golf": {"name": "Moonless Golf", "type": 0, "download_count": 779145,
+                      "categories": ["night"]},
+    "rock_wall_10": {"name": "Rock Wall 10", "type": 1, "download_count": 5000,
+                     "categories": ["rock"]},
+}
+
+
+def test_the_asset_list_is_not_refetched_within_the_ttl(server, monkeypatch):
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets=SEARCH_ASSETS)
+
+    first = srv.search_polyhaven_assets(asset_type="all")
+    second = srv.search_polyhaven_assets(asset_type="all")
+
+    assert first["assets"] == second["assets"]
+    assert len([c for c in calls if c["url"].endswith("/assets")]) == 1
+
+
+def test_a_lapsed_cache_revalidates_instead_of_refetching(server, monkeypatch):
+    """Once the TTL is up, If-None-Match turns the refetch into a 304 rather
+    than another 2.44MB."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets=SEARCH_ASSETS)
+
+    first = srv.search_polyhaven_assets(asset_type="all")
+    for entry in addon._polyhaven_cache.values():
+        entry["fetched"] -= addon.POLYHAVEN_CACHE_TTL + 1
+    second = srv.search_polyhaven_assets(asset_type="all")
+
+    assert first["assets"] == second["assets"]
+    asset_calls = [c for c in calls if c["url"].endswith("/assets")]
+    assert len(asset_calls) == 2
+    assert asset_calls[1]["headers"].get("If-None-Match") == ASSETS_ETAG
+
+
+def test_each_asset_type_is_cached_separately(server, monkeypatch):
+    """Asking for one type must not be served the whole library, or vice versa."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets=SEARCH_ASSETS)
+
+    srv.search_polyhaven_assets(asset_type="hdris")
+    srv.search_polyhaven_assets(asset_type="textures")
+    srv.search_polyhaven_assets(asset_type="hdris")
+
+    asset_calls = [c for c in calls if c["url"].endswith("/assets")]
+    assert [c["params"].get("type") for c in asset_calls] == ["hdris", "textures"]
+
+
+def test_the_cache_does_not_grow_without_limit(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, assets=SEARCH_ASSETS)
+
+    for i in range(addon.POLYHAVEN_CACHE_MAX_ENTRIES + 5):
+        addon._polyhaven_api_get("assets", params={"categories": f"c{i}"}, cache=True)
+
+    assert len(addon._polyhaven_cache) <= addon.POLYHAVEN_CACHE_MAX_ENTRIES

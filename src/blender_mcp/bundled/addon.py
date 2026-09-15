@@ -317,16 +317,64 @@ POLYHAVEN_COLOR_ROLES = {"base_color"}
 POLYHAVEN_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
-def _polyhaven_api_get(path, params=None):
-    """GET a Poly Haven API endpoint, raising on anything but a 2xx."""
+# Poly Haven serves the asset list with `Cache-Control: max-age=43200` and an
+# ETag, and both were being discarded: every search re-fetched all 2.44MB of it.
+# The TTL here matches theirs, and once it lapses the ETag usually turns the
+# refetch into a 304.
+POLYHAVEN_CACHE_TTL = 12 * 60 * 60
+
+# Bounded so a session that searches every type and taxonomy cannot grow without
+# limit. The asset list is by far the largest entry, and there are four of those.
+POLYHAVEN_CACHE_MAX_ENTRIES = 16
+
+_polyhaven_cache = {}
+
+
+def _polyhaven_cache_key(path, params):
+    return path, tuple(sorted((params or {}).items()))
+
+
+def _polyhaven_api_get(path, params=None, cache=False):
+    """GET a Poly Haven API endpoint, raising on anything but a 2xx.
+
+    With cache=True the response is held for POLYHAVEN_CACHE_TTL, and revalidated
+    with If-None-Match after that rather than re-downloaded.
+    """
+    key = _polyhaven_cache_key(path, params)
+    entry = _polyhaven_cache.get(key) if cache else None
+    headers = dict(REQ_HEADERS)
+
+    if entry is not None:
+        if time.time() - entry["fetched"] < POLYHAVEN_CACHE_TTL:
+            return entry["payload"]
+        if entry.get("etag"):
+            headers["If-None-Match"] = entry["etag"]
+
     response = requests.get(
         f"{POLYHAVEN_API_BASE}/{path}",
         params=params,
-        headers=REQ_HEADERS,
+        headers=headers,
         timeout=POLYHAVEN_API_TIMEOUT,
     )
+
+    if entry is not None and response.status_code == 304:
+        entry["fetched"] = time.time()
+        return entry["payload"]
+
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+
+    if cache:
+        if len(_polyhaven_cache) >= POLYHAVEN_CACHE_MAX_ENTRIES:
+            oldest = min(_polyhaven_cache, key=lambda k: _polyhaven_cache[k]["fetched"])
+            _polyhaven_cache.pop(oldest, None)
+        _polyhaven_cache[key] = {
+            "payload": payload,
+            "etag": getattr(response, "headers", {}).get("ETag"),
+            "fetched": time.time(),
+        }
+
+    return payload
 
 
 def _polyhaven_valid_slug(asset_id):
@@ -2191,7 +2239,7 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
-            assets = _polyhaven_api_get("assets", params=params)
+            assets = _polyhaven_api_get("assets", params=params, cache=True)
 
             # Rank before truncating. The previous order was whatever the API
             # happened to return, which is sorted by slug - and because models
