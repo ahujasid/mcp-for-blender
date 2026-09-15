@@ -1657,3 +1657,143 @@ def test_an_asset_with_no_thumbnail_says_so(server, monkeypatch):
 
     assert "error" in result
     assert "thumbnail" in result["error"]
+
+
+# --- provenance: where the asset came from, kept in the file -----------------
+
+def _props(block):
+    return block.custom_properties
+
+
+def test_a_texture_records_where_it_came_from(server, monkeypatch):
+    """Mirrors the polypizza_* properties the sibling integration writes. Poly
+    Haven's assets are CC0 and need no attribution, but custom properties are
+    saved into the .blend, so whoever opens it later can still find the asset
+    and the artist."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    material = _material(addon, result)
+
+    assert _props(material)["polyhaven_id"] == TEXTURE_SLUG
+    assert _props(material)["polyhaven_url"] == f"https://polyhaven.com/a/{TEXTURE_SLUG}"
+    assert _props(material)["polyhaven_licence"] == "CC0"
+    assert _props(material)["polyhaven_resolution"] == "1k"
+    assert _props(material)["polyhaven_authors"] == "Rob Tuytel"
+    assert result["url"] == f"https://polyhaven.com/a/{TEXTURE_SLUG}"
+    for image in addon.bpy.data.images:
+        assert _props(image)["polyhaven_url"]
+
+
+def test_an_hdri_records_where_it_came_from(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=HDRI_FILES)
+
+    result = srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr")
+
+    world = addon.bpy.context.scene.world
+    assert _props(world)["polyhaven_id"] == HDRI_SLUG
+    assert _props(world)["polyhaven_licence"] == "CC0"
+    assert _props(addon.bpy.data.images[0])["polyhaven_resolution"] == "1k"
+    assert result["authors"] == ["Rob Tuytel"]
+
+
+def test_a_model_records_where_it_came_from(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = MODEL_WITH_A_STOWAWAY
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    imported = [o for o in addon.bpy.data.objects if o.name in result["imported_objects"]]
+    assert imported
+    for obj in imported:
+        assert _props(obj)["polyhaven_id"] == MODEL_SLUG
+        assert _props(obj)["polyhaven_licence"] == "CC0"
+    linked = addon.bpy.context.scene.collection.children
+    assert _props(linked[0])["polyhaven_url"].endswith(MODEL_SLUG)
+
+
+def test_a_model_does_not_tag_collections_it_did_not_import(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = MODEL_WITH_A_STOWAWAY
+    mine = addon.bpy.data.collections.new("my_own_collection")
+    addon.bpy.context.scene.collection.children.link(mine)
+
+    srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert _props(mine) == {}
+
+
+def test_provenance_survives_a_failed_metadata_lookup(server, monkeypatch):
+    """The author lookup is a nicety. It must never be the reason an import
+    fails."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    inner = addon.requests.get
+
+    def fake_get(url, headers=None, params=None, timeout=None, stream=False):
+        if "/info/" in url or url.endswith("/assets"):
+            raise RuntimeError("metadata is down")
+        return inner(url, headers=headers, params=params, timeout=timeout, stream=stream)
+
+    monkeypatch.setattr(addon.requests, "get", fake_get, raising=False)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    assert result.get("success"), result
+    assert _props(_material(addon, result))["polyhaven_id"] == TEXTURE_SLUG
+    assert "polyhaven_authors" not in _props(_material(addon, result))
+
+
+def test_poly_haven_requests_identify_the_integration(server, monkeypatch):
+    """Extends the User-Agent added in #147. Kept off the shared REQ_HEADERS
+    because Poly Pizza sends that one too."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    agents = {c["headers"].get("User-Agent") for c in calls}
+    assert agents, "no requests were made"
+    for agent in agents:
+        assert agent.startswith("blender-mcp/"), agent
+        assert "github.com/ahujasid/blender-mcp" in agent
+    assert addon.REQ_HEADERS["User-Agent"] == "blender-mcp", "Poly Pizza's header is unchanged"
+
+
+def test_the_tool_response_says_where_the_asset_came_from():
+    """The sidebar checkbox names Poly Haven, but in an agentic session nobody
+    opens the sidebar - the chat is the only place the person receiving the
+    asset can see whose it is."""
+    import asyncio
+
+    from blender_mcp import server
+
+    class FakeBlender:
+        def send_command(self, command, params=None):
+            if command == "get_polyhaven_status":
+                return {"enabled": True}
+            return {
+                "success": True,
+                "message": "Texture rock_wall_10 imported as material",
+                "material": "rock_wall_10",
+                "maps": ["Diffuse", "Rough"],
+                "authors": ["Rob Tuytel"],
+                "url": "https://polyhaven.com/a/rock_wall_10",
+            }
+
+    original = server.get_blender_connection
+    server.get_blender_connection = lambda: FakeBlender()
+    try:
+        out = asyncio.run(server.download_polyhaven_asset(
+            None, asset_id="rock_wall_10", asset_type="textures", user_prompt=""))
+    finally:
+        server.get_blender_connection = original
+
+    assert "Poly Haven" in out
+    assert "https://polyhaven.com/a/rock_wall_10" in out
+    assert "Rob Tuytel" in out
+    assert "CC0" in out

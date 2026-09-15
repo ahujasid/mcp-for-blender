@@ -260,6 +260,15 @@ def _polypizza_cdn_error(status_code, headers, content):
 
 POLYHAVEN_API_BASE = "https://api.polyhaven.com"
 
+# Versioned, so Poly Haven can tell which integration its traffic is coming from
+# and how many people it is serving. Kept separate from the shared REQ_HEADERS
+# because Poly Pizza sends that one too.
+POLYHAVEN_HEADERS = dict(REQ_HEADERS)
+POLYHAVEN_HEADERS["User-Agent"] = (
+    "blender-mcp/" + ".".join(str(part) for part in bl_info["version"])
+    + " (+https://github.com/ahujasid/blender-mcp)"
+)
+
 # (connect, read). The read timeout applies per socket read rather than to the
 # whole transfer, so streaming a large HDRI never trips it - but a dead
 # connection no longer hangs Blender's main thread indefinitely.
@@ -373,7 +382,7 @@ def _polyhaven_api_get(path, params=None, cache=False):
     """
     key = _polyhaven_cache_key(path, params)
     entry = _polyhaven_cache.get(key) if cache else None
-    headers = dict(REQ_HEADERS)
+    headers = dict(POLYHAVEN_HEADERS)
 
     if entry is not None:
         if time.time() - entry["fetched"] < POLYHAVEN_CACHE_TTL:
@@ -434,7 +443,7 @@ def _polyhaven_download(file_info, dest_path):
 
     response = requests.get(
         file_info["url"],
-        headers=REQ_HEADERS,
+        headers=POLYHAVEN_HEADERS,
         stream=True,
         timeout=POLYHAVEN_FILE_TIMEOUT,
     )
@@ -741,21 +750,41 @@ def _polyhaven_set_colorspace(image, is_color_data):
     return image.colorspace_settings.name
 
 
-def _polyhaven_tag(datablocks, asset_id, resolution=None):
-    """Tag an image or material so set_texture can find it again.
+def _polyhaven_authors(asset_id):
+    """Author names for an asset. Best effort - never fails an import."""
+    with suppress(Exception):
+        record = _polyhaven_asset_record(asset_id)
+        authors = record.get("authors") or {}
+        return sorted(authors) if isinstance(authors, dict) else list(authors)
+    return []
 
-    This is the lookup key between downloading a texture and applying it. The
-    old code recovered the map type by parsing the image's name, taking the last
-    underscore-separated token - which turned "nor_gl" into "gl" and left the
-    download path and set_texture disagreeing about what a map was called.
+
+def _polyhaven_tag(datablocks, asset_id, resolution=None, authors=None):
+    """Record where a datablock came from, in the file that keeps it.
+
+    Two jobs. It is the lookup key between downloading a texture and applying
+    it - the old code recovered the map type by parsing the image's name, taking
+    the last underscore-separated token, which turned "nor_gl" into "gl" and
+    left the download path and set_texture disagreeing about what a map was
+    called.
+
+    It is also where the asset came from, in the same shape the Poly Pizza
+    integration writes its polypizza_* properties. Poly Haven's assets are CC0
+    and require no attribution, ever - but custom properties are saved into the
+    .blend, so whoever opens the file in a year can still find the asset's page,
+    who made it, and the resolutions they did not download.
     """
     for block in datablocks:
         if block is None:
             continue
         with suppress(Exception):
             block["polyhaven_id"] = asset_id
+            block["polyhaven_url"] = _polyhaven_asset_url(asset_id)
+            block["polyhaven_licence"] = "CC0"
             if resolution:
                 block["polyhaven_resolution"] = resolution
+            if authors:
+                block["polyhaven_authors"] = ", ".join(authors)
 
 #endregion
 
@@ -2499,7 +2528,7 @@ class BlenderMCPServer:
 
             response = requests.get(
                 _polyhaven_preview_url(thumbnail_url),
-                headers=REQ_HEADERS,
+                headers=POLYHAVEN_HEADERS,
                 timeout=POLYHAVEN_API_TIMEOUT,
             )
             if response.status_code >= 400:
@@ -2626,11 +2655,16 @@ class BlenderMCPServer:
 
             bpy.context.scene.world = world
 
+            authors = _polyhaven_authors(asset_id)
+            _polyhaven_tag([world, env_tex.image], asset_id, resolution, authors)
+
             return {
                 "success": True,
                 "message": f"HDRI {asset_id} imported successfully",
                 "image_name": env_tex.image.name,
                 "world": world.name,
+                "authors": authors,
+                "url": _polyhaven_asset_url(asset_id),
             }
         except Exception as e:
             traceback.print_exc()
@@ -2756,10 +2790,12 @@ class BlenderMCPServer:
             # a fake user is what keeps it alive in between.
             mat.use_fake_user = True
 
+            authors = _polyhaven_authors(asset_id)
             _polyhaven_tag(
                 [mat] + [image for _role, image in maps.values()],
                 asset_id,
                 resolution=resolution,
+                authors=authors,
             )
             for map_key, (role, image) in maps.items():
                 with suppress(Exception):
@@ -2771,6 +2807,8 @@ class BlenderMCPServer:
                 "message": f"Texture {asset_id} imported as material",
                 "material": mat.name,
                 "maps": wired,
+                "authors": authors,
+                "url": _polyhaven_asset_url(asset_id),
             }
         except Exception as e:
             traceback.print_exc()
@@ -2828,15 +2866,16 @@ class BlenderMCPServer:
                 # importing nothing at all.
                 data_to.objects = data_from.objects
 
-        linked = False
+        linked = []
         for collection in data_to.collections:
             if collection is not None:
                 bpy.context.scene.collection.children.link(collection)
-                linked = True
+                linked.append(collection)
         if not linked:
             for obj in data_to.objects:
                 if obj is not None:
                     bpy.context.collection.objects.link(obj)
+        return linked
 
     def _polyhaven_import_model(self, asset_id, files_data, resolution, file_format):
         """Download a model and its textures, then import it."""
@@ -2848,6 +2887,7 @@ class BlenderMCPServer:
 
         dest_dir = tempfile.mkdtemp(prefix="blender_mcp_polyhaven_")
         fallback_note = ""
+        collections = []
 
         try:
             main_file_path = self._polyhaven_fetch_model_files(
@@ -2866,7 +2906,7 @@ class BlenderMCPServer:
                 written_by = _polyhaven_blend_version(main_file_path)
                 if written_by and written_by > bpy.app.version[:2]:
                     raise RuntimeError("written by Blender %d.%d" % written_by)
-                self._polyhaven_append_blend(main_file_path, asset_id)
+                collections = self._polyhaven_append_blend(main_file_path, asset_id)
             else:
                 bpy.ops.import_scene.gltf(filepath=main_file_path)
         except Exception as blend_error:
@@ -2910,19 +2950,29 @@ class BlenderMCPServer:
             # temporary directory this deletes on the way out. A .glb carries its
             # textures inside it, but a .gltf with sidecar files does not, and an
             # appended .blend never does.
+            materials = []
             for obj in imported:
                 for slot in getattr(obj, "material_slots", []):
-                    if slot.material is None or not slot.material.use_nodes:
+                    if slot.material is None:
+                        continue
+                    if slot.material not in materials:
+                        materials.append(slot.material)
+                    if not slot.material.use_nodes:
                         continue
                     for node in slot.material.node_tree.nodes:
                         if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
                             with suppress(Exception):
                                 node.image.pack()
 
+            authors = _polyhaven_authors(asset_id)
+            _polyhaven_tag(imported + collections + materials, asset_id, resolution, authors)
+
             return {
                 "success": True,
                 "message": f"Model {asset_id} imported successfully.{fallback_note}",
                 "imported_objects": imported_objects,
+                "authors": authors,
+                "url": _polyhaven_asset_url(asset_id),
             }
         except Exception as e:
             traceback.print_exc()
@@ -3008,7 +3058,7 @@ class BlenderMCPServer:
             new_mat, wired = self._polyhaven_build_material(texture_id, maps)
             new_mat.name = new_mat_name
 
-            _polyhaven_tag([new_mat], texture_id)
+            _polyhaven_tag([new_mat], texture_id, authors=_polyhaven_authors(texture_id))
 
             # Note: this replaces every material slot on the object.
             replaced = len(obj.data.materials)
@@ -3030,6 +3080,7 @@ class BlenderMCPServer:
                 "material": new_mat.name,
                 "maps": wired,
                 "material_info": self._polyhaven_material_info(new_mat),
+                "url": _polyhaven_asset_url(texture_id),
             }
 
         except Exception as e:
@@ -4773,8 +4824,12 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         layout.separator()
         layout.label(text="Asset Libraries", icon='ASSET_MANAGER')
 
-        self._integration_header(
+        sub = self._integration_header(
             layout, scene, "blendermcp_use_polyhaven", "Poly Haven", 'WORLD')
+        if sub:
+            col = sub.column(align=True)
+            col.label(text="Free CC0 HDRIs, textures and models")
+            col.operator("wm.url_open", text="polyhaven.com", icon='URL').url = POLYHAVEN_SITE
 
         sub = self._integration_header(
             layout, scene, "blendermcp_use_sketchfab", "Sketchfab", 'MESH_MONKEY')

@@ -564,7 +564,7 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Execute any Python code in Blender
 - Export the scene, the selection or named objects to GLB/FBX for other applications (`export_scene`)
 - Look up node schemas and the bpy API reference instead of guessing socket order or enum names
-- Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
+- Search and download free CC0 HDRIs, textures and models from [Poly Haven](https://polyhaven.com/)
 - Search and download models from [Sketchfab](https://sketchfab.com/)
 - Search and download low-poly models from [Poly Pizza](https://poly.pizza/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/) and [Hunyuan3D](https://3d.hunyuan.tencent.com/)
@@ -581,6 +581,42 @@ Which Tencent Cloud service the addon must call depends on where your account li
 International credentials sent to the mainland endpoint fail with `AuthFailure.SignatureFailure` or
 `ResourceUnavailable`, so tick the toggle when your SecretId/SecretKey come from tencentcloud.com.
 The toggle sits under **Tencent Hunyuan 3D → Official API** in the sidebar.
+
+#### Poly Haven
+
+[Poly Haven](https://polyhaven.com/) publishes around 2,400 HDRIs, textures and models,
+all CC0 and free, funded by donations rather than by selling the assets. There is no API
+key, no account and no rate limit worth worrying about.
+
+In the 3D View sidebar, tick **Poly Haven**. That is the whole setup.
+
+Worked example:
+
+> *"Light the scene with an overcast afternoon HDRI and put a rusty metal texture on the wall"*
+
+Claude calls `search_polyhaven_assets(query="overcast afternoon", asset_type="hdris")`,
+which understands the intent rather than matching keywords - "couch" finds sofas, and it
+works in any language. It can then check the thumbnail with
+`get_polyhaven_asset_preview(asset_id="...")` before spending the bandwidth, and import
+with `download_polyhaven_asset(...)`.
+
+`get_polyhaven_categories(asset_type="textures")` returns the category tree and the
+attributes each type can be filtered on - `time_of_day`, `weather` and `season` for HDRIs,
+`surface_use` and `condition` for textures, `material`, `rigged` and `lods` for models.
+
+Models are imported from the `.blend`, which is the file the artist authored - the glTF,
+FBX and USD versions are generated from it and lose material detail. Textures build a
+Principled material from the maps the asset actually uses, and skip the ones it does not.
+HDRIs are packed into the file, so the lighting survives being saved and reopened
+somewhere else.
+
+**Licence and attribution:** every Poly Haven asset is CC0. You never have to credit
+anyone, for anything, commercial or not. Their [API terms](https://api.polyhaven.com) do
+ask that software built on the live API makes clear where the assets come from, so the
+tool responses name the source and link the asset's page. On import, `polyhaven_id`,
+`polyhaven_url`, `polyhaven_authors`, `polyhaven_resolution` and `polyhaven_licence` are
+written onto the imported objects, materials, images and world as custom properties, so
+whoever opens the `.blend` later can still find the asset and the artist who made it.
 
 #### Poly Pizza
 

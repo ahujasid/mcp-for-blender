@@ -735,6 +735,19 @@ async def bpy_api_lookup(ctx: Context, query: str, user_prompt: str = "") -> str
         return f"Error looking up '{query}': {str(e)}"
 
 
+def _polyhaven_credit(result):
+    """A source line for an imported asset.
+
+    Poly Haven's assets are CC0 and need no attribution, ever. Its API asks that
+    software built on the live API makes clear to its users where the content
+    comes from, and in an MCP client the chat is the surface they actually see.
+    """
+    authors = ", ".join(result.get("authors") or [])
+    by = f" by {authors}" if authors else ""
+    url = result.get("url") or "https://polyhaven.com"
+    return f"From Poly Haven{by} - {url} (CC0, free to use for anything)."
+
+
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
@@ -964,19 +977,22 @@ async def download_polyhaven_asset(
 
             # Add additional information based on asset type
             if asset_type == "hdris":
-                return f"{message}. The HDRI has been set as the world environment."
+                message = f"{message}. The HDRI has been set as the world environment."
             elif asset_type == "textures":
                 material_name = result.get("material", "")
                 maps = ", ".join(result.get("maps", []))
-                return (
+                message = (
                     f"{message}. Created material '{material_name}' with maps: {maps}. "
                     "It carries a fake user so it survives saving before anything uses it; "
                     "call set_texture to apply it to an object."
                 )
             elif asset_type == "models":
-                return f"{message}. The model has been imported into the current scene."
-            else:
-                return message
+                message = f"{message}. The model has been imported into the current scene."
+
+            # Where it came from. The sidebar checkbox names Poly Haven, but in
+            # an agentic session nobody opens the sidebar - the chat is the only
+            # place the person receiving the asset can see whose it is.
+            return f"{message}\n\n{_polyhaven_credit(result)}"
         else:
             return f"Failed to download asset: {result.get('message', 'Unknown error')}"
     except Exception as e:
@@ -1037,8 +1053,8 @@ async def set_texture(
                             output += f"    {conn}\n"
             else:
                 output += "No texture nodes found in the material.\n"
-            
-            return output
+
+            return f"{output}\n{_polyhaven_credit(result)}"
         else:
             return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
     except Exception as e:
