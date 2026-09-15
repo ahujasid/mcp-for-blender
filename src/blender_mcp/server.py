@@ -585,11 +585,92 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
             pass
 
 
+# Insert before execute_blender_code in src/blender_mcp/server.py.
+# Uses the server's existing json/base64/Context/mcp imports.
+
+def _inspection_content(result):
+    from mcp.types import TextContent, ImageContent
+    if not isinstance(result, dict) or "error" in result:
+        raise ValueError(result.get("error", "Invalid inspection response")
+                         if isinstance(result, dict) else "Invalid inspection response")
+    encoded = result.get("image_base64")
+    if not isinstance(encoded, str) or len(encoded) > 45*1024*1024:
+        raise ValueError("Invalid or oversized inspection image")
+    image_bytes = base64.b64decode(encoded, validate=True)
+    if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Inspection response is not a PNG")
+    # Exact names and timings stay text. Do not put the base64 in textual output.
+    views = result.get("views", [])
+    metadata = {"size": [result.get("width"), result.get("height")],
+                "grid": [result.get("rows"), result.get("columns")],
+                "elapsed_ms": result.get("elapsed_ms"), "views": []}
+    if views:
+        metadata["target"] = views[0].get("target", "auto")
+        metadata["resolved_from"] = views[0].get("target_source", "unknown")
+    for view in views:
+        cell = {"view": view["view"]}
+        if view.get("target") != metadata.get("target"):
+            cell["target"] = view.get("target")
+        if view.get("isolated"):
+            cell["isolated"] = True
+        if view.get("shading", "solid") != "solid":
+            cell["shading"] = view["shading"]
+        metadata["views"].append(cell)
+    return [TextContent(type="text", text=json.dumps(metadata, separators=(",", ":"))),
+            ImageContent(type="image", data=encoded, mimeType="image/png")]
+
+
+@mcp.tool()
+def get_viewport_montage(
+    ctx: Context,
+    views: str | List[str | Dict[str, Any]] = "auto",
+    target: str | List[str] | None = None,
+    max_size: int = 1536,
+    shading: str = "solid",
+    isolate: bool = False,
+    padding: float = 1.15,
+    user_prompt: str = "",
+) -> Any:
+    """Inspect multiple viewpoints in one numbered image, without moving the user's view.
+
+    Prefer this over repeated camera edits/screenshots for spatial inspection.
+    views='auto': current, front, right, back, left, top, bottom, iso_front_right,
+    iso_back_left. Or pass 1-16 view names/objects, e.g.
+    ['front', {'azimuth': 40, 'elevation': 20, 'target': ['Wing']}].
+    Azimuth 0 is front (-Y), 90 is right (+X); elevation is above XY, in degrees.
+    View objects accept target, shading, isolate, and projection ('orthographic'
+    or 'perspective'). Named views use {'view': 'top', ...}.
+    target: explicit names (including descendants), else selection, else visible geometry.
+    max_size: longest side of the WHOLE grid, 384-4096; not per-view resolution.
+    shading: solid (fast default), material, wireframe, current (may be expensive).
+    isolate: hide non-target geometry temporarily; false preserves attachment context.
+    padding: framing multiplier, default 1.15. Numbered cells map to the exact text legend.
+    Empty space/occluders remain visible by default: multiple angles do not guarantee
+    visibility. Request a close-up or explicitly isolated view when necessary.
+    user_prompt: user's goal, unchanged, as on other Blender MCP tools.
+    Update both the addon and MCP server before using this tool.
+    """
+    blender = get_blender_connection()
+    try:
+        result = blender.send_command("get_viewport_montage", {
+            "views": views, "target": target, "max_size": max_size,
+            "shading": shading, "isolate": isolate, "padding": padding,
+        })
+        return _inspection_content(result)
+    except Exception as exc:
+        raise RuntimeError(f"Multi-view inspection failed: {exc}. "
+                           "Ensure the updated addon is running in a GUI session.") from exc
+
+
 @mcp.tool()
 @trajectory_tool("execute_blender_code", capture_code=True)
-async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
+async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", inspect: Dict[str, Any] | None = None) -> Any:
     """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
+    Execute coherent batches of Blender Python edits. Use inspect={} to receive
+    multi-view feedback in the same result, instead of a separate screenshot turn.
+    inspect accepts views, target, max_size, shading, isolate, padding, as in
+    get_viewport_montage. Omit inspect to retain the existing text-only result.
+    Long-running or independent operations can still be split into smaller calls.
 
     Parameters:
     - code: The Python code to execute
@@ -613,8 +694,21 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -
     try:
         # Get the global connection
         blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        params = {"code": code}
+        if inspect is not None:
+            params["inspect"] = inspect
+        result = blender.send_command("execute_code", params)
+        message = f"Code executed successfully: {result.get('result', '')}"
+        if "inspection_error" in result:
+            return message + "\nInspection failed: " + str(result["inspection_error"]) + "\nThe edits were applied. Do not rerun them; retry inspection only."
+        if "inspection" in result:
+            from mcp.types import TextContent
+            try:
+                content = _inspection_content(result["inspection"])
+            except Exception as exc:
+                return message + f"\nInspection decoding failed: {exc}. Edits were applied; retry inspection only."
+            return [TextContent(type="text", text=message), *content]
+        return message
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"

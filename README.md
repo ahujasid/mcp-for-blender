@@ -562,6 +562,50 @@ is written onto each imported root object as the custom property `polypizza_attr
 survives the session. Filter with `licence="CC0"` if you would rather use models that need
 no credit.
 
+### Multi-view inspection
+
+`get_viewport_montage` returns one numbered PNG and a matching text legend without
+moving the camera or viewport. Defaults: a 1536 × 1536 grid of current, front,
+right, back, left, top, bottom and two opposite three-quarter views. Generated
+views fit evaluated target bounds, including descendants and instances.
+
+```python
+get_viewport_montage(
+    target=["Body", "Handle"],
+    views=["front", "back", "top", {"azimuth": 35, "elevation": 15},
+           {"view": "right", "target": ["Handle"], "isolate": True}],
+)
+execute_blender_code(
+    code="bpy.data.objects['Body'].location.z += 0.1",
+    inspect={"target": ["Body", "Handle"]},
+    user_prompt="Move the body up slightly and check the handle attachment.",
+)
+```
+
+`inspect={}` uses montage defaults; omitting it keeps text-only execution. Invalid
+options are rejected before editing. If capture fails after an edit, the result
+reports success and the capture error: retry inspection only, not the edit.
+
+- `views`: 1–16 names or objects. Front is −Y, right +X, top +Z; azimuth 0° is
+  front, 90° right, and elevation is above XY. Cardinal views are orthographic;
+  three-quarter/custom views use perspective. `current` keeps the user's view.
+- `target`: object names; otherwise selection, then visible geometry. Use explicit
+  names for close-ups when floors/backdrops dominate framing. Per-view `target`,
+  `projection`, `shading` and `isolate` override defaults.
+- `max_size`: 384–4096 pixels along the whole grid's longest side; tiles align to
+  32 pixels. `padding` is the framing multiplier (default 1.15).
+- `shading`: `solid` (default), `material`, `wireframe`, or `current` (potentially
+  expensive). `isolate=True` hides surroundings temporarily; default false keeps
+  attachment context. Extra views do not guarantee unoccluded geometry.
+
+Shading, overlays, gizmos, visibility and selection are restored even on failure.
+Update both server and addon; a GUI/GPU context is required (`xvfb-run -a blender`
+works, `blender -b` does not). No new runtime dependency or shared image path is needed.
+
+Tests: `pip install -e . pytest numpy Pillow && pytest`. For native capture and
+state-restoration checks in a disposable scene, run
+`xvfb-run -a blender --factory-startup --python tests/blender_multiview.py`.
+
 ### Example Commands
 
 Here are some examples of what you can ask Claude to do:

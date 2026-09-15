@@ -255,6 +255,374 @@ def _polypizza_cdn_error(status_code, headers, content):
 
 #endregion
 
+# Multi-view inspection helpers, embedded into both copies of addon.py.
+# Pure helpers deliberately avoid bpy imports so camera math is unit-testable.
+import math as _mv_math
+import struct as _mv_struct
+import zlib as _mv_zlib
+
+_MV_VIEWS = {
+    "front": (0, -1, 0), "back": (0, 1, 0),
+    "right": (1, 0, 0), "left": (-1, 0, 0),
+    "top": (0, 0, 1), "bottom": (0, 0, -1),
+    "iso_front_right": (1, -1, 1), "iso_back_left": (-1, 1, 1),
+    "iso_front_left": (-1, -1, 1), "iso_back_right": (1, 1, 1),
+}
+_MV_AUTO = ("current", "front", "right", "back", "left", "top", "bottom",
+            "iso_front_right", "iso_back_left")
+_MV_DIGITS = (
+    (14,17,19,21,25,17,14), (4,12,4,4,4,4,14),
+    (14,17,1,2,4,8,31), (30,1,1,14,1,1,30),
+    (2,6,10,18,31,2,2), (31,16,16,30,1,1,30),
+    (14,16,16,30,17,17,14), (31,1,2,4,8,8,8),
+    (14,17,17,14,17,17,14), (14,17,17,15,1,1,14),
+)
+
+
+def _mv_number(value, name, low, high):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    value = float(value)
+    if not _mv_math.isfinite(value) or not low <= value <= high:
+        raise ValueError(f"{name} must be finite and between {low} and {high}")
+    return value
+
+
+def _mv_target(value):
+    if value is None or value == "auto":
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not 1 <= len(value) <= 256:
+        raise ValueError("target must be 'auto', an object name, or 1-256 names")
+    if any(not isinstance(x, str) or not x or len(x) > 256 for x in value):
+        raise ValueError("target contains an invalid object name")
+    return list(dict.fromkeys(value))
+
+
+def _mv_options(options=None):
+    """Validate before executing edits; object existence is checked afterwards."""
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        raise ValueError("inspect must be an object; use {} for defaults")
+    allowed = {"views", "target", "max_size", "shading", "isolate", "padding"}
+    unknown = options.keys() - allowed
+    if unknown:
+        raise ValueError(f"Unknown inspection option(s): {sorted(unknown)}")
+    size = options.get("max_size", 1536)
+    if type(size) is not int or not 384 <= size <= 4096:
+        raise ValueError("max_size must be an integer between 384 and 4096 (whole grid)")
+    shading = options.get("shading", "solid")
+    if shading not in ("solid", "material", "wireframe", "current"):
+        raise ValueError("shading must be solid, material, wireframe, or current")
+    isolate = options.get("isolate", False)
+    if type(isolate) is not bool:
+        raise ValueError("isolate must be boolean")
+    padding = _mv_number(options.get("padding", 1.15), "padding", 1.01, 3.0)
+    target = _mv_target(options.get("target"))
+    views = options.get("views", "auto")
+    if views == "auto":
+        views = list(_MV_AUTO)
+    if not isinstance(views, list) or not 1 <= len(views) <= 16:
+        raise ValueError("views must be 'auto' or a list of 1-16 views")
+    normalized = []
+    for item in views:
+        if isinstance(item, str):
+            item = {"view": item}
+        if not isinstance(item, dict):
+            raise ValueError("Each view must be a name or an object")
+        unknown = item.keys() - {"view", "azimuth", "elevation", "projection",
+                                 "target", "shading", "isolate"}
+        if unknown:
+            raise ValueError(f"Unknown view field(s): {sorted(unknown)}")
+        name = item.get("view")
+        if name is not None:
+            if not isinstance(name, str) or (name not in _MV_VIEWS and name != "current"):
+                raise ValueError(f"Unknown view: {name!r}")
+            if "azimuth" in item or "elevation" in item:
+                raise ValueError("Use either a named view or azimuth/elevation, not both")
+            direction = _MV_VIEWS.get(name)
+        else:
+            if "azimuth" not in item or "elevation" not in item:
+                raise ValueError("Custom views require both azimuth and elevation")
+            az = _mv_number(item["azimuth"], "azimuth", -3600, 3600)
+            el = _mv_number(item["elevation"], "elevation", -90, 90)
+            a, e = _mv_math.radians(az), _mv_math.radians(el)
+            direction = (_mv_math.sin(a)*_mv_math.cos(e),
+                         -_mv_math.cos(a)*_mv_math.cos(e), _mv_math.sin(e))
+            name = f"az{az:g}_el{el:g}"
+        projection = item.get("projection", "perspective" if name.startswith("iso_")
+                              or "azimuth" in item else "orthographic")
+        if projection not in ("orthographic", "perspective"):
+            raise ValueError("projection must be orthographic or perspective")
+        if name == "current" and "projection" in item:
+            raise ValueError("current preserves the viewport projection")
+        mode = item.get("shading", shading)
+        if mode not in ("solid", "material", "wireframe", "current"):
+            raise ValueError("Invalid per-view shading")
+        isolation = item.get("isolate", isolate)
+        if type(isolation) is not bool:
+            raise ValueError("Per-view isolate must be boolean")
+        normalized.append({"name": name, "direction": direction,
+                           "projection": projection, "shading": mode,
+                           "isolate": isolation, "target": _mv_target(item.get("target", target))})
+    columns = _mv_math.ceil(_mv_math.sqrt(len(normalized)))
+    rows = _mv_math.ceil(len(normalized) / columns)
+    # 32-pixel alignment avoids gratuitous partial image-token patches.
+    cell = (size // columns // 32) * 32
+    if cell < 96:
+        raise ValueError("max_size is too small for this number of views")
+    return {"views": normalized, "columns": columns, "rows": rows, "cell": cell,
+            "width": columns*cell, "height": rows*cell, "padding": padding}
+
+
+def _mv_dot(a, b):
+    return sum(x*y for x, y in zip(a, b))
+
+
+def _mv_unit(a):
+    norm = _mv_math.sqrt(_mv_dot(a, a))
+    if not _mv_math.isfinite(norm) or norm < 1e-15:
+        raise ValueError("Invalid camera direction")
+    return tuple(x / norm for x in a)
+
+
+def _mv_cross(a, b):
+    return (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
+
+
+def _mv_camera(points, direction, projection, padding=1.15, aspect=1.0):
+    """Fit every supplied world-space bound corner, including off-axis depth."""
+    if not points or any(len(p) != 3 or any(not _mv_math.isfinite(float(x)) for x in p)
+                         for p in points):
+        raise ValueError("Cannot frame empty or non-finite bounds")
+    if projection not in ("perspective", "orthographic"):
+        raise ValueError("Unknown camera projection")
+    if not _mv_math.isfinite(aspect) or aspect <= 0:
+        raise ValueError("Invalid aspect ratio")
+    center = tuple((min(p[k] for p in points)+max(p[k] for p in points))/2 for k in range(3))
+    z = _mv_unit(direction)
+    up = (0, 1, 0) if abs(z[2]) > .999 else (0, 0, 1)
+    x = _mv_unit(_mv_cross(up, z))
+    y = _mv_cross(z, x)
+    offsets = [tuple(p[k]-center[k] for k in range(3)) for p in points]
+    local = [(_mv_dot(p, x), _mv_dot(p, y), _mv_dot(p, z)) for p in offsets]
+    radius = max((_mv_math.sqrt(_mv_dot(p,p)) for p in offsets), default=0)
+    radius = max(radius, 1e-6)
+    tan_y = _mv_math.tan(_mv_math.radians(45)/2)
+    tan_x = tan_y * aspect
+    if projection == "perspective":
+        distance = max(p[2]+padding*max(abs(p[0])/tan_x, abs(p[1])/tan_y)
+                       for p in local) + radius*.05
+    else:
+        distance = radius*2.5
+    distance = max(distance, radius*1.05)
+    depths = [distance-p[2] for p in local]
+    near = max(radius*1e-5, min(depths)*.25)
+    far = max(depths)+radius
+    eye = tuple(center[k]+z[k]*distance for k in range(3))
+    view = [list(v)+[-_mv_dot(v,eye)] for v in (x,y,z)] + [[0.,0.,0.,1.]]
+    if projection == "perspective":
+        proj = [[1/tan_x,0.,0.,0.], [0.,1/tan_y,0.,0.],
+                [0.,0.,-(far+near)/(far-near),-2*far*near/(far-near)],
+                [0.,0.,-1.,0.]]
+    else:
+        half_y = max(max(abs(p[1]) for p in local),
+                     max(abs(p[0]) for p in local)/aspect, radius*.001)*padding
+        half_x = half_y*aspect
+        proj = [[1/half_x,0.,0.,0.], [0.,1/half_y,0.,0.],
+                [0.,0.,-2/(far-near),-(far+near)/(far-near)], [0.,0.,0.,1.]]
+    return view, proj
+
+
+def _mv_png(rgba):
+    """Encode a top-down uint8 RGBA array, entirely in memory (no shared paths)."""
+    if rgba.ndim != 3 or rgba.shape[2] != 4 or str(rgba.dtype) != "uint8":
+        raise ValueError("PNG input must be HxWx4 uint8")
+    height, width, _ = rgba.shape
+    def chunk(kind, body):
+        return (_mv_struct.pack(">I", len(body)) + kind + body +
+                _mv_struct.pack(">I", _mv_zlib.crc32(kind+body) & 0xffffffff))
+    raw = b"".join(b"\x00"+row.tobytes() for row in rgba)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", _mv_struct.pack(">IIBBBBB", width,height,8,6,0,0,0)) +
+            chunk(b"IDAT", _mv_zlib.compress(raw, 3)) + chunk(b"IEND", b""))
+
+
+def _mv_badge(tile, number):
+    """High-contrast numeric key; the exact view names are in the text legend."""
+    scale = max(1, min(4, tile.shape[1] // 192))
+    text = str(number)
+    tile[3:3+9*scale, 3:3+(6*len(text)+2)*scale, :3] = 20
+    tile[3:3+9*scale, 3:3+(6*len(text)+2)*scale, 3] = 255
+    for pos, ch in enumerate(text):
+        for row, bits in enumerate(_MV_DIGITS[int(ch)]):
+            for col in range(5):
+                if bits & (1 << (4-col)):
+                    yy, xx = 3+(row+1)*scale, 3+(pos*6+col+1)*scale
+                    tile[yy:yy+scale, xx:xx+scale] = (255,255,255,255)
+
+
+def _mv_objects(context, space, target):
+    """Resolve explicit roots (including children), else selection, else geometry."""
+    import mathutils
+    geometry = {"MESH", "CURVE", "SURFACE", "META", "FONT", "VOLUME",
+                "POINTCLOUD", "GREASEPENCIL", "GPENCIL"}
+    objects = list(context.view_layer.objects)
+    by_name = {obj.name: obj for obj in objects}
+    if target is not None:
+        missing = [name for name in target if name not in by_name]
+        if missing:
+            raise ValueError(f"Target object(s) not in this view layer: {missing}")
+        roots = [by_name[name] for name in target]
+        source = "explicit"
+    else:
+        roots = [obj for obj in objects if obj.select_get() and
+                 obj.visible_get(view_layer=context.view_layer, viewport=space)]
+        source = "selection" if roots else "visible_geometry"
+        if not roots:
+            roots = [obj for obj in objects if obj.type in geometry and
+                     obj.visible_get(view_layer=context.view_layer, viewport=space)]
+    selected = set(roots)
+    for obj in roots:
+        selected.update(obj.children_recursive)
+    if target is None and source == "selection" and not any(
+            obj.type in geometry or getattr(obj, "instance_type", "NONE") != "NONE"
+            for obj in selected):
+        names = [obj.name for obj in objects if obj.type in geometry and
+                 obj.visible_get(view_layer=context.view_layer, viewport=space)]
+        points, keep, _ = _mv_objects(context, space, names)
+        return points, keep, "visible_geometry"
+    keep = set(selected)
+    for obj in list(keep):
+        parent = obj.parent
+        while parent:
+            keep.add(parent)
+            parent = parent.parent
+    depsgraph = context.evaluated_depsgraph_get()
+    points = []
+    # Evaluated objects cover modifiers, text and collection/geometry instances.
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        original = obj.original
+        parent = instance.parent.original if instance.parent else None
+        owner = (parent or original) if instance.is_instance else original
+        if original not in selected and owner not in selected:
+            continue
+        if obj.type not in geometry or not owner.visible_get(view_layer=context.view_layer, viewport=space):
+            continue
+        bounds = obj.bound_box
+        if all(tuple(p) == (-1.,-1.,-1.) for p in bounds):
+            continue
+        points.extend(tuple(instance.matrix_world @ mathutils.Vector(p)) for p in bounds)
+    if not points:
+        raise ValueError("No visible evaluated geometry to frame; specify target object names")
+    return points, keep, source
+
+
+def _mv_capture(options=None):
+    """Main-thread GPU viewport capture. Never moves cameras or the user's view."""
+    import bpy
+    import gpu
+    import numpy as np
+    import base64
+    import time
+    from mathutils import Matrix
+
+    options = _mv_options(options)
+    started = time.perf_counter()
+    if bpy.app.background:
+        raise RuntimeError("Multi-view inspection needs a GUI GPU context; use Blender under xvfb-run, not -b")
+    windows = list(bpy.context.window_manager.windows)
+    if bpy.context.window in windows:
+        windows.remove(bpy.context.window)
+        windows.insert(0, bpy.context.window)
+    viewport = next(((w,a,next((r for r in a.regions if r.type == 'WINDOW'),None))
+                     for w in windows for a in w.screen.areas if a.type == 'VIEW_3D'), None)
+    if not viewport or viewport[2] is None:
+        raise RuntimeError("No 3D viewport available for inspection")
+    window, area, region = viewport
+    space = area.spaces.active
+    cell = options["cell"]
+    canvas = np.full((options["height"],options["width"],4), (28,28,28,255), dtype=np.uint8)
+    views_meta = []
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        context = bpy.context
+        context.view_layer.update()
+        # Resolve BEFORE any temporary isolation can affect subsequent targets.
+        resolved = [_mv_objects(context, space, item["target"]) for item in options["views"]]
+        original_shading = space.shading.type
+        original_overlays = space.overlay.show_overlays
+        original_gizmo = space.show_gizmo
+        original_hidden = {obj: obj.hide_get(view_layer=context.view_layer)
+                           for obj in context.view_layer.objects}
+        # hide_set(True) also deselects objects in Blender. Restoring visibility
+        # alone would silently change the user's selection after isolation.
+        original_selected = {obj: obj.select_get(view_layer=context.view_layer)
+                             for obj in context.view_layer.objects}
+        original_active = context.view_layer.objects.active
+        offscreen = None
+        try:
+            space.overlay.show_overlays = False
+            space.show_gizmo = False
+            offscreen = gpu.types.GPUOffScreen(cell, cell, format='RGBA8')
+            for index, (item, (points, keep, source)) in enumerate(zip(options["views"], resolved)):
+                for obj, was_hidden in original_hidden.items():
+                    hidden = was_hidden or (item["isolate"] and obj not in keep and
+                                            obj.type not in {"LIGHT", "CAMERA"})
+                    if obj.hide_get(view_layer=context.view_layer) != hidden:
+                        obj.hide_set(hidden, view_layer=context.view_layer)
+                context.view_layer.update()
+                mode = item["shading"]
+                space.shading.type = original_shading if mode == "current" else mode.upper()
+                if item["name"] == "current":
+                    view = space.region_3d.view_matrix.copy()
+                    projection = space.region_3d.window_matrix.copy()
+                    # Keep the whole current field of view without stretching it into a square.
+                    aspect = region.width / max(1, region.height)
+                    if aspect >= 1:
+                        projection[1][1] /= aspect
+                    else:
+                        projection[0][0] *= aspect
+                else:
+                    v, p = _mv_camera(points,item["direction"],item["projection"],options["padding"])
+                    view, projection = Matrix(v), Matrix(p)
+                t0 = time.perf_counter()
+                offscreen.draw_view3d(context.scene,context.view_layer,space,region,
+                                     view,projection,do_color_management=True)
+                buf = offscreen.texture_color.read()
+                buf.dimensions = cell*cell*4
+                tile = np.asarray(buf,dtype=np.uint8).reshape(cell,cell,4)[::-1].copy()
+                _mv_badge(tile,index+1)
+                row, col = divmod(index,options["columns"])
+                canvas[row*cell:(row+1)*cell,col*cell:(col+1)*cell] = tile
+                views_meta.append({"index":index+1,"view":item["name"],"target":item["target"] or "auto",
+                                   "target_source":source,"isolated":item["isolate"],"shading":mode,
+                                   "capture_ms":round((time.perf_counter()-t0)*1000,3)})
+        finally:
+            # Restoration must still run if a GPU call or buffer read raises.
+            try:
+                if offscreen is not None:
+                    offscreen.free()
+            finally:
+                space.shading.type = original_shading
+                space.overlay.show_overlays = original_overlays
+                space.show_gizmo = original_gizmo
+                for obj, was_hidden in original_hidden.items():
+                    obj.hide_set(was_hidden,view_layer=context.view_layer)
+                for obj, was_selected in original_selected.items():
+                    obj.select_set(was_selected, view_layer=context.view_layer)
+                context.view_layer.objects.active = original_active
+                context.view_layer.update()
+    png = _mv_png(canvas)
+    if len(png) > 32*1024*1024:
+        raise RuntimeError("Inspection PNG exceeds 32 MiB; reduce max_size")
+    return {"image_base64":base64.b64encode(png).decode("ascii"),"mime_type":"image/png",
+            "width":options["width"],"height":options["height"],"columns":options["columns"],
+            "rows":options["rows"],"views":views_meta,"method":"gpu_offscreen",
+            "elapsed_ms":round((time.perf_counter()-started)*1000,3)}
+
+
 #region Manual edit capture
 # Records what the human does in Blender while an MCP session is live.
 
@@ -851,6 +1219,7 @@ class BlenderMCPServer:
             "get_addon_info": self.get_addon_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
+            "get_viewport_montage": self.get_viewport_montage,
             "execute_code": self.execute_code,
             "drain_human_activity": self.drain_human_activity,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -936,6 +1305,8 @@ class BlenderMCPServer:
                 "get_addon_info",
                 "get_object_info",
                 "get_viewport_screenshot",
+                "get_viewport_montage",
+                "execute_code_with_inspection",
                 "execute_code",
                 "drain_human_activity",
                 "get_telemetry_consent",
@@ -1450,22 +1821,31 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
-        # This is powerful but potentially dangerous - use with caution
-        try:
-            # Create a local namespace for execution
-            namespace = {"bpy": bpy}
+    def get_viewport_montage(self, **options):
+        """Return one in-memory PNG containing multiple viewport observations."""
+        return _mv_capture(options)
 
-            # Capture stdout during execution, and return it as result
+    def execute_code(self, code, inspect=None):
+        """Execute once; optional inspection belongs to the same main-thread command."""
+        if inspect is not None:
+            # Reject malformed options BEFORE code can mutate the scene.
+            _mv_options(inspect)
+        try:
+            namespace = {"bpy": bpy}
             capture_buffer = io.StringIO()
             with redirect_stdout(capture_buffer):
                 exec(code, namespace)
-
-            captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
+            result = {"executed": True, "result": capture_buffer.getvalue()}
         except Exception as e:
             raise Exception(f"Code execution error: {str(e)}")
+        if inspect is not None:
+            try:
+                result["inspection"] = _mv_capture(inspect)
+            except Exception as e:
+                # The edit already happened. Never report it as an execution failure,
+                # and never retry arbitrary Python to recover a failed screenshot.
+                result["inspection_error"] = str(e)
+        return result
 
 
 
