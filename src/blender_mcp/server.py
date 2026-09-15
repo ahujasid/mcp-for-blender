@@ -774,55 +774,91 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
 @telemetry_tool("search_polyhaven_assets")
 async def search_polyhaven_assets(
     ctx: Context,
+    query: str = None,
     asset_type: str = "all",
     categories: str = None,
+    limit: int = 20,
     user_prompt: str = ""
 ) -> str:
     """
-    Search for assets on Polyhaven with optional filtering.
+    Search Poly Haven's library of free CC0 HDRIs, textures and models.
 
     Parameters:
-    - asset_type: Type of assets to search for (hdris, textures, models, all)
-    - categories: Optional comma-separated list of categories to filter by
+    - query: What you are looking for, in plain words ("rusty metal", "overcast
+      afternoon", "wooden chair"). Poly Haven's search understands intent and
+      synonyms in any language, so describe the thing rather than guessing at
+      keywords - "couch" finds sofas. Leave it out to browse the most downloaded
+      assets instead.
+    - asset_type: hdris, textures, models, or all
+    - categories: Optional comma-separated category filter. Call
+      get_polyhaven_categories for the taxonomy and the attributes each type has.
+    - limit: How many results to return (default 20, maximum 50)
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
-    Returns a list of matching assets with basic information.
+    Results are returned in ranked order, most relevant first. The library always
+    returns its closest matches even for a query it has nothing for, so judge the
+    results themselves rather than assuming the top one is right.
+
+    Returns each asset's id, name, type, author, category, tags and page URL.
     """
     try:
         blender = get_blender_connection()
         result = blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
-            "categories": categories
+            "categories": categories,
+            "query": query,
+            "limit": limit,
         })
-        
+
         if "error" in result:
             return f"Error: {result['error']}"
-        
-        # Format the assets in a more readable way
+
         assets = result["assets"]
         total_count = result["total_count"]
-        returned_count = result["returned_count"]
-        
-        formatted_output = f"Found {total_count} assets"
-        if categories:
-            formatted_output += f" in categories: {categories}"
-        formatted_output += f"\nShowing {returned_count} assets:\n\n"
-        
-        # Sort assets by download count (popularity)
-        sorted_assets = sorted(assets.items(), key=lambda x: x[1].get("download_count", 0), reverse=True)
-        
-        for asset_id, asset_data in sorted_assets:
-            formatted_output += f"- {asset_data.get('name', asset_id)} (ID: {asset_id})\n"
-            asset_kind = {0: 'HDRI', 1: 'Texture', 2: 'Model'}.get(asset_data.get('type'), 'Unknown')
-            formatted_output += f"  Type: {asset_kind}\n"
-            formatted_output += f"  Categories: {', '.join(asset_data.get('categories', []))}\n"
-            formatted_output += f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n\n"
-        
-        return formatted_output
+
+        if result.get("query"):
+            header = f"{total_count} assets on Poly Haven match '{result['query']}'"
+        else:
+            header = f"{total_count} assets on Poly Haven"
+            if categories:
+                header += f" in categories: {categories}"
+            header += ", most downloaded first"
+
+        lines = [header, f"Showing {result['returned_count']}:", ""]
+        if result.get("note"):
+            lines.insert(1, result["note"])
+
+        for asset in assets:
+            lines.append(f"- {asset['name']} (ID: {asset['id']})")
+            lines.append(f"  Type: {asset['type']}  |  {asset['url']}")
+            if asset.get("authors"):
+                lines.append(f"  By: {', '.join(asset['authors'])}")
+            if asset.get("category"):
+                lines.append(f"  Category: {asset['category']}")
+            if asset.get("tags"):
+                lines.append(f"  Tags: {', '.join(asset['tags'])}")
+            if asset.get("attributes"):
+                attributes = ", ".join(
+                    f"{k}={v if not isinstance(v, list) else '/'.join(v)}"
+                    for k, v in asset["attributes"].items()
+                )
+                lines.append(f"  Attributes: {attributes}")
+            if asset.get("dimensions_mm"):
+                width, height = asset["dimensions_mm"][:2]
+                lines.append(f"  Real-world size: {width / 1000:g}m x {height / 1000:g}m")
+            if asset.get("max_resolution"):
+                lines.append(f"  Up to: {'x'.join(str(v) for v in asset['max_resolution'])}")
+            if asset.get("downloads") is not None:
+                lines.append(f"  Downloads: {asset['downloads']}")
+            if asset.get("description"):
+                lines.append(f"  {asset['description']}")
+            lines.append("")
+
+        lines.append("Assets from Poly Haven (https://polyhaven.com), free and CC0.")
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error searching Polyhaven assets: {str(e)}")
         return f"Error searching Polyhaven assets: {str(e)}"
-
 @mcp.tool()
 @trajectory_tool("download_polyhaven_asset")
 async def download_polyhaven_asset(

@@ -1157,8 +1157,17 @@ def test_an_asset_id_cannot_escape_the_cache_directory(server, monkeypatch):
 
 # --- search ------------------------------------------------------------------
 
-def _asset(name, asset_type, downloads):
-    return {"name": name, "type": asset_type, "categories": [], "download_count": downloads}
+def _asset(name, asset_type, downloads, **extra):
+    """An /assets record, in the shape the live API returns one."""
+    record = {
+        "name": name,
+        "type": asset_type,
+        "categories": [],
+        "download_count": downloads,
+        "authors": {"Rob Tuytel": "All"},
+    }
+    record.update(extra)
+    return record
 
 
 def test_search_ranks_before_truncating(server, monkeypatch):
@@ -1173,12 +1182,12 @@ def test_search_ranks_before_truncating(server, monkeypatch):
 
     result = srv.search_polyhaven_assets(asset_type="all")
 
-    returned = result["assets"]
+    returned = [asset["id"] for asset in result["assets"]]
     assert result["total_count"] == 22
     assert result["returned_count"] == 20
     assert "kloofendal_puresky" in returned, "the most downloaded asset was truncated away"
     assert "rock_wall_10" in returned
-    assert list(returned)[0] == "kloofendal_puresky"
+    assert returned[0] == "kloofendal_puresky"
 
 
 def test_search_rejects_an_unknown_type_without_a_request(server, monkeypatch):
@@ -1337,3 +1346,132 @@ def test_the_cache_does_not_grow_without_limit(server, monkeypatch):
         addon._polyhaven_api_get("assets", params={"categories": f"c{i}"}, cache=True)
 
     assert len(addon._polyhaven_cache) <= addon.POLYHAVEN_CACHE_MAX_ENTRIES
+
+
+# --- search: the tool could not search --------------------------------------
+
+def _install_search(monkeypatch, addon, assets, results=None, status=None, retry_after=None):
+    """Serve /search alongside the other endpoints."""
+    calls = _install_requests(monkeypatch, addon, assets=assets)
+    inner = addon.requests.get
+
+    def fake_get(url, headers=None, params=None, timeout=None, stream=False):
+        if url.endswith("/search"):
+            calls.append({"url": url, "params": dict(params or {}), "stream": False,
+                          "timeout": timeout, "headers": dict(headers or {})})
+            if status:
+                return FakeResponse(status_code=status,
+                                    headers={"Retry-After": retry_after} if retry_after else {})
+            return FakeResponse(payload={
+                "query": (params or {}).get("q"),
+                "total": len(results),
+                "considered": len(assets),
+                "hybrid": True,
+                "results": [{"slug": slug, "score": score} for slug, score in results],
+            })
+        return inner(url, headers=headers, params=params, timeout=timeout, stream=stream)
+
+    monkeypatch.setattr(addon.requests, "get", fake_get, raising=False)
+    return calls
+
+
+SEARCHABLE = {
+    "rusty_metal": _asset("Rusty Metal", 1, 300000, tags=["rust", "metal"],
+                          category="Metal/Sheet & Corrugated", dimensions=[1000, 1000]),
+    "rusty_metal_03": _asset("Rusty Metal 03", 1, 200000),
+    "metal_plate_02": _asset("Metal Plate 02", 1, 100000),
+    "moonless_golf": _asset("Moonless Golf", 0, 779145),
+}
+
+
+def test_a_query_is_answered_by_the_search_endpoint(server, monkeypatch):
+    """There was no query parameter at all: the tool fetched the whole asset
+    list and returned a slice of it, so "find me a rusty metal texture" could
+    only ever be answered by whatever happened to be popular."""
+    addon, srv = server
+    calls = _install_search(monkeypatch, addon, SEARCHABLE, results=[
+        ("rusty_metal", 0.69), ("rusty_metal_03", 0.67), ("metal_plate_02", 0.61)])
+
+    result = srv.search_polyhaven_assets(query="Rusty Metal ", asset_type="textures")
+
+    assert [asset["id"] for asset in result["assets"]] == [
+        "rusty_metal", "rusty_metal_03", "metal_plate_02"]
+    search = next(c for c in calls if c["url"].endswith("/search"))
+    assert search["params"]["q"] == "rusty metal", "queries are trimmed and lower-cased"
+    assert search["params"]["t"] == "textures"
+
+
+def test_search_order_is_the_ranking_and_is_not_re_sorted(server, monkeypatch):
+    """Two rankings are fused by position, so the array order is the answer.
+    `score` is the vector lane alone and does not explain the order once a
+    keyword match has lifted something."""
+    addon, srv = server
+    _install_search(monkeypatch, addon, SEARCHABLE, results=[
+        ("rusty_metal", 0.69), ("rusty_metal_03", 0.67), ("metal_plate_02", 0.71)])
+
+    result = srv.search_polyhaven_assets(query="rusty metal")
+
+    assert [asset["id"] for asset in result["assets"]] == [
+        "rusty_metal", "rusty_metal_03", "metal_plate_02"]
+
+
+def test_search_results_carry_the_metadata_the_api_already_returned(server, monkeypatch):
+    """Every /assets record holds the author, tags, category and real-world size,
+    and all of it was being downloaded and then thrown away."""
+    addon, srv = server
+    _install_search(monkeypatch, addon, SEARCHABLE, results=[("rusty_metal", 0.69)])
+
+    asset = srv.search_polyhaven_assets(query="rusty metal")["assets"][0]
+
+    assert asset["url"] == "https://polyhaven.com/a/rusty_metal"
+    assert asset["authors"] == ["Rob Tuytel"]
+    assert asset["tags"] == ["rust", "metal"]
+    assert asset["category"] == "Metal/Sheet & Corrugated"
+    assert asset["dimensions_mm"] == [1000, 1000]
+    assert asset["type"] == "textures"
+
+
+def test_a_rate_limited_search_says_how_long_to_wait(server, monkeypatch):
+    addon, srv = server
+    _install_search(monkeypatch, addon, SEARCHABLE, status=429, retry_after="30")
+
+    result = srv.search_polyhaven_assets(query="rusty metal")
+
+    assert "error" in result
+    assert "30s" in result["error"], result["error"]
+
+
+def test_an_unavailable_search_index_falls_back_to_keywords(server, monkeypatch):
+    """The API documents a 503 as "the query could not be embedded, fall back to
+    your own keyword matching"."""
+    addon, srv = server
+    _install_search(monkeypatch, addon, SEARCHABLE, status=503)
+
+    result = srv.search_polyhaven_assets(query="rusty metal")
+
+    assert [asset["id"] for asset in result["assets"]][:2] == ["rusty_metal", "rusty_metal_03"]
+    assert "moonless_golf" not in [asset["id"] for asset in result["assets"]]
+    assert "keyword" in (result.get("note") or "").lower()
+
+
+def test_a_search_hit_outside_the_category_filter_is_dropped(server, monkeypatch):
+    """/search does not know about the category filter, so its ranking has to be
+    intersected with the filtered list rather than trusted wholesale."""
+    addon, srv = server
+    filtered = {"rusty_metal": SEARCHABLE["rusty_metal"]}
+    _install_search(monkeypatch, addon, filtered, results=[
+        ("rusty_metal", 0.69), ("metal_plate_02", 0.61)])
+
+    result = srv.search_polyhaven_assets(query="rusty metal", categories="metal")
+
+    assert [asset["id"] for asset in result["assets"]] == ["rusty_metal"]
+
+
+def test_the_result_limit_is_capped(server, monkeypatch):
+    addon, srv = server
+    assets = {f"asset_{i:03d}": _asset(f"Asset {i}", 1, i) for i in range(120)}
+    _install_requests(monkeypatch, addon, assets=assets)
+
+    result = srv.search_polyhaven_assets(limit=1000)
+
+    assert result["returned_count"] == addon.POLYHAVEN_SEARCH_MAX_LIMIT

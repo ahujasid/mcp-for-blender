@@ -316,6 +316,28 @@ POLYHAVEN_COLOR_ROLES = {"base_color"}
 
 POLYHAVEN_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
+POLYHAVEN_SITE = "https://polyhaven.com"
+
+# `type` is an integer in the API's asset records.
+POLYHAVEN_ASSET_TYPES = {0: "hdris", 1: "textures", 2: "models"}
+
+POLYHAVEN_SEARCH_LIMIT = 20
+POLYHAVEN_SEARCH_MAX_LIMIT = 50
+
+
+class PolyHavenAPIError(Exception):
+    """A non-2xx from the Poly Haven API, with the status kept.
+
+    Needed because 429 and 503 want different handling from a generic failure:
+    one means back off, the other means the search index is unavailable and the
+    API is telling us to fall back to matching keywords ourselves.
+    """
+
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.retry_after = retry_after
+
 
 # Poly Haven serves the asset list with `Cache-Control: max-age=43200` and an
 # ETag, and both were being discarded: every search re-fetched all 2.44MB of it.
@@ -361,7 +383,12 @@ def _polyhaven_api_get(path, params=None, cache=False):
         entry["fetched"] = time.time()
         return entry["payload"]
 
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise PolyHavenAPIError(
+            response.status_code,
+            getattr(response, "headers", {}).get("Retry-After"),
+        )
+
     payload = response.json()
 
     if cache:
@@ -475,6 +502,76 @@ def _polyhaven_blend_version(path):
         return int(head[9:10]), int(head[10:12])
     except (ValueError, IndexError):
         return None
+
+
+def _polyhaven_asset_url(slug):
+    return f"{POLYHAVEN_SITE}/a/{quote(slug, safe='')}"
+
+
+def _polyhaven_summarize_asset(slug, record):
+    """Trim an /assets record down to what is worth sending back over MCP.
+
+    The full record is around a kilobyte of JSON per asset and the whole page of
+    results crosses the socket in one message, so twenty untrimmed records is
+    most of what the model then has to read.
+    """
+    authors = record.get("authors") or {}
+    summary = {
+        "id": slug,
+        "name": record.get("name") or slug,
+        "type": POLYHAVEN_ASSET_TYPES.get(record.get("type"), "unknown"),
+        "url": _polyhaven_asset_url(slug),
+        "authors": sorted(authors) if isinstance(authors, dict) else authors,
+        "downloads": record.get("download_count"),
+    }
+
+    for key in ("description", "category", "tags", "attributes", "max_resolution"):
+        value = record.get(key)
+        if value:
+            summary[key] = value
+
+    # Real-world size in millimetres, published for every texture. Without it
+    # there is no way to know that a wall texture is 1.8m across, and the
+    # material gets whatever tiling the object's UVs happen to give it.
+    if record.get("dimensions"):
+        summary["dimensions_mm"] = record["dimensions"]
+
+    return summary
+
+
+def _polyhaven_search(query, asset_type, limit):
+    """Ranked slugs from Poly Haven's search endpoint, and the match count.
+
+    The array order IS the ranking - it fuses a vector lane and a keyword lane
+    by position - so it must not be re-sorted by `score`, which reports vector
+    similarity alone.
+    """
+    params = {"q": query, "limit": limit}
+    if asset_type and asset_type != "all":
+        params["t"] = asset_type
+
+    payload = _polyhaven_api_get("search", params=params, cache=True)
+    results = payload.get("results") or []
+    return [r["slug"] for r in results if r.get("slug")], payload.get("total", len(results))
+
+
+def _polyhaven_keyword_match(query, assets):
+    """The fallback the API asks for when it answers a search with 503."""
+    terms = [term for term in query.split() if term]
+    scored = []
+    for slug, record in assets.items():
+        haystack = " ".join([
+            slug.replace("_", " "),
+            str(record.get("name") or ""),
+            " ".join(record.get("tags") or []),
+            str(record.get("category") or ""),
+        ]).lower()
+        hits = sum(1 for term in terms if term in haystack)
+        if hits:
+            scored.append((hits, record.get("download_count", 0), slug))
+
+    scored.sort(reverse=True)
+    return [slug for _hits, _downloads, slug in scored]
 
 
 def _polyhaven_resolution_rank(resolution):
@@ -2226,7 +2323,7 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def search_polyhaven_assets(self, asset_type=None, categories=None):
+    def search_polyhaven_assets(self, asset_type=None, categories=None, query=None, limit=None):
         """Search for assets from Polyhaven with optional filtering"""
         try:
             params = {}
@@ -2239,30 +2336,61 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
+            try:
+                limit = int(limit) if limit else POLYHAVEN_SEARCH_LIMIT
+            except (TypeError, ValueError):
+                limit = POLYHAVEN_SEARCH_LIMIT
+            limit = max(1, min(limit, POLYHAVEN_SEARCH_MAX_LIMIT))
+
             assets = _polyhaven_api_get("assets", params=params, cache=True)
 
-            # Rank before truncating. The previous order was whatever the API
-            # happened to return, which is sorted by slug - and because models
-            # are the only assets with capitalised slugs, the first 20 of an
-            # unfiltered list were 20 models. asset_type="all" could not return
-            # a single HDRI or texture, and the library's most downloaded assets
-            # were unreachable by any call.
-            ranked = sorted(
-                assets.items(),
-                key=lambda item: item[1].get("download_count", 0),
-                reverse=True,
-            )
+            # Trimmed and lower-cased so equivalent queries share a cache entry,
+            # both here and at Poly Haven's edge.
+            query = (query or "").strip().lower()
+            note = None
+            total = len(assets)
 
-            limited_assets = dict(ranked[:20])
+            if query:
+                try:
+                    ranked, total = _polyhaven_search(query, asset_type, limit)
+                except PolyHavenAPIError as e:
+                    if e.status == 429:
+                        wait = f" Retry in {e.retry_after}s." if e.retry_after else ""
+                        return {"error": f"Poly Haven is rate limiting searches from this "
+                                         f"address.{wait}"}
+                    if e.status != 503:
+                        raise
+                    # The API documents a 503 as "the query could not be
+                    # embedded, fall back to your own keyword matching".
+                    ranked = _polyhaven_keyword_match(query, assets)
+                    total = len(ranked)
+                    note = ("Poly Haven's semantic search was unavailable, so these are plain "
+                            "keyword matches and the ranking is weaker than usual.")
+
+                # /search does not know about the category filter, and an asset
+                # can be published between the two responses.
+                ordered = [slug for slug in ranked if slug in assets]
+            else:
+                # Rank before truncating. The previous order was whatever the API
+                # happened to return, which is sorted by slug - and because models
+                # are the only assets with capitalised slugs, the first 20 of an
+                # unfiltered list were 20 models. asset_type="all" could not return
+                # a single HDRI or texture, and the library's most downloaded assets
+                # were unreachable by any call.
+                ordered = sorted(
+                    assets, key=lambda slug: assets[slug].get("download_count", 0), reverse=True)
+
+            selected = ordered[:limit]
 
             return {
-                "assets": limited_assets,
-                "total_count": len(assets),
-                "returned_count": len(limited_assets),
+                "assets": [_polyhaven_summarize_asset(slug, assets[slug]) for slug in selected],
+                "total_count": total,
+                "returned_count": len(selected),
+                "query": query or None,
+                "note": note,
             }
         except Exception as e:
             return {"error": str(e)}
-
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
         try:
             if asset_type not in POLYHAVEN_SUPPORTED_FORMATS:
