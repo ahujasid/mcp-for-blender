@@ -307,6 +307,15 @@ export BLENDER_HOST='host.docker.internal'
 export BLENDER_PORT=9876
 ```
 
+You can also pass the connection as CLI flags, which take precedence over the
+environment variables. This is handy for running several Blender instances side
+by side, since each MCP client entry can point at a different port with plain
+arguments instead of env vars:
+
+```bash
+uvx blender-mcp --port 9877
+```
+
 #### Safe mode
 
 By default, the AI can run any Python code in Blender. Set `BLENDER_MCP_SAFE_MODE=1` to check every script before it runs and block risky code — things like reading or writing files directly, running other programs, accessing the network, or installing code that keeps running after the script ends. Normal Blender work (modeling, materials, rendering, saving, import/export) still works. Blocked scripts are sent back to the AI with the reason, so it can try again with a corrected version.

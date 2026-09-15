@@ -1,5 +1,6 @@
 # blender_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context, Image
+import argparse
 import socket
 import json
 import asyncio
@@ -37,6 +38,11 @@ logger = logging.getLogger("BlenderMCPServer")
 # Default configuration
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
+
+# Optional --host/--port CLI flags (parsed in main()); when set they take
+# precedence over the BLENDER_HOST/BLENDER_PORT environment variables.
+CLI_HOST = None
+CLI_PORT = None
 
 _addon_handshake = None
 _addon_handshake_checked = False
@@ -325,8 +331,8 @@ def get_blender_connection():
 
     # Create a new connection if needed
     if _blender_connection is None:
-        host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-        port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+        host = CLI_HOST or os.getenv("BLENDER_HOST", DEFAULT_HOST)
+        port = CLI_PORT if CLI_PORT is not None else int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
         _blender_connection = BlenderConnection(host=host, port=port)
         if not _blender_connection.connect():
             logger.error("Failed to connect to Blender")
@@ -1878,10 +1884,20 @@ def asset_creation_strategy() -> str:
 
 def main():
     """Run the MCP server, or addon install CLI subcommands."""
+    global CLI_HOST, CLI_PORT
+
     if len(sys.argv) > 1 and sys.argv[1] in {"install-addon", "addon-paths", "-h", "--help"}:
         code = run_addon_cli(sys.argv[1:])
         if code >= 0:
             raise SystemExit(code)
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host", default=None,
+                        help="Host of the Blender socket server (overrides BLENDER_HOST)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Port of the Blender socket server (overrides BLENDER_PORT)")
+    args, _ = parser.parse_known_args()
+    CLI_HOST, CLI_PORT = args.host, args.port
 
     # When run by hand (stdin is a TTY) the server appears to "hang" while it
     # silently waits for an MCP client; log a hint so that state is obvious.
