@@ -298,6 +298,7 @@ The following environment variables can be used to configure the Blender connect
 |---|---|---|
 | `BLENDER_HOST` | `localhost` | Host address for Blender socket server |
 | `BLENDER_PORT` | `9876` | Port number for Blender socket server |
+| `WSL_NETWORKING` | `false` | Set to `true` only when the MCP server runs in WSL and Blender runs on Windows; the add-on then listens on `0.0.0.0` instead of `localhost` |
 | `BLENDER_MCP_SAFE_MODE` | off | Set to `1` to validate scripts before they run in Blender (see below) |
 
 Example:
@@ -306,6 +307,35 @@ Example:
 export BLENDER_HOST='host.docker.internal'
 export BLENDER_PORT=9876
 ```
+
+#### WSL and Windows Blender
+
+Blender on Windows with the MCP server in WSL.
+
+1. In WSL, point the installer at your Windows add-ons folder and the server at the Windows host, which is the WSL default gateway. Put both in `~/.bashrc` — the gateway address changes when WSL restarts, so resolve it rather than hardcoding it:
+
+   ```bash
+   export BLENDERMCP_ADDONS_DIR="/mnt/c/Users/<user>/AppData/Roaming/Blender Foundation/Blender/<version>/scripts/addons"
+   export BLENDER_HOST=$(ip route show default | cut -d' ' -f3)
+   ```
+
+2. Install the add-on from WSL:
+
+   ```bash
+   uvx blender-mcp install-addon
+   ```
+
+3. In a **Windows** terminal, set the variable that makes the add-on bind `0.0.0.0`:
+
+   ```
+   setx WSL_NETWORKING true
+   ```
+
+4. Sign out and back in, so Blender picks up the new variable.
+
+5. Enable the add-on in Blender and click Start MCP Server. The console prints `BlenderMCP server started on 0.0.0.0:9876`.
+
+If the server cannot connect, allow Blender through Windows Firewall on private networks.
 
 #### Safe mode
 
