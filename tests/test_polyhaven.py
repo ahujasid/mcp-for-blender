@@ -2159,6 +2159,75 @@ def test_set_texture_reports_the_node_that_decides_the_tiling(server, monkeypatc
         "name": "Mapping", "vector_type": "POINT", "scale": [1.0, 1.0, 1.0]}
 
 
+def test_a_size_floor_leaves_out_textures_that_would_tile(server, monkeypatch):
+    """A 0.5m texture on a 4m wall repeats eight times and reads as a pattern
+    rather than as a wall. The API publishes the size for every texture but
+    takes no filter on it, so it is applied to the records already in hand."""
+    addon, srv = server
+    assets = {
+        "rough_wood": _asset("Rough Wood", 1, 900, dimensions=[500, 500]),
+        "wooden_planks": _asset("Wooden Planks", 1, 800, dimensions=[2000, 2000]),
+        "long_wall": _asset("Long Wall", 1, 700, dimensions=[6000, 3000]),
+    }
+    calls = _install_requests(monkeypatch, addon, assets=assets)
+
+    result = srv.search_polyhaven_assets(asset_type="textures", min_size_m=2)
+
+    assert [a["id"] for a in result["assets"]] == ["wooden_planks", "long_wall"]
+    assert result["total_count"] == 2, "the count describes the page it heads"
+    params = next(c["params"] for c in calls if c["url"].endswith("/assets"))
+    assert "min_size_m" not in params, "the API takes no such filter"
+
+
+def test_a_size_floor_excludes_what_publishes_no_size(server, monkeypatch):
+    """An HDRI has no real-world size, and something with no size cannot satisfy
+    a floor on it."""
+    addon, srv = server
+    assets = {"kloofendal": _asset("Kloofendal", 0, 900),
+              "wooden_planks": _asset("Wooden Planks", 1, 800, dimensions=[2000, 2000])}
+    _install_requests(monkeypatch, addon, assets=assets)
+
+    result = srv.search_polyhaven_assets(min_size_m=1)
+
+    assert [a["id"] for a in result["assets"]] == ["wooden_planks"]
+
+
+def test_a_size_floor_narrows_a_ranked_search_without_reordering_it(server, monkeypatch):
+    addon, srv = server
+    assets = {
+        "rough_wood": _asset("Rough Wood", 1, 900, dimensions=[500, 500]),
+        "wooden_planks": _asset("Wooden Planks", 1, 800, dimensions=[2000, 2000]),
+    }
+    _install_search(monkeypatch, addon, assets, results=[
+        ("rough_wood", 0.9), ("wooden_planks", 0.4)])
+
+    result = srv.search_polyhaven_assets(query="weathered timber", min_size_m=2)
+
+    assert [a["id"] for a in result["assets"]] == ["wooden_planks"]
+
+
+def test_a_size_floor_that_matches_nothing_says_so_rather_than_looking_empty(server, monkeypatch):
+    """An empty page reads as "Poly Haven does not have this", which is a
+    different and much worse statement than "your floor is above everything"."""
+    addon, srv = server
+    assets = {"rough_wood": _asset("Rough Wood", 1, 900, dimensions=[500, 500])}
+    _install_requests(monkeypatch, addon, assets=assets)
+
+    result = srv.search_polyhaven_assets(min_size_m=10)
+
+    assert result["assets"] == []
+    assert "10m or larger" in result["note"]
+
+
+def test_a_size_floor_that_is_not_a_number_is_reported(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, assets=SEARCHABLE)
+
+    result = srv.search_polyhaven_assets(min_size_m="two metres")
+
+    assert "error" in result and "min_size_m" in result["error"]
+
+
 def test_the_download_message_says_how_big_the_texture_is_and_how_to_tile_it():
     """The text the model reads immediately before it writes the material code."""
     import asyncio

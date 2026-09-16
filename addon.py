@@ -38,7 +38,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 8
+ADDON_PROTOCOL_VERSION = 9
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -2514,7 +2514,7 @@ class BlenderMCPServer:
             return {"error": str(e)}
 
     def search_polyhaven_assets(self, asset_type=None, category=None, attributes=None,
-                                query=None, limit=None):
+                                query=None, limit=None, min_size_m=None):
         """Search for assets from Polyhaven with optional filtering"""
         try:
             params = {}
@@ -2566,6 +2566,28 @@ class BlenderMCPServer:
             # both here and at Poly Haven's edge.
             query = (query or "").strip().lower()
             note = None
+
+            # Filtered here rather than at the API, which publishes a real-world
+            # size for every texture but takes no filter on it. Free: the records
+            # are already in hand. Anything that publishes no size cannot satisfy
+            # a floor on it and drops out - HDRIs have none.
+            if min_size_m:
+                try:
+                    floor_mm = float(min_size_m) * 1000
+                except (TypeError, ValueError):
+                    return {"error": f"min_size_m must be a number, got {min_size_m!r}"}
+                before = len(assets)
+                assets = {
+                    slug: record for slug, record in assets.items()
+                    if max(record.get("dimensions") or [0]) >= floor_mm
+                }
+                if before and not assets:
+                    # An empty page reads as "Poly Haven does not have this",
+                    # which is a different and much worse statement than "the
+                    # size floor is above everything that matched".
+                    note = (f"Nothing matching the other filters is {floor_mm / 1000:g}m or "
+                            "larger. Most textures are 1-4m, and HDRIs have no real-world "
+                            "size at all. Lower min_size_m or leave it out.")
 
             if query:
                 try:

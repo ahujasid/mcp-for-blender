@@ -834,6 +834,7 @@ async def search_polyhaven_assets(
     asset_type: str = "all",
     category: str = None,
     attributes: dict = None,
+    min_size_m: float = None,
     limit: int = 20,
     user_prompt: str = ""
 ) -> str:
@@ -855,6 +856,12 @@ async def search_polyhaven_assets(
       {"rigged": true}. Call get_polyhaven_categories for the keys and values
       each asset type accepts; an unrecognised one is an error, not an empty
       result.
+    - min_size_m: Optional floor on an asset's real-world size, in metres. A
+      texture covers a fixed real-world area, so a 0.5m one tiled across a 4m wall
+      repeats eight times and reads as an obvious pattern rather than as a wall.
+      Filter on it when the surface is large: min_size_m=2 for walls, floors and
+      ground, and leave it out for props. Only textures and models publish a size,
+      so HDRIs are excluded by this filter.
     - limit: How many results to return (default 20, maximum 50)
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
@@ -879,6 +886,7 @@ async def search_polyhaven_assets(
             "attributes": attributes,
             "query": query,
             "limit": limit,
+            "min_size_m": min_size_m,
         })
 
         if "error" in result:
@@ -896,6 +904,9 @@ async def search_polyhaven_assets(
             if attributes:
                 header += " (" + ", ".join(f"{k}={v}" for k, v in attributes.items()) + ")"
             header += ", most downloaded first"
+
+        if min_size_m:
+            header += f" (at least {min_size_m:g}m across)"
 
         lines = [header, f"Showing {result['returned_count']}:", ""]
         if result.get("note"):
