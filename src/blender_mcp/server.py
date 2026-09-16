@@ -759,9 +759,9 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
     parent path to search_polyhaven_assets also returns everything beneath it.
 
     Categories describe what an asset IS. Qualities like weather, condition or
-    material are separate attributes, listed here with the values each accepts -
-    HDRIs carry time_of_day, weather and season; textures carry surface_use and
-    condition; models carry material, rigged and lods.
+    material are separate attributes, and every attribute this type supports is
+    listed in the response with the exact values it accepts. Pass those to
+    search_polyhaven_assets's `attributes`.
 
     Parameters:
     - asset_type: hdris, textures, models, or all. Asking for one type returns
@@ -807,7 +807,8 @@ async def search_polyhaven_assets(
     ctx: Context,
     query: str = None,
     asset_type: str = "all",
-    categories: str = None,
+    category: str = None,
+    attributes: dict = None,
     limit: int = 20,
     user_prompt: str = ""
 ) -> str:
@@ -821,8 +822,14 @@ async def search_polyhaven_assets(
       keywords - "couch" finds sofas. Leave it out to browse the most downloaded
       assets instead.
     - asset_type: hdris, textures, models, or all
-    - categories: Optional comma-separated category filter. Call
-      get_polyhaven_categories for the taxonomy and the attributes each type has.
+    - category: Optional single category path, exactly as get_polyhaven_categories
+      returns it ("Metal/Sheet & Corrugated"). Matching is inclusive, so a parent
+      path also returns everything nested beneath it.
+    - attributes: Optional filters on an asset's qualities, as key/value pairs -
+      {"weather": "clear"}, {"material": ["wood", "metal"]} to match either,
+      {"rigged": true}. Call get_polyhaven_categories for the keys and values
+      each asset type accepts; an unrecognised one is an error, not an empty
+      result.
     - limit: How many results to return (default 20, maximum 50)
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
@@ -836,7 +843,8 @@ async def search_polyhaven_assets(
         blender = get_blender_connection()
         result = blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
-            "categories": categories,
+            "category": category,
+            "attributes": attributes,
             "query": query,
             "limit": limit,
         })
@@ -851,8 +859,10 @@ async def search_polyhaven_assets(
             header = f"{total_count} assets on Poly Haven match '{result['query']}'"
         else:
             header = f"{total_count} assets on Poly Haven"
-            if categories:
-                header += f" in categories: {categories}"
+            if category:
+                header += f" in {category}"
+            if attributes:
+                header += " (" + ", ".join(f"{k}={v}" for k, v in attributes.items()) + ")"
             header += ", most downloaded first"
 
         lines = [header, f"Showing {result['returned_count']}:", ""]
@@ -874,9 +884,11 @@ async def search_polyhaven_assets(
                     for k, v in asset["attributes"].items()
                 )
                 lines.append(f"  Attributes: {attributes}")
-            if asset.get("dimensions_mm"):
-                width, height = asset["dimensions_mm"][:2]
-                lines.append(f"  Real-world size: {width / 1000:g}m x {height / 1000:g}m")
+            size = asset.get("dimensions_mm")
+            if size:
+                metres = " x ".join(f"{v / 1000:g}m" for v in size)
+                axes = " (W x D x H)" if len(size) == 3 else ""
+                lines.append(f"  Real-world size: {metres}{axes}")
             if asset.get("max_resolution"):
                 lines.append(f"  Up to: {'x'.join(str(v) for v in asset['max_resolution'])}")
             if asset.get("downloads") is not None:

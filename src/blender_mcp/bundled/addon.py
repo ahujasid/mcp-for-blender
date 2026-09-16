@@ -38,7 +38,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 7
+ADDON_PROTOCOL_VERSION = 8
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -304,13 +304,21 @@ POLYHAVEN_MODEL_FALLBACK_FORMAT = "gltf"
 # "Displacement" are capitalised while "nor_gl" and "arm" are not - so these
 # are matched exactly instead of being lower-cased and guessed at.
 #
-# This is deliberately the same set Poly Haven's own .blend materials
-# reference: diff, nor_gl, rough, disp, and metal where the asset has one.
-# Everything else the API offers is either a repacking of maps already here
-# ("arm" is ORM, "rough_ao" is roughness with AO baked in), the other normal
-# map convention ("nor_dx"), or has no Principled BSDF input to drive ("AO",
-# "spec", "Bump"). Downloading those as well - and then leaving them
-# unconnected - is what made one 1k texture cost 7.4MB instead of 1.9MB.
+# This is the set that drives a Principled BSDF directly, and it covers what
+# Poly Haven's own .blend materials use for the large majority of the library.
+# Of the rest the API offers, "arm" is an ORM repacking of maps already here,
+# "rough_ao" is roughness with AO baked in, and "nor_dx" is the other normal map
+# convention. "AO", "spec" and "Bump" need extra nodes to be worth anything.
+#
+# It is not a complete match for every asset: measured across the 860 published
+# textures, 114 ship a .blend referencing a map not in this table - 74 use "AO",
+# and 30 fabrics drive Anisotropic, Anisotropic Rotation and IOR from
+# "anisotropy_strength", "anisotropy_rotation" and "spec_ior". Those materials
+# come out flatter here than the artist built them.
+#
+# Downloading every map and then leaving most of them unconnected is what cost
+# 7.4MB to build a 1k material that connected 1.9MB of it. This table brings
+# that asset down to 3.9MB, all of it wired.
 POLYHAVEN_TEXTURE_MAPS = {
     "Diffuse": "base_color",
     "Rough": "roughness",
@@ -369,6 +377,18 @@ POLYHAVEN_CACHE_MAX_ENTRIES = 16
 
 _polyhaven_cache = {}
 
+# A counter rather than a clock. time.time() has ~15ms resolution on Windows, so
+# entries touched inside one burst of calls tie, and min() then evicts whichever
+# happens to come first in the dict - which can be the very entry this is
+# protecting.
+_polyhaven_cache_clock = 0
+
+
+def _polyhaven_cache_touch():
+    global _polyhaven_cache_clock
+    _polyhaven_cache_clock += 1
+    return _polyhaven_cache_clock
+
 
 def _polyhaven_cache_key(path, params):
     return path, tuple(sorted((params or {}).items()))
@@ -386,6 +406,7 @@ def _polyhaven_api_get(path, params=None, cache=False):
 
     if entry is not None:
         if time.time() - entry["fetched"] < POLYHAVEN_CACHE_TTL:
+            entry["used"] = _polyhaven_cache_touch()
             return entry["payload"]
         if entry.get("etag"):
             headers["If-None-Match"] = entry["etag"]
@@ -399,6 +420,7 @@ def _polyhaven_api_get(path, params=None, cache=False):
 
     if entry is not None and response.status_code == 304:
         entry["fetched"] = time.time()
+        entry["used"] = _polyhaven_cache_touch()
         return entry["payload"]
 
     if response.status_code >= 400:
@@ -411,12 +433,19 @@ def _polyhaven_api_get(path, params=None, cache=False):
 
     if cache:
         if len(_polyhaven_cache) >= POLYHAVEN_CACHE_MAX_ENTRIES:
-            oldest = min(_polyhaven_cache, key=lambda k: _polyhaven_cache[k]["fetched"])
-            _polyhaven_cache.pop(oldest, None)
+            # Least recently USED, not least recently fetched. Evicting on fetch
+            # time is strictly FIFO, because a hit never refreshes it - and the
+            # asset list is by construction the first thing fetched in a session
+            # and then only ever read, so it was always the first entry thrown
+            # out, displaced by one-shot search payloads a tenth of a percent its
+            # size. Its ETag went with it, so the refetch could not revalidate.
+            coldest = min(_polyhaven_cache, key=lambda k: _polyhaven_cache[k]["used"])
+            _polyhaven_cache.pop(coldest, None)
         _polyhaven_cache[key] = {
             "payload": payload,
             "etag": getattr(response, "headers", {}).get("ETag"),
             "fetched": time.time(),
+            "used": _polyhaven_cache_touch(),
         }
 
     return payload
@@ -625,20 +654,24 @@ def _polyhaven_summarize_asset(slug, record):
     return summary
 
 
-def _polyhaven_search(query, asset_type, limit):
-    """Ranked slugs from Poly Haven's search endpoint, and the match count.
+def _polyhaven_search(query, asset_type):
+    """The full ranked list of slugs from Poly Haven's search endpoint.
 
     The array order IS the ranking - it fuses a vector lane and a keyword lane
     by position - so it must not be re-sorted by `score`, which reports vector
     similarity alone.
+
+    No `limit` is sent. The endpoint returns the whole ranked list by design,
+    because callers are expected to intersect it with whatever they already
+    hold; asking for the first N and then filtering those would drop matches
+    that were simply further down.
     """
-    params = {"q": query, "limit": limit}
+    params = {"q": query}
     if asset_type and asset_type != "all":
         params["t"] = asset_type
 
     payload = _polyhaven_api_get("search", params=params, cache=True)
-    results = payload.get("results") or []
-    return [r["slug"] for r in results if r.get("slug")], payload.get("total", len(results))
+    return [r["slug"] for r in (payload.get("results") or []) if r.get("slug")]
 
 
 def _polyhaven_keyword_match(query, assets):
@@ -785,6 +818,12 @@ def _polyhaven_tag(datablocks, asset_id, resolution=None, authors=None):
                 block["polyhaven_resolution"] = resolution
             if authors:
                 block["polyhaven_authors"] = ", ".join(authors)
+            elif "polyhaven_authors" in block.keys():
+                # The lookup is best-effort and comes back empty on any API
+                # failure. Every other field is overwritten regardless, so
+                # leaving a previous asset's artist behind on a datablock that
+                # is being re-tagged would credit them for somebody else's work.
+                del block["polyhaven_authors"]
 
 #endregion
 
@@ -2442,7 +2481,8 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def search_polyhaven_assets(self, asset_type=None, categories=None, query=None, limit=None):
+    def search_polyhaven_assets(self, asset_type=None, category=None, attributes=None,
+                                query=None, limit=None):
         """Search for assets from Polyhaven with optional filtering"""
         try:
             params = {}
@@ -2452,8 +2492,26 @@ class BlenderMCPServer:
                     return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
                 params["type"] = asset_type
 
-            if categories:
-                params["categories"] = categories
+            # `category`, not `categories`. The two are different filters over
+            # different vocabularies: `categories` is the legacy flat tag list
+            # ("outdoor", "man made", "floor"), while `category` takes the
+            # single-path taxonomy that get_polyhaven_categories now returns
+            # ("Metal/Sheet & Corrugated") and matches it inclusively, so a
+            # parent selects everything beneath it. Sending a path to the legacy
+            # parameter is answered with 200 and an empty object rather than an
+            # error, so every filtered search came back silently empty.
+            if category:
+                params["category"] = category
+
+            for key, value in (attributes or {}).items():
+                if value is None or value == "":
+                    continue
+                if isinstance(value, bool):
+                    value = "true" if value else "false"
+                elif isinstance(value, (list, tuple)):
+                    # Comma-separated values are OR'd together by the API.
+                    value = ",".join(str(v) for v in value)
+                params[str(key)] = str(value)
 
             try:
                 limit = int(limit) if limit else POLYHAVEN_SEARCH_LIMIT
@@ -2461,17 +2519,25 @@ class BlenderMCPServer:
                 limit = POLYHAVEN_SEARCH_LIMIT
             limit = max(1, min(limit, POLYHAVEN_SEARCH_MAX_LIMIT))
 
-            assets = _polyhaven_api_get("assets", params=params, cache=True)
+            try:
+                assets = _polyhaven_api_get("assets", params=params, cache=True)
+            except PolyHavenAPIError as e:
+                if e.status == 400:
+                    # The category and attribute filters answer an unrecognised
+                    # value with 400 precisely so it is not a silent empty page.
+                    return {"error": "Poly Haven did not recognise that category or attribute "
+                                     "filter. Call get_polyhaven_categories for the values each "
+                                     "asset type accepts."}
+                raise
 
             # Trimmed and lower-cased so equivalent queries share a cache entry,
             # both here and at Poly Haven's edge.
             query = (query or "").strip().lower()
             note = None
-            total = len(assets)
 
             if query:
                 try:
-                    ranked, total = _polyhaven_search(query, asset_type, limit)
+                    ranked = _polyhaven_search(query, asset_type)
                 except PolyHavenAPIError as e:
                     if e.status == 429:
                         wait = f" Retry in {e.retry_after}s." if e.retry_after else ""
@@ -2482,12 +2548,14 @@ class BlenderMCPServer:
                     # The API documents a 503 as "the query could not be
                     # embedded, fall back to your own keyword matching".
                     ranked = _polyhaven_keyword_match(query, assets)
-                    total = len(ranked)
                     note = ("Poly Haven's semantic search was unavailable, so these are plain "
                             "keyword matches and the ranking is weaker than usual.")
 
-                # /search does not know about the category filter, and an asset
-                # can be published between the two responses.
+                # /search knows nothing about the category and attribute filters,
+                # so its ranking is intersected with the filtered list here. That
+                # is why the whole ranked list is asked for rather than the first
+                # `limit` of it: filtering a page that the server already cut can
+                # only shrink it, and the matches would be the ones further down.
                 ordered = [slug for slug in ranked if slug in assets]
             else:
                 # Rank before truncating. The previous order was whatever the API
@@ -2503,7 +2571,9 @@ class BlenderMCPServer:
 
             return {
                 "assets": [_polyhaven_summarize_asset(slug, assets[slug]) for slug in selected],
-                "total_count": total,
+                # Everything matching every filter, so the count and the page it
+                # heads describe the same population.
+                "total_count": len(ordered),
                 "returned_count": len(selected),
                 "query": query or None,
                 "note": note,
@@ -2605,15 +2675,17 @@ class BlenderMCPServer:
             return {"error": f"Failed to download HDRI: {str(e)}"}
 
         try:
-            # The scene's own world, not bpy.data.worlds[0]. worlds[0] is the
-            # alphabetically first world datablock, which is very often somebody
-            # else's: wiping its nodes and then making it the active world
-            # destroyed hand-built world setups, with no undo step to get them
-            # back.
-            world = bpy.context.scene.world
-            if world is None:
-                world = bpy.data.worlds.new(f"PolyHaven {asset_id}")
-                bpy.context.scene.world = world
+            # A new world every time, rather than clearing the nodes of whatever
+            # world is already there. The old code took bpy.data.worlds[0] - the
+            # alphabetically first world datablock, very often somebody else's -
+            # wiped its nodes and made it active, destroying hand-built setups
+            # with no undo step to recover them. Using the scene's own world
+            # instead would still have wiped it. This leaves the previous world
+            # intact and simply unused; without a fake user Blender clears it up
+            # on save if nothing else references it, and it is recoverable from
+            # the outliner's orphan data until then.
+            world = bpy.data.worlds.new(f"PolyHaven {asset_id}")
+            bpy.context.scene.world = world
 
             world.use_nodes = True
             node_tree = world.node_tree
@@ -2945,6 +3017,9 @@ class BlenderMCPServer:
         try:
             imported = [obj for obj in bpy.data.objects if obj.name not in before]
             imported_objects = [obj.name for obj in imported]
+            if not imported_objects:
+                return {"error": f"Imported {asset_id} but nothing arrived in the scene. "
+                                 "The .blend may not hold the collection this expects."}
 
             # Appended and glTF-imported images still reference the files in the
             # temporary directory this deletes on the way out. A .glb carries its
@@ -3058,7 +3133,8 @@ class BlenderMCPServer:
             new_mat, wired = self._polyhaven_build_material(texture_id, maps)
             new_mat.name = new_mat_name
 
-            _polyhaven_tag([new_mat], texture_id, authors=_polyhaven_authors(texture_id))
+            authors = _polyhaven_authors(texture_id)
+            _polyhaven_tag([new_mat], texture_id, authors=authors)
 
             # Note: this replaces every material slot on the object.
             replaced = len(obj.data.materials)
@@ -3080,6 +3156,7 @@ class BlenderMCPServer:
                 "material": new_mat.name,
                 "maps": wired,
                 "material_info": self._polyhaven_material_info(new_mat),
+                "authors": authors,
                 "url": _polyhaven_asset_url(texture_id),
             }
 

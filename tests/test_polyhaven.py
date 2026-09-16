@@ -152,6 +152,12 @@ class CustomPropMixin:
     def __setitem__(self, key, value):
         self.custom_properties[key] = value
 
+    def __delitem__(self, key):
+        del self.custom_properties[key]
+
+    def keys(self):
+        return self.custom_properties.keys()
+
     def __getitem__(self, key):
         return self.custom_properties[key]
 
@@ -200,6 +206,7 @@ class FakeWorld(CustomPropMixin):
     def __init__(self, name):
         self.name = name
         self.use_nodes = False
+        self.use_fake_user = False
         self.node_tree = FakeNodeTree()
         self.custom_properties = {}
 
@@ -465,6 +472,15 @@ def _texture_map(slug, name):
     payload = f"{slug}-{name}-bytes".encode()
     return {"1k": {"jpg": _file(f"{CDN}/Textures/jpg/1k/{slug}/{slug}_{name}_1k.jpg", payload)}}
 
+
+METAL_SLUG = "metal_plate"
+METAL_FILES = {
+    "Diffuse": _texture_map(METAL_SLUG, "diff"),
+    "Rough": _texture_map(METAL_SLUG, "rough"),
+    "Metal": _texture_map(METAL_SLUG, "metal"),
+    "nor_gl": _texture_map(METAL_SLUG, "nor_gl"),
+    "arm": _texture_map(METAL_SLUG, "arm"),
+}
 
 TEXTURE_SLUG = "rock_wall_10"
 TEXTURE_FILES = {
@@ -878,23 +894,31 @@ def test_hdri_image_is_packed_so_the_blend_survives_reopening(server, monkeypatc
     assert image.packed_file is not None
 
 
-def test_hdri_uses_the_scenes_own_world_and_leaves_others_alone(server, monkeypatch):
-    """bpy.data.worlds[0] is the alphabetically first world datablock, which is
-    very often somebody else's. Wiping its nodes and then making it active
-    destroyed hand-built world setups with no undo step to recover them."""
+def test_hdri_builds_a_new_world_and_wipes_nobodys(server, monkeypatch):
+    """The old code took bpy.data.worlds[0] - the alphabetically first world
+    datablock, very often somebody else's - cleared its nodes and made it
+    active, destroying hand-built setups with no undo step. Using the scene's
+    own world instead would still have wiped that one, so a new world is built
+    each time and the existing ones are left exactly as they were."""
     addon, srv = server
     _install_requests(monkeypatch, addon, files=HDRI_FILES)
 
     someone_elses = addon.bpy.data.worlds.new("Aurora Studio Setup")
     someone_elses.node_tree.nodes.new(type="ShaderNodeBackground")
     scene_world = addon.bpy.data.worlds.new("Scene World")
+    scene_world.node_tree.nodes.new(type="ShaderNodeBackground")
     addon.bpy.context.scene.world = scene_world
 
     srv.download_polyhaven_asset(HDRI_SLUG, "hdris", "1k", "hdr")
 
     assert len(someone_elses.node_tree.nodes) == 1, "an unrelated world was wiped"
-    assert addon.bpy.context.scene.world is scene_world
-    assert _node_of_type(scene_world.node_tree, "TEX_ENVIRONMENT") is not None
+    assert len(scene_world.node_tree.nodes) == 1, "the scene's own world was wiped"
+    new_world = addon.bpy.context.scene.world
+    assert new_world is not scene_world and new_world is not someone_elses
+    assert _node_of_type(new_world.node_tree, "TEX_ENVIRONMENT") is not None
+    # No fake user: Blender clears the displaced world up on save if nothing
+    # else references it, rather than accumulating one per import.
+    assert getattr(new_world, "use_fake_user", False) is False
 
 
 def test_hdri_creates_a_world_when_the_scene_has_none(server, monkeypatch):
@@ -1462,7 +1486,7 @@ def test_a_search_hit_outside_the_category_filter_is_dropped(server, monkeypatch
     _install_search(monkeypatch, addon, filtered, results=[
         ("rusty_metal", 0.69), ("metal_plate_02", 0.61)])
 
-    result = srv.search_polyhaven_assets(query="rusty metal", categories="metal")
+    result = srv.search_polyhaven_assets(query="rusty metal", category="Metal")
 
     assert [asset["id"] for asset in result["assets"]] == ["rusty_metal"]
 
@@ -1797,3 +1821,209 @@ def test_the_tool_response_says_where_the_asset_came_from():
     assert "https://polyhaven.com/a/rock_wall_10" in out
     assert "Rob Tuytel" in out
     assert "CC0" in out
+
+
+# --- what the adversarial review caught --------------------------------------
+
+def test_a_category_filter_uses_the_taxonomy_parameter_not_the_legacy_one(server, monkeypatch):
+    """`categories` and `category` are different filters over disjoint
+    vocabularies. `categories` is the legacy flat tag list ("outdoor", "floor");
+    `category` takes the single-path taxonomy get_polyhaven_categories now hands
+    out ("Metal/Sheet & Corrugated"). Measured live: ?categories=Metal returns 0
+    assets and ?category=Metal returns 26 - and the legacy filter answers an
+    unknown value with 200 and an empty object, so every filtered search came
+    back silently empty rather than erroring."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets=SEARCHABLE)
+
+    srv.search_polyhaven_assets(category="Metal/Sheet & Corrugated")
+
+    params = next(c["params"] for c in calls if c["url"].endswith("/assets"))
+    assert params.get("category") == "Metal/Sheet & Corrugated"
+    assert "categories" not in params, "the legacy flat-tag filter matches no taxonomy path"
+
+
+def test_attribute_filters_reach_the_api(server, monkeypatch):
+    """The taxonomy response advertises attributes as filters, so something has
+    to be able to send one."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets=SEARCHABLE)
+
+    srv.search_polyhaven_assets(attributes={"weather": "clear",
+                                            "material": ["wood", "metal"],
+                                            "rigged": True,
+                                            "ignored": None})
+
+    params = next(c["params"] for c in calls if c["url"].endswith("/assets"))
+    assert params["weather"] == "clear"
+    assert params["material"] == "wood,metal", "a list is OR'd with commas by the API"
+    assert params["rigged"] == "true"
+    assert "ignored" not in params
+
+
+def test_an_unrecognised_filter_is_reported_rather_than_shown_as_empty(server, monkeypatch):
+    addon, srv = server
+    _install_requests(monkeypatch, addon, assets=SEARCHABLE)
+    inner = addon.requests.get
+    monkeypatch.setattr(addon.requests, "get", lambda url, **kw: (
+        FakeResponse(status_code=400) if url.endswith("/assets") else inner(url, **kw)),
+        raising=False)
+
+    result = srv.search_polyhaven_assets(category="Not A Real Category")
+
+    assert "error" in result
+    assert "get_polyhaven_categories" in result["error"]
+
+
+def test_search_asks_for_the_whole_ranking_not_the_first_page(server, monkeypatch):
+    """/search returns the full ranked list by design, because callers are meant
+    to intersect it with what they already hold. Asking for `limit` slugs and
+    then filtering those can only shrink the page - the matches are the ones
+    further down the ranking."""
+    addon, srv = server
+    matching = {"rusty_metal": SEARCHABLE["rusty_metal"]}
+    calls = _install_search(monkeypatch, addon, matching, results=[
+        ("metal_plate_02", 0.9), ("moonless_golf", 0.8), ("rusty_metal", 0.1)])
+
+    result = srv.search_polyhaven_assets(query="rusty metal", limit=2)
+
+    search = next(c for c in calls if c["url"].endswith("/search"))
+    assert "limit" not in search["params"], "the server must not cut the list before we filter it"
+    assert [a["id"] for a in result["assets"]] == ["rusty_metal"]
+
+
+def test_total_count_describes_the_page_it_heads(server, monkeypatch):
+    """total_count used to be /search's pre-filter count in one branch and the
+    post-filter count in another, so the same field meant different things."""
+    addon, srv = server
+    matching = {"rusty_metal": SEARCHABLE["rusty_metal"],
+                "rusty_metal_03": SEARCHABLE["rusty_metal_03"]}
+    _install_search(monkeypatch, addon, matching, results=[
+        ("rusty_metal", 0.9), ("metal_plate_02", 0.8), ("rusty_metal_03", 0.7),
+        ("moonless_golf", 0.6)])
+
+    result = srv.search_polyhaven_assets(query="rusty metal", limit=1)
+
+    assert result["total_count"] == 2, "only the assets that survived every filter"
+    assert result["returned_count"] == 1
+
+
+def test_the_asset_list_outlives_one_shot_search_payloads(server, monkeypatch):
+    """Eviction by fetch time is FIFO, not LRU: a hit never refreshed it, so the
+    asset list - fetched first and then only ever read - was always the oldest
+    key and the first thing discarded, displaced by search payloads a fraction
+    of its size. Its ETag went with it, so the refetch could not revalidate."""
+    addon, srv = server
+    calls = _install_requests(monkeypatch, addon, assets=SEARCHABLE)
+
+    srv.search_polyhaven_assets(asset_type="all")
+    for i in range(addon.POLYHAVEN_CACHE_MAX_ENTRIES * 2):
+        addon._polyhaven_api_get("search", params={"q": f"one shot {i}"}, cache=True)
+        srv.search_polyhaven_assets(asset_type="all")
+
+    assert len([c for c in calls if c["url"].endswith("/assets")]) == 1
+
+
+def test_a_failed_author_lookup_does_not_leave_the_previous_artist_behind(server, monkeypatch):
+    """The lookup is best-effort and comes back empty on any API failure. Every
+    other property is overwritten regardless, so a stale name would credit one
+    artist for another's asset."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    block = addon.bpy.data.materials.new("reused")
+    addon._polyhaven_tag([block], "first_asset", "1k", ["Rob Tuytel"])
+    assert block.custom_properties["polyhaven_authors"] == "Rob Tuytel"
+
+    addon._polyhaven_tag([block], "second_asset", "1k", [])
+
+    assert block.custom_properties["polyhaven_id"] == "second_asset"
+    assert "polyhaven_authors" not in block.custom_properties
+
+
+def test_set_texture_credits_the_artist(server, monkeypatch):
+    """It looked the authors up and stamped them on the material, then omitted
+    them from the response, so the chat credit always degraded to no name."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    obj = FakeObject("Cube")
+    addon.bpy.data.objects.append(obj)
+
+    result = srv.set_texture("Cube", TEXTURE_SLUG)
+
+    assert result.get("success"), result
+    assert result["authors"] == ["Rob Tuytel"]
+
+
+def test_the_metallic_map_is_connected(server, monkeypatch):
+    """No fixture contained a Metal key, so `elif role == "metallic"` was never
+    executed by any test - and a wrong socket name there aborts the whole
+    material build rather than degrading it."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=METAL_FILES)
+
+    result = srv.download_polyhaven_asset(METAL_SLUG, "textures", "1k", "jpg")
+    material = _material(addon, result)
+
+    link = _link_into(material.node_tree, _node_of_type(material.node_tree, "BSDF_PRINCIPLED"),
+                      "Metallic")
+    assert link is not None, "the Metal map was downloaded but never connected"
+    assert link.from_node.image.get("polyhaven_map") == "Metal"
+
+
+def test_an_append_that_lands_nothing_is_an_error(server, monkeypatch):
+    """Reporting success with an empty object list leaves the model believing a
+    model is in the scene when nothing is."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=MODEL_FILES)
+    addon.bpy.data.libraries.contents = {"collections": {}, "objects": []}
+
+    result = srv.download_polyhaven_asset(MODEL_SLUG, "models", "1k", "blend")
+
+    assert "error" in result
+    assert "nothing arrived" in result["error"]
+
+
+def test_a_zstd_compressed_blend_header_is_read(server, tmp_path):
+    """Blender has written zstd since 3.0, so every published model uses it -
+    only the gzip path had coverage."""
+    zstandard = pytest.importorskip("zstandard")
+
+    addon, _srv = server
+    path = tmp_path / "zstd.blend"
+    path.write_bytes(zstandard.ZstdCompressor().compress(_blend_bytes(BLEND_HEADER_500)))
+
+    assert addon._polyhaven_blend_version(str(path)) == (5, 0)
+
+
+def test_a_models_three_axis_size_is_reported_in_full():
+    """dimensions is [W, H] on a texture and [X, Y, Z] on a model. Slicing [:2]
+    dropped a model's actual height and printed its depth as one - ArmChair_01
+    is [848, 766, 1065] mm and rendered as "0.85m x 0.77m"."""
+    import asyncio
+
+    from blender_mcp import server
+
+    class FakeBlender:
+        def send_command(self, command, params=None):
+            if command == "get_polyhaven_status":
+                return {"enabled": True}
+            return {"assets": [
+                {"id": "ArmChair_01", "name": "Arm Chair 01", "type": "models",
+                 "url": "https://polyhaven.com/a/ArmChair_01", "authors": ["Kirill Sannikov"],
+                 "downloads": 1, "dimensions_mm": [848.43, 765.76, 1065.09]},
+                {"id": "rusty_metal", "name": "Rusty Metal", "type": "textures",
+                 "url": "https://polyhaven.com/a/rusty_metal", "authors": [],
+                 "downloads": 1, "dimensions_mm": [1000, 1000]},
+            ], "total_count": 2, "returned_count": 2, "query": None, "note": None}
+
+    original = server.get_blender_connection
+    server.get_blender_connection = lambda: FakeBlender()
+    try:
+        out = asyncio.run(server.search_polyhaven_assets(None, query="chair", user_prompt=""))
+    finally:
+        server.get_blender_connection = original
+
+    assert "0.84843m x 0.76576m x 1.06509m (W x D x H)" in out
+    assert "1m x 1m" in out, "a texture keeps its two-axis form"

@@ -600,20 +600,25 @@ works in any language. It can then check the thumbnail with
 `get_polyhaven_asset_preview(asset_id="...")` before spending the bandwidth, and import
 with `download_polyhaven_asset(...)`.
 
-`get_polyhaven_categories(asset_type="textures")` returns the category tree and the
-attributes each type can be filtered on - `time_of_day`, `weather` and `season` for HDRIs,
-`surface_use` and `condition` for textures, `material`, `rigged` and `lods` for models.
+`get_polyhaven_categories(asset_type="textures")` returns the category tree and every
+attribute that type can be filtered on, each with the values it accepts - weather and time
+of day for HDRIs, surface use and condition for textures, material and whether a model is
+rigged or ships level-of-detail variants. Pass a category path or those attributes to
+`search_polyhaven_assets`; matching on a category is inclusive, so a parent selects
+everything nested beneath it.
 
 Models are imported from the `.blend`, which is the file the artist authored - the glTF,
 FBX and USD versions are generated from it and lose material detail. Textures build a
-Principled material from the maps the asset actually uses, and skip the ones it does not.
-HDRIs are packed into the file, so the lighting survives being saved and reopened
-somewhere else.
+Principled material from the maps that drive it, and skip the repackings and alternate
+conventions that nothing reads. HDRIs are packed into the file, so the lighting survives
+being saved and reopened somewhere else, and arrive in a new world rather than overwriting
+one you built.
 
 **Licence and attribution:** every Poly Haven asset is CC0. You never have to credit
-anyone, for anything, commercial or not. Their [API terms](https://api.polyhaven.com) do
-ask that software built on the live API makes clear where the assets come from, so the
-tool responses name the source and link the asset's page. On import, `polyhaven_id`,
+anyone, for anything, commercial or not. Their
+[API terms](https://github.com/Poly-Haven/Public-API/blob/master/ToS.md) do ask that
+software built on the live API makes clear where the assets come from, so the search and
+import responses name the source and link the asset's page. On import, `polyhaven_id`,
 `polyhaven_url`, `polyhaven_authors`, `polyhaven_resolution` and `polyhaven_licence` are
 written onto the imported objects, materials, images and world as custom properties, so
 whoever opens the `.blend` later can still find the asset and the artist who made it.
