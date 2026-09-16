@@ -2029,3 +2029,24 @@ def test_a_models_three_axis_size_is_reported_in_full():
 
     assert "0.84843m x 0.76576m x 1.06509m (W x D x H)" in out
     assert "1m x 1m" in out, "a texture keeps its two-axis form"
+
+
+# --- what the texture is, in metres -------------------------------------------
+
+def test_the_mapping_node_is_left_in_blenders_default_point_mode(server, monkeypatch):
+    """POINT scales the coordinate; TEXTURE inverse-maps it. They are exact
+    opposites, so on a TEXTURE node the obvious arithmetic - Scale = surface
+    size / texture size - tiles by its reciprocal, and a 2m texture asked to
+    repeat twice repeated half a time. Poly Haven authors the Mapping node
+    inside its own published .blend files at POINT and its real-world-scale
+    operator solves for a Scale that grows with the surface, so this is the
+    convention the assets were made for."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    material = _material(addon, result)
+
+    mapping = _node_of_type(material.node_tree, "MAPPING")
+    assert mapping is not None
+    assert mapping.vector_type == "POINT"

@@ -2772,7 +2772,16 @@ class BlenderMCPServer:
 
         mapping = nodes.new(type='ShaderNodeMapping')
         mapping.location = (-800, 0)
-        mapping.vector_type = 'TEXTURE'
+        # POINT is Blender's default and the mode Poly Haven authors its own
+        # materials in - the Mapping node published inside every texture .blend
+        # is left at POINT, and the add-on's real-world-scale operator solves for
+        # a Scale that grows as the surface grows. TEXTURE is its exact inverse
+        # ("transform a texture by inverse mapping the texture coordinate"), so
+        # the natural arithmetic - Scale = surface size / texture size - came out
+        # upside down, and a 2m texture asked to repeat twice repeated half a
+        # time instead. At Scale 1.0 the two modes are identical, so this moves
+        # nothing that was not already inverted.
+        mapping.vector_type = 'POINT'
         links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
 
         y_pos = 300
