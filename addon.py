@@ -2856,11 +2856,11 @@ class BlenderMCPServer:
         try:
             mat, wired = self._polyhaven_build_material(asset_id, maps)
 
-            # A material with no users is purged the next time the file is
-            # saved and reopened, taking its packed images with it. This tool
-            # only downloads - set_texture is what applies it to an object - so
-            # a fake user is what keeps it alive in between.
-            mat.use_fake_user = True
+            # Deliberately no fake user. A material nothing has been applied to
+            # is not being used, and Blender discarding it on save is the
+            # correct outcome rather than a leak to guard against - the same
+            # reasoning as the world this no longer keeps alive either. Call
+            # set_texture to give it a real user.
 
             authors = _polyhaven_authors(asset_id)
             _polyhaven_tag(

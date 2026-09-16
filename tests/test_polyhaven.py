@@ -840,15 +840,17 @@ def test_only_the_albedo_is_treated_as_colour(server, monkeypatch):
 
 # --- the material has to survive a save --------------------------------------
 
-def test_material_is_kept_alive_by_a_fake_user(server, monkeypatch):
-    """A material with no users is purged the next time the file is saved and
-    reopened, taking its packed images with it - and the tool reported success."""
+def test_a_downloaded_material_is_not_given_a_fake_user(server, monkeypatch):
+    """A material nothing has been applied to is not in use, so Blender
+    discarding it on save is the right outcome. Pinning it with a fake user
+    would keep every downloaded-but-unused texture, and its packed images, in
+    the file forever - 24MB apiece at 4k, invisible to whoever saved it."""
     addon, srv = server
     _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
 
     result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
 
-    assert _material(addon, result).use_fake_user is True
+    assert _material(addon, result).use_fake_user is False
 
 
 def test_texture_images_are_packed(server, monkeypatch):

@@ -995,8 +995,9 @@ async def download_polyhaven_asset(
                 maps = ", ".join(result.get("maps", []))
                 message = (
                     f"{message}. Created material '{material_name}' with maps: {maps}. "
-                    "It carries a fake user so it survives saving before anything uses it; "
-                    "call set_texture to apply it to an object."
+                    "Nothing is using it yet - call set_texture to apply it to an object. "
+                    "Saving the file before then discards it, as Blender does with any "
+                    "unused datablock, and it would have to be downloaded again."
                 )
             elif asset_type == "models":
                 message = f"{message}. The model has been imported into the current scene."
