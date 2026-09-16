@@ -748,6 +748,31 @@ def _polyhaven_credit(result):
     return f"From Poly Haven{by} - {url} (CC0, free to use for anything)."
 
 
+def _polyhaven_scale_note(result):
+    """How to tile the material that was just built, in the units it was authored in.
+
+    Poly Haven publishes a real-world size for every texture, but until now it
+    appeared once in a search result and never again - so a material was applied
+    with whatever tiling the object's UVs happened to give it, which for a 0.5m
+    plank texture on a 6m beam is twelve visible repeats. Saying it here, beside
+    the node that consumes it, is the difference between the size being a fact
+    and it being a decision.
+    """
+    size = result.get("scale_mm")
+    node = result.get("mapping_node")
+    if not size or len(size) != 2 or not node:
+        return ""
+
+    width, height = (value / 1000 for value in size)
+    return (
+        f" The texture covers {width:g}m x {height:g}m in the real world. Its "
+        f"'{node}' node is in POINT mode, where Scale multiplies the UV "
+        f"coordinates: the pattern repeats Scale times across whatever span the "
+        f"UVs cover. For UVs that run 0-1 across a surface, life-sized tiling is "
+        f"Scale = surface size in metres / {width:g}."
+    )
+
+
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
@@ -836,6 +861,13 @@ async def search_polyhaven_assets(
     Results are returned in ranked order, most relevant first. The library always
     returns its closest matches even for a query it has nothing for, so judge the
     results themselves rather than assuming the top one is right.
+
+    Two things worth reading in the results before picking one. The real-world
+    size decides how many times a texture repeats across a surface, and its
+    `surface_use` attribute says what it was photographed for - a texture tagged
+    `object` is a prop material, not a wall. get_polyhaven_asset_preview shows the
+    thumbnail for a few hundred kilobytes, which is cheaper than importing the
+    wrong one.
 
     Returns each asset's id, name, type, author, category, tags and page URL.
     """
@@ -998,6 +1030,7 @@ async def download_polyhaven_asset(
                     "Nothing is using it yet - call set_texture to apply it to an object. "
                     "Saving the file before then discards it, as Blender does with any "
                     "unused datablock, and it would have to be downloaded again."
+                    f"{_polyhaven_scale_note(result)}"
                 )
             elif asset_type == "models":
                 message = f"{message}. The model has been imported into the current scene."

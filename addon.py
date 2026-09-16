@@ -792,7 +792,31 @@ def _polyhaven_authors(asset_id):
     return []
 
 
-def _polyhaven_tag(datablocks, asset_id, resolution=None, authors=None):
+def _polyhaven_dimensions_mm(asset_id):
+    """A texture's real-world size in millimetres. Best effort, like the authors.
+
+    Read from the record _polyhaven_authors has already fetched, so it costs no
+    extra request. Length two means a texture: a model's `dimensions` is a
+    bounding box, which is a different measurement and is readable from the
+    object itself once it is in the scene.
+    """
+    with suppress(Exception):
+        dimensions = _polyhaven_asset_record(asset_id).get("dimensions")
+        if isinstance(dimensions, (list, tuple)) and len(dimensions) == 2:
+            return [float(value) for value in dimensions]
+    return None
+
+
+def _polyhaven_mapping_node(node_tree):
+    """The node every image node's Vector input is routed through, if it is still there."""
+    with suppress(Exception):
+        for node in node_tree.nodes:
+            if node.type == 'MAPPING':
+                return node
+    return None
+
+
+def _polyhaven_tag(datablocks, asset_id, resolution=None, authors=None, dimensions=None):
     """Record where a datablock came from, in the file that keeps it.
 
     Two jobs. It is the lookup key between downloading a texture and applying
@@ -824,6 +848,14 @@ def _polyhaven_tag(datablocks, asset_id, resolution=None, authors=None):
                 # leaving a previous asset's artist behind on a datablock that
                 # is being re-tagged would credit them for somebody else's work.
                 del block["polyhaven_authors"]
+            # The texture's real-world size, the same measurement Poly Haven's
+            # own add-on writes onto the materials it ships. Saved into the
+            # .blend because tiling cannot be worked out without it and it is
+            # otherwise visible exactly once, in a search result.
+            if dimensions:
+                block["polyhaven_scale_mm"] = list(dimensions)
+            elif "polyhaven_scale_mm" in block.keys():
+                del block["polyhaven_scale_mm"]
 
 #endregion
 
@@ -2872,17 +2904,20 @@ class BlenderMCPServer:
             # set_texture to give it a real user.
 
             authors = _polyhaven_authors(asset_id)
+            dimensions = _polyhaven_dimensions_mm(asset_id)
             _polyhaven_tag(
                 [mat] + [image for _role, image in maps.values()],
                 asset_id,
                 resolution=resolution,
                 authors=authors,
+                dimensions=dimensions,
             )
             for map_key, (role, image) in maps.items():
                 with suppress(Exception):
                     image["polyhaven_map"] = map_key
                     image["polyhaven_role"] = role
 
+            mapping = _polyhaven_mapping_node(mat.node_tree)
             return {
                 "success": True,
                 "message": f"Texture {asset_id} imported as material",
@@ -2890,6 +2925,11 @@ class BlenderMCPServer:
                 "maps": wired,
                 "authors": authors,
                 "url": _polyhaven_asset_url(asset_id),
+                # What the material has to be told before it is applied to
+                # anything, reported next to the material itself rather than
+                # left in a search result several steps back.
+                "scale_mm": dimensions,
+                "mapping_node": None if mapping is None else mapping.name,
             }
         except Exception as e:
             traceback.print_exc()
@@ -3082,10 +3122,20 @@ class BlenderMCPServer:
                 "connections": connections,
             })
 
+        # Every image node's Vector input comes from here, so this is the one
+        # node that decides the tiling - and it could not appear in this report,
+        # which described TEX_IMAGE nodes and nothing else.
+        mapping = _polyhaven_mapping_node(mat.node_tree)
+
         return {
             "has_nodes": mat.use_nodes,
             "node_count": len(mat.node_tree.nodes),
             "texture_nodes": texture_nodes,
+            "mapping_node": None if mapping is None else {
+                "name": mapping.name,
+                "vector_type": mapping.vector_type,
+                "scale": list(mapping.inputs['Scale'].default_value),
+            },
         }
 
     def set_texture(self, object_name, texture_id):
@@ -3143,7 +3193,8 @@ class BlenderMCPServer:
             new_mat.name = new_mat_name
 
             authors = _polyhaven_authors(texture_id)
-            _polyhaven_tag([new_mat], texture_id, authors=authors)
+            _polyhaven_tag([new_mat], texture_id, authors=authors,
+                           dimensions=_polyhaven_dimensions_mm(texture_id))
 
             # Note: this replaces every material slot on the object.
             replaced = len(obj.data.materials)

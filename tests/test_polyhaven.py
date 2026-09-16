@@ -54,6 +54,31 @@ NODE_INPUTS = {
     "ShaderNodeOutputWorld": ["Surface", "Volume"],
 }
 
+# Blender names a new node after its UI label, not its bl_idname, and that
+# name is what the add-on reports back to the caller - "Mapping", the node the
+# user is being told to set a Scale on.
+NODE_NAMES = {
+    "ShaderNodeOutputMaterial": "Material Output",
+    "ShaderNodeBsdfPrincipled": "Principled BSDF",
+    "ShaderNodeTexCoord": "Texture Coordinate",
+    "ShaderNodeMapping": "Mapping",
+    "ShaderNodeTexImage": "Image Texture",
+    "ShaderNodeNormalMap": "Normal Map",
+    "ShaderNodeDisplacement": "Displacement",
+    "ShaderNodeTexEnvironment": "Environment Texture",
+    "ShaderNodeBackground": "Background",
+    "ShaderNodeOutputWorld": "World Output",
+}
+
+# Vector sockets hold three floats, not None, and a Mapping node's Scale starts
+# at 1 on every axis - the identity, and the reason POINT and TEXTURE look the
+# same until something writes to it.
+SOCKET_DEFAULTS = {
+    "Scale": [1.0, 1.0, 1.0],
+    "Location": [0.0, 0.0, 0.0],
+    "Rotation": [0.0, 0.0, 0.0],
+}
+
 NODE_OUTPUTS = {
     "ShaderNodeBsdfPrincipled": ["BSDF"],
     "ShaderNodeTexCoord": ["Generated", "Normal", "UV", "Object", "Camera", "Window"],
@@ -74,7 +99,8 @@ class FakeSocket:
     def __init__(self, node, name):
         self.node = node
         self.name = name
-        self.default_value = None
+        default = SOCKET_DEFAULTS.get(name)
+        self.default_value = list(default) if default is not None else None
 
 
 class FakeSocketCollection:
@@ -82,6 +108,9 @@ class FakeSocketCollection:
         self.node = node
         self._order = list(names)
         self._sockets = {name: FakeSocket(node, name) for name in names}
+
+    def get(self, key, default=None):
+        return self._sockets.get(key, default)
 
     def __getitem__(self, key):
         if isinstance(key, int):
@@ -104,7 +133,7 @@ class FakeNode:
     def __init__(self, bl_idname):
         self.bl_idname = bl_idname
         self.type = NODE_TYPES.get(bl_idname, "UNKNOWN")
-        self.name = bl_idname
+        self.name = NODE_NAMES.get(bl_idname, bl_idname)
         self.location = (0, 0)
         self.image = None
         self.vector_type = "POINT"
@@ -123,6 +152,11 @@ class FakeLink:
 class FakeNodes(list):
     def new(self, type=None):
         node = FakeNode(type)
+        # Node names are unique within a tree; Blender suffixes the clashes.
+        taken = {existing.name for existing in self}
+        if node.name in taken:
+            node.name = next(f"{node.name}.{n:03d}" for n in range(1, 1000)
+                             if f"{node.name}.{n:03d}" not in taken)
         self.append(node)
         return node
 
@@ -608,7 +642,8 @@ HOSTILE_MODEL_FILES = {
     ]),
 }
 
-INFO = {"authors": {"Rob Tuytel": "All"}, "name": "Rock Wall 10"}
+INFO = {"authors": {"Rob Tuytel": "All"}, "name": "Rock Wall 10",
+        "dimensions": [2000, 2000]}
 
 
 ASSETS_ETAG = 'W/"a1b2c3"'
@@ -2050,3 +2085,130 @@ def test_the_mapping_node_is_left_in_blenders_default_point_mode(server, monkeyp
     mapping = _node_of_type(material.node_tree, "MAPPING")
     assert mapping is not None
     assert mapping.vector_type == "POINT"
+
+
+def test_a_textures_real_world_size_is_saved_into_the_file(server, monkeypatch):
+    """Published for every texture, and until now visible exactly once - in a
+    search result, several steps before the material is applied to anything.
+    Saved onto the datablocks, it survives into the .blend, the same way Poly
+    Haven's own add-on writes it onto the materials it ships."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    material = _material(addon, result)
+
+    assert material.custom_properties["polyhaven_scale_mm"] == [2000.0, 2000.0]
+    image = next(img for img in addon.bpy.data.images
+                 if img.get("polyhaven_id") == TEXTURE_SLUG)
+    assert image.custom_properties["polyhaven_scale_mm"] == [2000.0, 2000.0]
+
+
+def test_a_models_bounding_box_is_not_written_as_a_texture_scale(server, monkeypatch):
+    """`dimensions` is two numbers on a texture and three on a model, where it
+    is a bounding box - a different measurement, and readable from the object
+    itself once it is in the scene."""
+    addon, _srv = server
+    _install_requests(monkeypatch, addon, info={"authors": {}, "name": "Arm Chair",
+                                                "dimensions": [848, 766, 1065]})
+
+    assert addon._polyhaven_dimensions_mm("ArmChair_01") is None
+
+
+def test_a_re_tagged_datablock_does_not_keep_the_previous_textures_size(server, monkeypatch):
+    """The same trap as the authors: every other field is overwritten, so a
+    stale size left behind would describe one texture while the material holds
+    another, and the tiling would be wrong in a way nothing could explain."""
+    addon, _srv = server
+    _install_requests(monkeypatch, addon)
+
+    block = addon.bpy.data.materials.new("reused")
+    addon._polyhaven_tag([block], "first_asset", dimensions=[500.0, 500.0])
+    assert block.custom_properties["polyhaven_scale_mm"] == [500.0, 500.0]
+
+    addon._polyhaven_tag([block], "second_asset", dimensions=None)
+
+    assert "polyhaven_scale_mm" not in block.custom_properties
+
+
+def test_the_download_response_names_the_size_and_the_node_that_consumes_it(server, monkeypatch):
+    """A material arrives with no indication of how big it is or which node
+    decides that, so it gets applied at whatever tiling the object's UVs happen
+    to give it."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+
+    result = srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+
+    assert result["scale_mm"] == [2000.0, 2000.0]
+    assert result["mapping_node"] == "Mapping"
+
+
+def test_set_texture_reports_the_node_that_decides_the_tiling(server, monkeypatch):
+    """material_info described TEX_IMAGE nodes and nothing else, so the one node
+    every image is routed through - and the only one worth touching afterwards -
+    could not appear in its own report."""
+    addon, srv = server
+    _install_requests(monkeypatch, addon, files=TEXTURE_FILES)
+    srv.download_polyhaven_asset(TEXTURE_SLUG, "textures", "1k", "jpg")
+    addon.bpy.data.objects.append(FakeObject("Cube"))
+
+    info = srv.set_texture("Cube", TEXTURE_SLUG)["material_info"]
+
+    assert info["mapping_node"] == {
+        "name": "Mapping", "vector_type": "POINT", "scale": [1.0, 1.0, 1.0]}
+
+
+def test_the_download_message_says_how_big_the_texture_is_and_how_to_tile_it():
+    """The text the model reads immediately before it writes the material code."""
+    import asyncio
+
+    from blender_mcp import server
+
+    class FakeBlender:
+        def send_command(self, command, params=None):
+            if command == "get_polyhaven_status":
+                return {"enabled": True}
+            return {"success": True, "message": "Texture wooden_planks imported as material",
+                    "material": "wooden_planks", "maps": ["Diffuse"],
+                    "authors": ["Rob Tuytel"], "url": "https://polyhaven.com/a/wooden_planks",
+                    "scale_mm": [2000.0, 2000.0], "mapping_node": "Mapping"}
+
+    original = server.get_blender_connection
+    server.get_blender_connection = lambda: FakeBlender()
+    try:
+        out = asyncio.run(server.download_polyhaven_asset(
+            None, "wooden_planks", "textures", user_prompt=""))
+    finally:
+        server.get_blender_connection = original
+
+    assert "2m x 2m in the real world" in out
+    assert "'Mapping' node is in POINT mode" in out
+    assert "surface size in metres / 2" in out
+
+
+def test_a_texture_with_no_published_size_says_nothing_about_tiling():
+    """Rather than printing an empty measurement with authoritative wording."""
+    import asyncio
+
+    from blender_mcp import server
+
+    class FakeBlender:
+        def send_command(self, command, params=None):
+            if command == "get_polyhaven_status":
+                return {"enabled": True}
+            return {"success": True, "message": "Texture x imported as material",
+                    "material": "x", "maps": ["Diffuse"], "authors": [],
+                    "url": "https://polyhaven.com/a/x",
+                    "scale_mm": None, "mapping_node": "Mapping"}
+
+    original = server.get_blender_connection
+    server.get_blender_connection = lambda: FakeBlender()
+    try:
+        out = asyncio.run(server.download_polyhaven_asset(None, "x", "textures", user_prompt=""))
+    finally:
+        server.get_blender_connection = original
+
+    assert "Created material 'x'" in out, "the import still has to be reported"
+    assert "real world" not in out
+    assert "POINT" not in out
