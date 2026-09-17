@@ -20,7 +20,7 @@ from pathlib import Path
 logger = logging.getLogger("BlenderMCPServer")
 
 # Must match ADDON_PROTOCOL_VERSION in addon.py / bundled/addon.py
-EXPECTED_ADDON_PROTOCOL_VERSION = 7
+EXPECTED_ADDON_PROTOCOL_VERSION = 9
 
 _ADDON_MARKER = 'bl_info = {\n    "name": "MCP for Blender"'
 _INSTALLED_FILENAME = "blender_mcp.py"

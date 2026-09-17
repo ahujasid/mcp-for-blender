@@ -564,7 +564,7 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Execute any Python code in Blender
 - Export the scene, the selection or named objects to GLB/FBX for other applications (`export_scene`)
 - Look up node schemas and the bpy API reference instead of guessing socket order or enum names
-- Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
+- Search and download free CC0 HDRIs, textures and models from [Poly Haven](https://polyhaven.com/)
 - Search and download models from [Sketchfab](https://sketchfab.com/)
 - Search and download low-poly models from [Poly Pizza](https://poly.pizza/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/) and [Hunyuan3D](https://3d.hunyuan.tencent.com/)
@@ -581,6 +581,47 @@ Which Tencent Cloud service the addon must call depends on where your account li
 International credentials sent to the mainland endpoint fail with `AuthFailure.SignatureFailure` or
 `ResourceUnavailable`, so tick the toggle when your SecretId/SecretKey come from tencentcloud.com.
 The toggle sits under **Tencent Hunyuan 3D → Official API** in the sidebar.
+
+#### Poly Haven
+
+[Poly Haven](https://polyhaven.com/) publishes around 2,400 HDRIs, textures and models,
+all CC0 and free, funded by donations rather than by selling the assets. There is no API
+key, no account and no rate limit worth worrying about.
+
+In the 3D View sidebar, tick **Poly Haven**. That is the whole setup.
+
+Worked example:
+
+> *"Light the scene with an overcast afternoon HDRI and put a rusty metal texture on the wall"*
+
+Claude calls `search_polyhaven_assets(query="overcast afternoon", asset_type="hdris")`,
+which understands the intent rather than matching keywords - "couch" finds sofas, and it
+works in any language. It can then check the thumbnail with
+`get_polyhaven_asset_preview(asset_id="...")` before spending the bandwidth, and import
+with `download_polyhaven_asset(...)`.
+
+`get_polyhaven_categories(asset_type="textures")` returns the category tree and every
+attribute that type can be filtered on, each with the values it accepts - weather and time
+of day for HDRIs, surface use and condition for textures, material and whether a model is
+rigged or ships level-of-detail variants. Pass a category path or those attributes to
+`search_polyhaven_assets`; matching on a category is inclusive, so a parent selects
+everything nested beneath it.
+
+Models are imported from the `.blend`, which is the file the artist authored - the glTF,
+FBX and USD versions are generated from it and lose material detail. Textures build a
+Principled material from the maps that drive it, and skip the repackings and alternate
+conventions that nothing reads. HDRIs are packed into the file, so the lighting survives
+being saved and reopened somewhere else, and arrive in a new world rather than overwriting
+one you built.
+
+**Licence and attribution:** every Poly Haven asset is CC0. You never have to credit
+anyone, for anything, commercial or not. Their
+[API terms](https://github.com/Poly-Haven/Public-API/blob/master/ToS.md) do ask that
+software built on the live API makes clear where the assets come from, so the search and
+import responses name the source and link the asset's page. On import, `polyhaven_id`,
+`polyhaven_url`, `polyhaven_authors`, `polyhaven_resolution` and `polyhaven_licence` are
+written onto the imported objects, materials, images and world as custom properties, so
+whoever opens the `.blend` later can still find the asset and the artist who made it.
 
 #### Poly Pizza
 
@@ -664,7 +705,7 @@ For headless setups or CI, credentials can also be injected by environment varia
 |---|---|
 | **Connection issues** | Make sure the Blender addon server is running, and the MCP server is configured on Claude. **Do not** run the `uvx` command in the terminal. Sometimes the first command won't go through, but after that it starts working. |
 | **Timeout errors** | Try simplifying your requests or breaking them into smaller steps. |
-| **Poly Haven integration** | Claude is sometimes erratic with its behaviour. |
+| **Blender freezes during a Poly Haven download** | Assets are downloaded on Blender's main thread, so the UI stops responding until the transfer finishes. File size grows roughly fourfold per resolution step, so ask for 1k or 2k unless the asset is held close to camera. |
 | **Poly Pizza download fails with a Cloudflare challenge** | `static.poly.pizza` is behind bot protection and blocks datacenter, VPN and cloud IPs. Your API key is fine - the CDN never sees it. Retry from a normal connection, or download the `.glb` by hand and use **File → Import → glTF 2.0**. |
 | **Have you tried turning it off and on again?** | If you're still having connection errors, try restarting both Claude and the Blender server. |
 

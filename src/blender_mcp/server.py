@@ -735,14 +735,62 @@ async def bpy_api_lookup(ctx: Context, query: str, user_prompt: str = "") -> str
         return f"Error looking up '{query}': {str(e)}"
 
 
+def _polyhaven_credit(result):
+    """A source line for an imported asset.
+
+    Poly Haven's assets are CC0 and need no attribution, ever. Its API asks that
+    software built on the live API makes clear to its users where the content
+    comes from, and in an MCP client the chat is the surface they actually see.
+    """
+    authors = ", ".join(result.get("authors") or [])
+    by = f" by {authors}" if authors else ""
+    url = result.get("url") or "https://polyhaven.com"
+    return f"From Poly Haven{by} - {url} (CC0, free to use for anything)."
+
+
+def _polyhaven_scale_note(result):
+    """How to tile the material that was just built, in the units it was authored in.
+
+    Poly Haven publishes a real-world size for every texture, but until now it
+    appeared once in a search result and never again - so a material was applied
+    with whatever tiling the object's UVs happened to give it, which for a 0.5m
+    plank texture on a 6m beam is twelve visible repeats. Saying it here, beside
+    the node that consumes it, is the difference between the size being a fact
+    and it being a decision.
+    """
+    size = result.get("scale_mm")
+    node = result.get("mapping_node")
+    if not size or len(size) != 2 or not node:
+        return ""
+
+    width, height = (value / 1000 for value in size)
+    return (
+        f" The texture covers {width:g}m x {height:g}m in the real world. Its "
+        f"'{node}' node is in POINT mode, where Scale multiplies the UV "
+        f"coordinates: the pattern repeats Scale times across whatever span the "
+        f"UVs cover. For UVs that run 0-1 across a surface, life-sized tiling is "
+        f"Scale = surface size in metres / {width:g}."
+    )
+
+
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
     """
-    Get a list of categories for a specific asset type on Polyhaven.
+    Get the categories and attributes you can filter Poly Haven assets by.
+
+    Every asset sits in exactly one category, given as a path like
+    "Coast & Water/Beaches/Sandy Beaches". Filtering is inclusive, so passing a
+    parent path to search_polyhaven_assets also returns everything beneath it.
+
+    Categories describe what an asset IS. Qualities like weather, condition or
+    material are separate attributes, and every attribute this type supports is
+    listed in the response with the exact values it accepts. Pass those to
+    search_polyhaven_assets's `attributes`.
 
     Parameters:
-    - asset_type: The type of asset to get categories for (hdris, textures, models, all)
+    - asset_type: hdris, textures, models, or all. Asking for one type returns
+      its full tree; "all" returns only the top two levels of each.
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
     """
     try:
@@ -751,76 +799,192 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
         if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
-        
+
         if "error" in result:
             return f"Error: {result['error']}"
-        
-        # Format the categories in a more readable way
-        categories = result["categories"]
-        formatted_output = f"Categories for {asset_type}:\n\n"
-        
-        # Sort categories by count (descending)
-        sorted_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)
-        
-        for category, count in sorted_categories:
-            formatted_output += f"- {category}: {count} assets\n"
-        
-        return formatted_output
+
+        lines = []
+        for taxonomy in result["taxonomy"]:
+            lines.append(f"{taxonomy['type']} categories:")
+            for path in taxonomy["categories"]:
+                lines.append(f"  {path}")
+            if result.get("truncated"):
+                lines.append("  (top two levels only - ask for a single asset type for the rest)")
+            lines.append("")
+
+            if taxonomy["attributes"]:
+                lines.append(f"{taxonomy['type']} attributes:")
+                for key, spec in taxonomy["attributes"].items():
+                    values = spec.get("enum")
+                    allowed = ", ".join(values) if values else spec.get("type", "")
+                    lines.append(f"  {key}: {allowed}")
+                    if spec.get("description"):
+                        lines.append(f"    {spec['description']}")
+                lines.append("")
+
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error getting Polyhaven categories: {str(e)}")
         return f"Error getting Polyhaven categories: {str(e)}"
-
 @mcp.tool()
 @telemetry_tool("search_polyhaven_assets")
 async def search_polyhaven_assets(
     ctx: Context,
+    query: str = None,
     asset_type: str = "all",
-    categories: str = None,
+    category: str = None,
+    attributes: dict = None,
+    min_size_m: float = None,
+    limit: int = 20,
     user_prompt: str = ""
 ) -> str:
     """
-    Search for assets on Polyhaven with optional filtering.
+    Search Poly Haven's library of free CC0 HDRIs, textures and models.
 
     Parameters:
-    - asset_type: Type of assets to search for (hdris, textures, models, all)
-    - categories: Optional comma-separated list of categories to filter by
+    - query: What you are looking for, in plain words ("rusty metal", "overcast
+      afternoon", "wooden chair"). Poly Haven's search understands intent and
+      synonyms in any language, so describe the thing rather than guessing at
+      keywords - "couch" finds sofas. Leave it out to browse the most downloaded
+      assets instead.
+    - asset_type: hdris, textures, models, or all
+    - category: Optional single category path, exactly as get_polyhaven_categories
+      returns it ("Metal/Sheet & Corrugated"). Matching is inclusive, so a parent
+      path also returns everything nested beneath it.
+    - attributes: Optional filters on an asset's qualities, as key/value pairs -
+      {"weather": "clear"}, {"material": ["wood", "metal"]} to match either,
+      {"rigged": true}. Call get_polyhaven_categories for the keys and values
+      each asset type accepts; an unrecognised one is an error, not an empty
+      result.
+    - min_size_m: Optional floor on an asset's real-world size, in metres. A
+      texture covers a fixed real-world area, so a 0.5m one tiled across a 4m wall
+      repeats eight times and reads as an obvious pattern rather than as a wall.
+      Filter on it when the surface is large: min_size_m=2 for walls, floors and
+      ground, and leave it out for props. Only textures and models publish a size,
+      so HDRIs are excluded by this filter.
+    - limit: How many results to return (default 20, maximum 50)
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
-    Returns a list of matching assets with basic information.
+    Results are returned in ranked order, most relevant first. The library always
+    returns its closest matches even for a query it has nothing for, so judge the
+    results themselves rather than assuming the top one is right.
+
+    Two things worth reading in the results before picking one. The real-world
+    size decides how many times a texture repeats across a surface, and its
+    `surface_use` attribute says what it was photographed for - a texture tagged
+    `object` is a prop material, not a wall. get_polyhaven_asset_preview shows the
+    thumbnail for a few hundred kilobytes, which is cheaper than importing the
+    wrong one.
+
+    Returns each asset's id, name, type, author, category, tags and page URL.
     """
     try:
         blender = get_blender_connection()
         result = blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
-            "categories": categories
+            "category": category,
+            "attributes": attributes,
+            "query": query,
+            "limit": limit,
+            "min_size_m": min_size_m,
         })
-        
+
         if "error" in result:
             return f"Error: {result['error']}"
-        
-        # Format the assets in a more readable way
+
         assets = result["assets"]
         total_count = result["total_count"]
-        returned_count = result["returned_count"]
-        
-        formatted_output = f"Found {total_count} assets"
-        if categories:
-            formatted_output += f" in categories: {categories}"
-        formatted_output += f"\nShowing {returned_count} assets:\n\n"
-        
-        # Sort assets by download count (popularity)
-        sorted_assets = sorted(assets.items(), key=lambda x: x[1].get("download_count", 0), reverse=True)
-        
-        for asset_id, asset_data in sorted_assets:
-            formatted_output += f"- {asset_data.get('name', asset_id)} (ID: {asset_id})\n"
-            formatted_output += f"  Type: {['HDRI', 'Texture', 'Model'][asset_data.get('type', 0)]}\n"
-            formatted_output += f"  Categories: {', '.join(asset_data.get('categories', []))}\n"
-            formatted_output += f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n\n"
-        
-        return formatted_output
+
+        if result.get("query"):
+            header = f"{total_count} assets on Poly Haven match '{result['query']}'"
+        else:
+            header = f"{total_count} assets on Poly Haven"
+            if category:
+                header += f" in {category}"
+            if attributes:
+                header += " (" + ", ".join(f"{k}={v}" for k, v in attributes.items()) + ")"
+            header += ", most downloaded first"
+
+        if min_size_m:
+            header += f" (at least {min_size_m:g}m across)"
+
+        lines = [header, f"Showing {result['returned_count']}:", ""]
+        if result.get("note"):
+            lines.insert(1, result["note"])
+
+        for asset in assets:
+            lines.append(f"- {asset['name']} (ID: {asset['id']})")
+            lines.append(f"  Type: {asset['type']}  |  {asset['url']}")
+            if asset.get("authors"):
+                lines.append(f"  By: {', '.join(asset['authors'])}")
+            if asset.get("category"):
+                lines.append(f"  Category: {asset['category']}")
+            if asset.get("tags"):
+                lines.append(f"  Tags: {', '.join(asset['tags'])}")
+            if asset.get("attributes"):
+                attributes = ", ".join(
+                    f"{k}={v if not isinstance(v, list) else '/'.join(v)}"
+                    for k, v in asset["attributes"].items()
+                )
+                lines.append(f"  Attributes: {attributes}")
+            size = asset.get("dimensions_mm")
+            if size:
+                metres = " x ".join(f"{v / 1000:g}m" for v in size)
+                axes = " (W x D x H)" if len(size) == 3 else ""
+                lines.append(f"  Real-world size: {metres}{axes}")
+            if asset.get("max_resolution"):
+                lines.append(f"  Up to: {'x'.join(str(v) for v in asset['max_resolution'])}")
+            if asset.get("downloads") is not None:
+                lines.append(f"  Downloads: {asset['downloads']}")
+            if asset.get("description"):
+                lines.append(f"  {asset['description']}")
+            lines.append("")
+
+        lines.append("Assets from Poly Haven (https://polyhaven.com), free and CC0.")
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error searching Polyhaven assets: {str(e)}")
         return f"Error searching Polyhaven assets: {str(e)}"
+@mcp.tool()
+@telemetry_tool("get_polyhaven_asset_preview")
+async def get_polyhaven_asset_preview(
+    ctx: Context,
+    asset_id: str, user_prompt: str = "") -> Image:
+    """
+    Get a preview thumbnail of a Poly Haven asset by its ID.
+    Use this to check an asset looks right before downloading it.
+
+    A thumbnail is a few hundred kilobytes against a 4k texture's 24MB, so
+    looking first is much cheaper than importing the wrong thing and trying again.
+
+    Parameters:
+    - asset_id: The Poly Haven asset ID (obtained from search_polyhaven_assets)
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+
+    Returns the asset's thumbnail as an Image.
+    """
+    try:
+        blender = get_blender_connection()
+        logger.info(f"Getting Poly Haven preview for: {asset_id}")
+
+        result = blender.send_command("get_polyhaven_asset_preview", {"asset_id": asset_id})
+
+        if result is None:
+            raise Exception("Received no response from Blender")
+
+        if "error" in result:
+            raise Exception(result["error"])
+
+        image_data = base64.b64decode(result["image_data"])
+        authors = ", ".join(result.get("authors") or []) or "Poly Haven"
+        logger.info(f"Preview retrieved for '{result.get('name')}' by {authors} - {result.get('url')}")
+
+        return Image(data=image_data, format=result.get("format", "png"))
+
+    except Exception as e:
+        logger.error(f"Error getting Poly Haven preview: {str(e)}")
+        raise Exception(f"Failed to get preview: {str(e)}")
+
 
 @mcp.tool()
 @trajectory_tool("download_polyhaven_asset")
@@ -838,8 +1002,15 @@ async def download_polyhaven_asset(
     Parameters:
     - asset_id: The ID of the asset to download
     - asset_type: The type of asset (hdris, textures, models)
-    - resolution: The resolution to download (e.g., 1k, 2k, 4k)
-    - file_format: Optional file format (e.g., hdr, exr for HDRIs; jpg, png for textures; gltf, fbx for models)
+    - resolution: The resolution to download. Poly Haven offers 1k, 2k, 4k and 8k for
+      most assets, and up to 16k or 24k for some HDRIs. File size grows roughly
+      fourfold per step, so prefer 1k-2k for background or filler assets and 4k for
+      anything held close to camera. If a resolution is unavailable, the error names
+      the ones that are.
+    - file_format: Optional. hdr (default) or exr for HDRIs; jpg (default), png or exr
+      for textures. Models are always imported from .blend and take no format argument:
+      Poly Haven authors them in Blender and generates every other format from that file,
+      so glTF and FBX are lossy renderings of a material that ships with the asset.
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
 
     Returns a message indicating success or failure.
@@ -858,18 +1029,27 @@ async def download_polyhaven_asset(
         
         if result.get("success"):
             message = result.get("message", "Asset downloaded and imported successfully")
-            
+
             # Add additional information based on asset type
             if asset_type == "hdris":
-                return f"{message}. The HDRI has been set as the world environment."
+                message = f"{message}. The HDRI has been set as the world environment."
             elif asset_type == "textures":
                 material_name = result.get("material", "")
                 maps = ", ".join(result.get("maps", []))
-                return f"{message}. Created material '{material_name}' with maps: {maps}."
+                message = (
+                    f"{message}. Created material '{material_name}' with maps: {maps}. "
+                    "Nothing is using it yet - call set_texture to apply it to an object. "
+                    "Saving the file before then discards it, as Blender does with any "
+                    "unused datablock, and it would have to be downloaded again."
+                    f"{_polyhaven_scale_note(result)}"
+                )
             elif asset_type == "models":
-                return f"{message}. The model has been imported into the current scene."
-            else:
-                return message
+                message = f"{message}. The model has been imported into the current scene."
+
+            # Where it came from. The sidebar checkbox names Poly Haven, but in
+            # an agentic session nobody opens the sidebar - the chat is the only
+            # place the person receiving the asset can see whose it is.
+            return f"{message}\n\n{_polyhaven_credit(result)}"
         else:
             return f"Failed to download asset: {result.get('message', 'Unknown error')}"
     except Exception as e:
@@ -884,7 +1064,9 @@ async def set_texture(
     texture_id: str, user_prompt: str = "") -> str:
     """
     Apply a previously downloaded Polyhaven texture to an object.
-    
+
+    Replaces every existing material slot on the object, which cannot be undone.
+
     Parameters:
     - object_name: Name of the object to apply the texture to
     - texture_id: ID of the Polyhaven texture to apply (must be downloaded first)
@@ -928,8 +1110,8 @@ async def set_texture(
                             output += f"    {conn}\n"
             else:
                 output += "No texture nodes found in the material.\n"
-            
-            return output
+
+            return f"{output}\n{_polyhaven_credit(result)}"
         else:
             return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
     except Exception as e:
