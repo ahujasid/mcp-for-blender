@@ -131,6 +131,15 @@ ALLOWED_SCRIPTS = {
         "except KeyError as e:\n"
         "    print('missing:', e)\n"
     ),
+    # Reading ordinary preferences must keep working: only the script search
+    # path and autoexec toggle are blocked, not `filepaths` as a whole.
+    "read_preferences": (
+        "import bpy\n"
+        "prefs = bpy.context.preferences\n"
+        "print(prefs.filepaths.temporary_directory)\n"
+        "print(prefs.filepaths.render_output_directory)\n"
+        "prefs.view.show_splash = False\n"
+    ),
 }
 
 
@@ -171,6 +180,37 @@ BLOCKED_SCRIPTS = {
     "ops_script": "import bpy\nbpy.ops.script.python_file_run(filepath='/tmp/x.py')",
     "ops_text": "import bpy\nbpy.ops.text.run_script()",
     "addon_install": "import bpy\nbpy.ops.preferences.addon_install(filepath='/tmp/x.zip')",
+    "extension_install_files": (
+        "import bpy\n"
+        "bpy.ops.extensions.package_install_files("
+        "filepath='/tmp/x.zip', repo='user_default', enable_on_install=True)\n"
+    ),
+    "extension_install_remote": (
+        "import bpy\nbpy.ops.extensions.package_install(repo_index=0, pkg_id='x')"
+    ),
+    # Script search path (issue #365). `script_directories` is the live 3.6+
+    # collection; `script_directory` is the pre-3.6 string property.
+    "script_directories_new": (
+        "import bpy\n"
+        "sd = bpy.context.preferences.filepaths.script_directories.new()\n"
+        "sd.directory = '/tmp/evil_scripts'\n"
+    ),
+    "script_directories_via_alias": (
+        "import bpy\n"
+        "prefs = bpy.context.preferences\n"
+        "prefs.filepaths.script_directories.new().directory = '/tmp/evil_scripts'\n"
+    ),
+    "script_directories_iterate": (
+        "import bpy\n"
+        "for sd in bpy.context.preferences.filepaths.script_directories:\n"
+        "    sd.directory = '/tmp/evil_scripts'\n"
+    ),
+    "script_directory_legacy": (
+        "import bpy\nbpy.context.preferences.filepaths.script_directory = '/tmp/evil'"
+    ),
+    "scripts_auto_execute": (
+        "import bpy\nbpy.context.preferences.filepaths.use_scripts_auto_execute = True"
+    ),
     "texts": "import bpy\nt = bpy.data.texts.new('x')",
     "external_blend": "import bpy\nbpy.ops.wm.append(filepath='/tmp/evil.blend')",
     "libraries": "import bpy\nprint(bpy.data.libraries)",
