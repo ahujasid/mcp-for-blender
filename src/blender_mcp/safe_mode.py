@@ -38,7 +38,10 @@ STILL BLOCKED (security properties, not app-architecture decisions):
   * persistence: `bpy.app.handlers`, `bpy.app.timers`, drivers and driver
     expressions, `register_class`, `bpy.props`, RNA-type assignment
   * code-execution operators: `bpy.ops.script.*`, `bpy.ops.text.*`,
-    `bpy.ops.preferences.*` (addon install), `bpy.ops.console.*`
+    `bpy.ops.preferences.*` (addon install), `bpy.ops.extensions.*`
+    (extension install, the 4.2+ successor), `bpy.ops.console.*`
+  * script search paths: `preferences.filepaths.script_directories` (3.6+)
+    and the pre-3.6 `script_directory`, plus `use_scripts_auto_execute`
   * external .blend datablock loading (`wm.append`/`wm.link`/`lib_relocate`/
     `lib_reload`) — a hostile .blend carries drivers that run on load
   * `bpy.data.texts` / `.scripts` / `.libraries`, `bpy.utils.execfile` and
@@ -288,6 +291,14 @@ _FORBIDDEN_BPY_PATHS: Final[tuple[tuple[str, str], ...]] = (
     ("bpy.ops.wm.console_toggle", "exposes an interactive Python console"),
     ("bpy.ops.wm.quit_blender", "terminates the host process"),
     ("bpy.ops.render.play_rendered_anim", "launches an external player process"),
+    # A new entry in the script search path is a persistent code-loading
+    # location: Blender imports startup/, addons/ and modules/ from it on
+    # the next launch. This is the live 3.6+ collection; the pre-3.6 string
+    # property `script_directory` is covered by `_FORBIDDEN_ASSIGN_ATTRS`.
+    (
+        "bpy.context.preferences.filepaths.script_directories",
+        "adds a persistent script search path Blender loads code from",
+    ),
 )
 
 #: Whole `bpy.ops` submodule prefixes that are blocked because every operator
@@ -297,6 +308,7 @@ _FORBIDDEN_OPS_PREFIXES: Final[tuple[str, ...]] = (
     "bpy.ops.script",       # bpy.ops.script.* executes python
     "bpy.ops.text",         # bpy.ops.text.* runs text datablocks
     "bpy.ops.preferences",  # preferences ops install and enable addons
+    "bpy.ops.extensions",   # 4.2+ extension ops install and enable packages
     "bpy.ops.console",      # the console executes arbitrary python
 )
 
@@ -309,7 +321,7 @@ _FORBIDDEN_OPS_PREFIXES: Final[tuple[str, ...]] = (
 _MODULE_NAVIGATION: Final[frozenset[str]] = frozenset({
     "ops", "utils", "app", "props", "types",
     # Sub-namespaces of bpy.ops that own the blocked operators.
-    "wm", "script", "preferences",
+    "wm", "script", "preferences", "extensions",
 })
 
 #: Attribute names that are blocked wherever they appear, regardless of what
@@ -340,6 +352,7 @@ _FORBIDDEN_BARE_ATTRS: Final[dict[str, str]] = {
     "binary_path": "exposes the Blender executable path for re-launch",
     "user_resource": "resolves writable on-disk resource paths",
     "script_paths": "enumerates disk locations for script loading",
+    "script_directories": "adds a persistent script search path Blender loads code from",
     "modules_from_path": "imports arbitrary modules from disk",
     "python_file_run": "executes a python file from disk",
     "run_script": "executes a text datablock as python",
@@ -356,6 +369,9 @@ _FORBIDDEN_ASSIGN_ATTRS: Final[dict[str, str]] = {
     "expression": "driver expressions are evaluated by Blender as python",
     "script": "script nodes execute their assigned datablock",
     "use_self": "enables driver expression access to the owning datablock",
+    # Pre-3.6 spelling of the script search path (a single string). 3.6+
+    # exposes the `script_directories` collection instead, which is blocked
+    # on access above; keeping this entry costs nothing on older builds.
     "script_directory": "redirects Blender's script search path",
     "use_scripts_auto_execute": "enables automatic execution of embedded scripts",
 }
