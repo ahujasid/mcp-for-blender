@@ -99,8 +99,13 @@ class BlenderConnection:
     def connect(self) -> bool:
         """Connect to the Blender addon socket server"""
         if self.sock:
-            return True
-            
+            if not self._peer_closed():
+                return True
+            # The cached socket outlived the connection Blender had open for it,
+            # so drop it rather than writing into a dead handle.
+            logger.info("Cached socket is stale; reconnecting to Blender")
+            self._close_socket()
+
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
@@ -120,6 +125,42 @@ class BlenderConnection:
                 logger.error(f"Error disconnecting from Blender: {str(e)}")
             finally:
                 self.sock = None
+
+    def _close_socket(self):
+        """Drop the cached socket without logging an error if it is already dead."""
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            finally:
+                self.sock = None
+
+    def _peer_closed(self) -> bool:
+        """Report whether the cached socket has been closed on Blender's side.
+
+        The connection is kept open across commands, so it can go away while the
+        client sits idle - the addon's handler thread ends, Blender restarts, or
+        the machine sleeps. A non-blocking peek distinguishes 'idle but alive'
+        (no data pending) from 'closed' (orderly EOF or a reset), which lets
+        connect() replace a dead socket before anything is written to it.
+        """
+        if not self.sock:
+            return True
+
+        try:
+            self.sock.setblocking(False)
+            try:
+                # An orderly close from the peer surfaces as an empty read.
+                return self.sock.recv(1, socket.MSG_PEEK) == b''
+            except BlockingIOError:
+                return False  # nothing pending: idle, still connected
+            except OSError:
+                return True   # reset, aborted, or otherwise unusable
+            finally:
+                self.sock.setblocking(True)
+        except OSError:
+            return True
 
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
@@ -185,8 +226,30 @@ class BlenderConnection:
         with self._lock:
             return self._send_command_locked(command_type, params)
 
+    def _send_payload(self, payload: bytes) -> None:
+        """Write one command to Blender, reconnecting once if the socket is dead.
+
+        Retrying is only safe on the send side: a failed send means Blender never
+        received the command, so re-sending cannot apply it twice. A failure while
+        receiving is deliberately not retried - the command may already have run.
+        """
+        try:
+            self.sock.sendall(payload)
+            return
+        except socket.timeout:
+            raise
+        except OSError as e:
+            logger.warning(f"Send failed on cached socket ({e}); reconnecting and retrying once")
+
+        self._close_socket()
+        if not self.connect():
+            raise ConnectionError("Not connected to Blender")
+        self.sock.sendall(payload)
+
     def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        if not self.sock and not self.connect():
+        # connect() also validates a cached socket, so this replaces a stale one
+        # before the command is written rather than after it fails.
+        if not self.connect():
             raise ConnectionError("Not connected to Blender")
 
         command = {
@@ -199,7 +262,7 @@ class BlenderConnection:
             logger.info(f"Sending command: {command_type} with params: {params}")
             
             # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
+            self._send_payload(json.dumps(command).encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
@@ -224,9 +287,12 @@ class BlenderConnection:
             self.sock = None
             raise Exception("Timeout waiting for Blender response - try simplifying your request. If Blender is running headless (blender -b), commands never execute; run Blender with a GUI or via 'xvfb-run -a blender' instead")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+            # Reaching here means the connection dropped while waiting for the
+            # response, so the command may already have taken effect in Blender.
+            # Not retried for that reason - the next command reconnects.
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Blender lost: {str(e)}")
+            self._close_socket()
+            raise Exception(f"Connection to Blender lost while awaiting a response: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
             # Try to log what was received
