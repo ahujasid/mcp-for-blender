@@ -230,3 +230,96 @@ def test_repeat_install_preserves_original_backup(tmp_path: Path):
     assert "USER LOCAL EDIT" in backup.read_text(encoding="utf-8"), (
         "repeat install clobbered the backup of the user's previous addon"
     )
+
+
+# --- fork-aware config discovery ------------------------------------------
+# Blender forks keep user config under their own base directory (Bforartists
+# uses ~/Library/Application Support/Bforartists), so discovery must not assume
+# a single hardcoded "Blender" path.
+
+
+def _make_versioned(root: Path, name: str, version: str = "5.3") -> Path:
+    """Create <root>/<name>/<version>/scripts/addons and return the addons dir."""
+    addons = root / name / version / "scripts" / "addons"
+    addons.mkdir(parents=True)
+    return addons
+
+
+def test_fork_config_dir_is_discovered(tmp_path: Path, monkeypatch):
+    from blender_mcp import addon_manager as am
+
+    addons = _make_versioned(tmp_path, "Bforartists")
+    monkeypatch.setattr(am, "_config_roots", lambda: [tmp_path])
+
+    assert addons in am.discover_blender_addon_dirs()
+
+
+def test_unknown_fork_with_blender_layout_is_discovered(tmp_path: Path, monkeypatch):
+    """Discovery must not depend on a hardcoded list of fork names."""
+    from blender_mcp import addon_manager as am
+
+    addons = _make_versioned(tmp_path, "SomeNewFork")
+    monkeypatch.setattr(am, "_config_roots", lambda: [tmp_path])
+
+    assert addons in am.discover_blender_addon_dirs()
+
+
+def test_blender_and_fork_are_both_discovered(tmp_path: Path, monkeypatch):
+    from blender_mcp import addon_manager as am
+
+    blender = _make_versioned(tmp_path, "Blender", "4.5")
+    bforartists = _make_versioned(tmp_path, "Bforartists", "5.3")
+    monkeypatch.setattr(am, "_config_roots", lambda: [tmp_path])
+
+    dirs = am.discover_blender_addon_dirs()
+    assert blender in dirs
+    assert bforartists in dirs
+
+
+def test_version_dirs_are_newest_first(tmp_path: Path, monkeypatch):
+    from blender_mcp import addon_manager as am
+
+    old = _make_versioned(tmp_path, "Bforartists", "4.2")
+    new = _make_versioned(tmp_path, "Bforartists", "5.3")
+    monkeypatch.setattr(am, "_config_roots", lambda: [tmp_path])
+
+    dirs = am.discover_blender_addon_dirs()
+    assert dirs.index(new) < dirs.index(old)
+
+
+def test_unrelated_directory_is_ignored(tmp_path: Path, monkeypatch):
+    """Only directories with Blender's versioned user layout qualify."""
+    from blender_mcp import addon_manager as am
+
+    (tmp_path / "BraveSoftware").mkdir()
+    monkeypatch.setattr(am, "_config_roots", lambda: [tmp_path])
+
+    assert am.discover_blender_addon_dirs() == []
+
+
+def test_missing_config_root_is_not_fatal(monkeypatch):
+    from blender_mcp import addon_manager as am
+
+    monkeypatch.setattr(am, "_config_roots", lambda: [Path("/no/such/root")])
+
+    assert am.discover_blender_addon_dirs() == []
+
+
+def test_unreadable_directory_does_not_abort_discovery(tmp_path: Path, monkeypatch):
+    """macOS TCC raises PermissionError when listing some config folders."""
+    from blender_mcp import addon_manager as am
+
+    addons = _make_versioned(tmp_path, "Bforartists")
+    blocked = tmp_path / "AddressBook"
+    blocked.mkdir()
+    real_iterdir = Path.iterdir
+
+    def guarded(self):
+        if self == blocked:
+            raise PermissionError(1, "Operation not permitted")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", guarded)
+    monkeypatch.setattr(am, "_config_roots", lambda: [tmp_path])
+
+    assert addons in am.discover_blender_addon_dirs()

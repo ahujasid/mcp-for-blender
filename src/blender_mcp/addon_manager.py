@@ -31,6 +31,13 @@ _BL_INFO_NAME_RE = re.compile(
     r"""["']name["']\s*:\s*["'](?:MCP for Blender|Blender MCP)["']"""
 )
 
+# Blender versions look like 3.6, 4.0, 4.2
+_VERSION_DIR_RE = re.compile(r"^\d+\.\d+")
+# Blender and its forks each keep user configuration in their own base
+# directory, compared case-insensitively because the spelling differs by
+# platform (~/.config/blender vs %APPDATA%/Blender Foundation/Blender).
+_FORK_DIR_NAMES = frozenset({"blender", "bforartists"})
+
 
 def read_addon_protocol_version(path: Path) -> int | None:
     """Parse ADDON_PROTOCOL_VERSION from an installed addon file."""
@@ -187,25 +194,73 @@ def get_bundled_addon_path() -> Path:
     )
 
 
-def discover_blender_addon_dirs() -> list[Path]:
-    """Find Blender user scripts/addons directories across versions."""
-    dirs: list[Path] = []
+def _config_roots() -> list[Path]:
+    """Top-level directories that hold Blender-compatible user config folders."""
     home = Path.home()
-
     if sys.platform == "darwin":
-        base = home / "Library" / "Application Support" / "Blender"
-    elif sys.platform == "win32":
+        return [home / "Library" / "Application Support"]
+    if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
-        base = Path(appdata) / "Blender Foundation" / "Blender" if appdata else None
-    else:
-        base = home / ".config" / "blender"
+        return [Path(appdata) / "Blender Foundation"] if appdata else []
+    return [home / ".config"]
 
-    if base and base.is_dir():
-        for child in sorted(base.iterdir(), reverse=True):
+
+def _safe_iterdir(path: Path) -> list[Path]:
+    """Newest-first directory listing, tolerant of unreadable directories.
+
+    macOS gates several Application Support folders behind TCC, where listing
+    raises PermissionError. A folder we cannot read must not abort discovery.
+    """
+    try:
+        return sorted(path.iterdir(), reverse=True)
+    except OSError:
+        return []
+
+
+def _has_blender_user_layout(path: Path) -> bool:
+    """True when *path* holds version folders laid out like Blender's user config."""
+    for child in _safe_iterdir(path):
+        if not child.is_dir() or not _VERSION_DIR_RE.match(child.name):
+            continue
+        if (child / "scripts" / "addons").is_dir() or (child / "extensions").is_dir():
+            return True
+    return False
+
+
+def _blender_config_dirs() -> list[Path]:
+    """Every Blender-family user config directory, forks included.
+
+    Blender forks ship under their own base directory - Bforartists uses
+    ~/Library/Application Support/Bforartists - so assuming a single "Blender"
+    folder silently misses every fork installation.
+    """
+    found: list[Path] = []
+    for root in _config_roots():
+        if not root.is_dir():
+            continue
+        children = _safe_iterdir(root)
+        known = [c for c in children if c.name.lower() in _FORK_DIR_NAMES]
+        # Anything else on disk that genuinely has Blender's user layout, so a
+        # fork we have never heard of still works without a code change.
+        unknown = [
+            c for c in children if c not in known and _has_blender_user_layout(c)
+        ]
+        for candidate in known + unknown:
+            if candidate.is_dir() and candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def discover_blender_addon_dirs() -> list[Path]:
+    """Find Blender user scripts/addons directories across versions and forks."""
+    dirs: list[Path] = []
+
+    for base in _blender_config_dirs():
+        for child in _safe_iterdir(base):
             if not child.is_dir():
                 continue
             # Blender versions look like 3.6, 4.0, 4.2
-            if not re.match(r"^\d+\.\d+", child.name):
+            if not _VERSION_DIR_RE.match(child.name):
                 continue
             dirs.append(child / "scripts" / "addons")
             # Blender 4.2+ installs through the extensions system.
