@@ -165,8 +165,15 @@ class BlenderConnection:
                         # If we get here, it parsed successfully
                         logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        # Incomplete JSON, continue receiving. A multi-byte
+                        # UTF-8 character (a CJK/emoji object name, an accented
+                        # path) can land split across a recv() chunk boundary,
+                        # which fails decode() before json.loads() ever runs -
+                        # that's incomplete data too, not garbage. Without this
+                        # the exception reaches the outer handler, which drops
+                        # the response even though the rest of it is already in
+                        # the OS receive buffer. Mirrors the addon-side fix.
                         continue
                 except socket.timeout:
                     # If we hit a timeout during receiving, break the loop and try to use what we have
@@ -190,7 +197,7 @@ class BlenderConnection:
                 # Try to parse what we have
                 json.loads(data.decode('utf-8'))
                 return data
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 # If we can't parse it, it's incomplete
                 raise Exception("Incomplete JSON response received")
         else:
