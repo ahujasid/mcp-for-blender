@@ -44,7 +44,7 @@ def test_release_key_reads_version_and_protocol(addon):
     "print('hello')",
     SOURCE.replace('"name": "MCP for Blender"', '"name": "Something Else"', 1),
     SOURCE.replace("ADDON_PROTOCOL_VERSION = ", "PROTOCOL = ", 1),
-])
+], ids=["not-the-addon", "renamed-addon", "no-protocol"])
 def test_release_key_rejects_files_that_are_not_the_addon(addon, text):
     assert addon.addon_release_key(text) is None
 
@@ -107,7 +107,11 @@ def test_install_replaces_the_file_and_keeps_a_backup(tmp_path, addon):
     assert not (tmp_path / "addon.py.new").exists()
 
 
-@pytest.mark.parametrize("bad", ["print('not the addon')", _with_version((99, 0), 99) + "\ndef broken(:\n"])
+@pytest.mark.parametrize(
+    "bad",
+    ["print('not the addon')", _with_version((99, 0), 99) + "\ndef broken(:\n"],
+    ids=["not-the-addon", "syntax-error"],
+)
 def test_install_refuses_anything_but_a_valid_addon(tmp_path, addon, bad):
     target = tmp_path / "addon.py"
     target.write_text(SOURCE, encoding="utf-8")
