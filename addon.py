@@ -33,7 +33,7 @@ bl_info = {
     "version": (1, 8),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > MCP for Blender",
-    "description": "Connect Blender to Claude via MCP",
+    "description": "Connect Blender to any LLM via MCP",
     "doc_url": "https://mcp-for-blender.com/",
     "category": "Interface",
 }
@@ -3442,7 +3442,7 @@ class BlenderMCPServer:
                 "message": """PolyHaven integration is currently disabled. To enable it:
                             1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                             2. Check the 'Use assets from Poly Haven' checkbox
-                            3. Restart the connection to Claude"""
+                            3. Disconnect and reconnect the MCP server"""
         }
 
     #region Hyper3D
@@ -3460,7 +3460,7 @@ class BlenderMCPServer:
                                 1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                                 2. Keep the 'Use Hyper3D Rodin 3D model generation' checkbox checked
                                 3. Choose the right plaform and fill in the API Key
-                                4. Restart the connection to Claude"""
+                                4. Disconnect and reconnect the MCP server"""
                 }
             mode = bpy.context.scene.blendermcp_hyper3d_mode
             message = f"Hyper3D Rodin integration is enabled and ready to use. Mode: {mode}. " + \
@@ -3475,7 +3475,7 @@ class BlenderMCPServer:
                 "message": """Hyper3D Rodin integration is currently disabled. To enable it:
                             1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                             2. Check the 'Use Hyper3D Rodin 3D model generation' checkbox
-                            3. Restart the connection to Claude"""
+                            3. Disconnect and reconnect the MCP server"""
             }
 
     def create_rodin_job(self, *args, **kwargs):
@@ -3866,7 +3866,7 @@ class BlenderMCPServer:
                             1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                             2. Keep the 'Use Sketchfab' checkbox checked
                             3. Enter your Sketchfab API Key
-                            4. Restart the connection to Claude"""
+                            4. Disconnect and reconnect the MCP server"""
             }
         else:
             return {
@@ -3875,7 +3875,7 @@ class BlenderMCPServer:
                             1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                             2. Check the 'Use assets from Sketchfab' checkbox
                             3. Enter your Sketchfab API Key
-                            4. Restart the connection to Claude"""
+                            4. Disconnect and reconnect the MCP server"""
             }
 
     def search_sketchfab_models(self, query, categories=None, count=20, downloadable=True):
@@ -4269,7 +4269,7 @@ class BlenderMCPServer:
                             2. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                             3. Keep the 'Use Poly Pizza' checkbox checked
                             4. Enter your Poly Pizza API Key
-                            5. Restart the connection to Claude"""
+                            5. Disconnect and reconnect the MCP server"""
             }
         else:
             return {
@@ -4279,7 +4279,7 @@ class BlenderMCPServer:
                             2. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                             3. Check the 'Use assets from Poly Pizza' checkbox
                             4. Enter your Poly Pizza API Key
-                            5. Restart the connection to Claude"""
+                            5. Disconnect and reconnect the MCP server"""
             }
 
     def search_polypizza_models(self, query=None, category=None, licence=None,
@@ -4594,7 +4594,7 @@ class BlenderMCPServer:
                                 1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                                 2. Keep the 'Use Tencent Hunyuan 3D model generation' checkbox checked
                                 3. Choose the right platform and fill in the SecretId and SecretKey
-                                4. Restart the connection to Claude"""
+                                4. Disconnect and reconnect the MCP server"""
                         }
                 case "LOCAL_API":
                     if not api_url:
@@ -4605,7 +4605,7 @@ class BlenderMCPServer:
                                 1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                                 2. Keep the 'Use Tencent Hunyuan 3D model generation' checkbox checked
                                 3. Choose the right platform and fill in the API URL
-                                4. Restart the connection to Claude"""
+                                4. Disconnect and reconnect the MCP server"""
                         }
                 case _:
                     return {
@@ -4622,7 +4622,7 @@ class BlenderMCPServer:
             "message": """Hunyuan3D integration is currently disabled. To enable it:
                         1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
                         2. Check the 'Use Tencent Hunyuan 3D model generation' checkbox
-                        3. Restart the connection to Claude"""
+                        3. Disconnect and reconnect the MCP server"""
         }
     
     @staticmethod
@@ -5783,7 +5783,7 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     )
     premium_default_quality: bpy.props.EnumProperty(
         name="Default Quality",
-        description="Quality Claude uses unless you ask for another. High uses a high-quality generation",
+        description="Quality the AI uses unless you ask for another. High uses a high-quality generation",
         items=[
             ("standard", "Standard", "Uses a standard generation"),
             ("high", "High", "More detail; uses a high-quality generation (Pro)"),
@@ -6004,8 +6004,8 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
 # Operator to start the server
 class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     bl_idname = "blendermcp.start_server"
-    bl_label = "Connect to Claude"
-    bl_description = "Start the MCP for Blender server to connect with Claude"
+    bl_label = "Connect to MCP server"
+    bl_description = "Start the MCP for Blender server so your MCP client can connect"
 
     def execute(self, context):
         global _user_stopped_server
@@ -6025,8 +6025,8 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
 # Operator to stop the server
 class BLENDERMCP_OT_StopServer(bpy.types.Operator):
     bl_idname = "blendermcp.stop_server"
-    bl_label = "Stop the connection to Claude"
-    bl_description = "Stop the connection to Claude"
+    bl_label = "Disconnect"
+    bl_description = "Stop the MCP for Blender server"
 
     def execute(self, context):
         global _user_stopped_server

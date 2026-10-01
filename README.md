@@ -131,7 +131,7 @@ Then in Blender: **Edit → Preferences → Add-ons** → enable **Interface: MC
 
 **4. Connect**
 
-The addon starts its server when Blender opens. To check, press `N` in the 3D viewport → open the **MCP for Blender** tab (click **Start MCP Server** if it isn't running). That's it — ask Claude to build something.
+The addon starts its server when Blender opens. To check, press `N` in the 3D viewport → open the **MCP for Blender** tab (click **Connect to MCP server** if it isn't running). That's it — ask Claude to build something.
 
 </details>
 
@@ -584,7 +584,7 @@ This copies the addon into your Blender addons folder as `blender_mcp.py`. It pr
 
 **5. Manual alternative** — if the command above can't find your Blender install, or you prefer doing it by hand: download `addon.py` from this repo → in Blender, **Edit → Preferences → Add-ons → Install…** → select the downloaded `addon.py` → enable it.
 
-Then open the **MCP for Blender** tab in Blender's sidebar (press `N` in the 3D viewport) and click **Start MCP Server**. See [Starting the Connection](#starting-the-connection) below.
+Then open the **MCP for Blender** tab in Blender's sidebar (press `N` in the 3D viewport) and click **Connect to MCP server**. See [Starting the Connection](#starting-the-connection) below.
 
 ## Upgrading (existing users)
 
@@ -597,7 +597,7 @@ uvx mcp-for-blender install-addon
 uvx mcp-for-blender addon-paths   # optional: list detected Blender addons folders
 ```
 
-**2.** In Blender: **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender** (or restart Blender), then click **Start MCP Server** again.
+**2.** In Blender: **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender** (or restart Blender), then click **Connect to MCP server** again.
 
 **3.** Delete the MCP server from Claude and add it back again if the server package itself needs a refresh.
 
@@ -614,7 +614,7 @@ uvx mcp-for-blender addon-paths   # optional: list detected Blender addons folde
 1. In Blender, go to the 3D View sidebar (press <kbd>N</kbd> if not visible)
 2. Find the **MCP for Blender** tab
 3. Turn on the checkboxes you'd like to use (see more under [Capabilities](#capabilities) below)
-4. Click **Connect to Claude**
+4. Click **Connect to MCP server**
 5. Make sure the MCP server is running in your terminal
 
 ### Using with Claude

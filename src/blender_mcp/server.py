@@ -469,7 +469,7 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             "update_command": "uvx mcp-for-blender install-addon",
             "after_install": (
                 "If the addon file was updated: in Blender, Preferences → Add-ons → "
-                "disable/enable 'Interface: Blender MCP', or restart Blender, then Start MCP Server."
+                "disable/enable 'Interface: MCP for Blender', or restart Blender, then click Connect to MCP server."
             ),
         }
         return (json.dumps(payload, indent=2) + premium_generation_guidance(result.premium_generators)
