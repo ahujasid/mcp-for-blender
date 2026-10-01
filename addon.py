@@ -39,7 +39,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 13
+ADDON_PROTOCOL_VERSION = 14
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -2064,7 +2064,7 @@ class BlenderMCPServer:
 
         return obj_info
 
-    def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
+    def get_viewport_screenshot(self, max_size=800, filepath=None, format="png", return_data=False):
         """
         Capture a screenshot of the current 3D viewport and save it to the specified path.
 
@@ -2072,6 +2072,10 @@ class BlenderMCPServer:
         - max_size: Maximum size in pixels for the largest dimension of the image
         - filepath: Path where to save the screenshot file
         - format: Image format (png, jpg, etc.)
+        - return_data: Also return the image, base64-encoded, as "image_data".
+          A path chosen by the MCP server is only readable back when it shares
+          a filesystem with Blender, which it doesn't in Docker, WSL or on
+          another machine. Without a filepath, a temp file is used and removed.
 
         Returns success/error status
         """
@@ -2082,9 +2086,14 @@ class BlenderMCPServer:
         # instead, which is independent of window compositing state, and fall
         # back to the window grab if offscreen rendering is unavailable (e.g. no
         # GPU context). The response reports which path produced the image.
+        temp_path = None
         try:
             if not filepath:
-                return {"error": "No filepath provided"}
+                if not return_data:
+                    return {"error": "No filepath provided"}
+                fd, temp_path = tempfile.mkstemp(prefix="blendermcp_viewport_", suffix=f".{format.lower()}")
+                os.close(fd)
+                filepath = temp_path
 
             area = region = space = None
             for a in bpy.context.screen.areas:
@@ -2163,17 +2172,25 @@ class BlenderMCPServer:
                 "success": True,
                 "width": width,
                 "height": height,
-                "filepath": filepath,
                 "method": method,
                 **origin,
                 "scene_count": len(bpy.data.scenes),
             }
+            if not temp_path:
+                result["filepath"] = filepath
             if view:
                 result["view"] = view
+            if return_data:
+                with open(filepath, "rb") as f:
+                    result["image_data"] = base64.b64encode(f.read()).decode("ascii")
             return result
 
         except Exception as e:
             return {"error": str(e)}
+        finally:
+            if temp_path:
+                with suppress(OSError):
+                    os.remove(temp_path)
 
     def pick_viewport_object(self, view_matrix, window_matrix, width, height, x, y, file=None, scene=None):
         """The object under a click on a viewport capture.
