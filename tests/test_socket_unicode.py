@@ -86,9 +86,10 @@ def test_split_multibyte_utf8_boundary_is_not_dropped():
         "recv() chunk boundary killed the connection instead of waiting for "
         "the rest of the buffer"
     )
-    command, _client = server.command_queue.get_nowait()
+    command, _client, framed = server.command_queue.get_nowait()
     assert command["type"] == "ping"
     assert command["params"]["note"] == "café ☕ 日本語"
+    assert framed is False, "a raw JSON client must not be answered with a frame"
 
 
 def test_split_multibyte_utf8_boundary_keeps_handler_loop_alive():
@@ -110,7 +111,7 @@ def test_split_multibyte_utf8_boundary_keeps_handler_loop_alive():
 
     queued = []
     while not server.command_queue.empty():
-        command, _client = server.command_queue.get_nowait()
+        command, _client, _framed = server.command_queue.get_nowait()
         queued.append(command)
 
     assert len(queued) == 2, f"expected both commands queued, got {queued}"

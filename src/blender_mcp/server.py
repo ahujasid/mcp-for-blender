@@ -2,6 +2,7 @@
 from mcp.server.fastmcp import FastMCP, Context
 import argparse
 import socket
+import struct
 import json
 import logging
 import tempfile
@@ -57,6 +58,31 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
+# Wire framing: [4-byte big-endian length][UTF-8 JSON]. Opt-in per connection:
+# the get_addon_info handshake reports FRAMING_CAPABILITY, and only then does
+# the server start sending frames. Addons without it keep getting raw JSON, so
+# an older addon never sees a prefix it cannot parse (#311).
+FRAMING_CAPABILITY = "length_prefixed_framing"
+# A frame length is read from the wire and must never be trusted; this bounds
+# it. Responses are capped well below this by the commands that produce them.
+MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+
+def _pack_frame(payload: bytes) -> bytes:
+    """Prefix a JSON payload with its 4-byte big-endian length."""
+    return struct.pack(">I", len(payload)) + payload
+
+
+def _recv_exact(sock: socket.socket, length: int) -> bytes:
+    """Read exactly `length` bytes; a short read means the connection is gone."""
+    data = bytearray()
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed mid-frame")
+        data += chunk
+    return bytes(data)
+
 
 def parse_connection_args(argv):
     """Parse --host/--port out of argv, ignoring anything else.
@@ -109,6 +135,10 @@ class BlenderConnection:
     host: str
     port: int
     sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
+    # True once the connected addon's handshake declares FRAMING_CAPABILITY.
+    # Every new socket starts on raw JSON: every addon can parse it, so a
+    # reconnect can never send a prefix an older addon would choke on.
+    framed: bool = False
     # Serializes send+receive so two commands can never interleave on one socket.
     # Without this, a second command's response can be read as the first's, and
     # the stream stays desynced until the 180s timeout fires.
@@ -121,6 +151,7 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.framed = False
             self.sock.connect((self.host, self.port))
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
@@ -195,6 +226,16 @@ class BlenderConnection:
         else:
             raise Exception("No data received")
 
+    def receive_framed_response(self, sock):
+        """Read exactly one [uint32 length][JSON] frame; no guessing involved."""
+        header = _recv_exact(sock, 4)
+        length = struct.unpack(">I", header)[0]
+        if length > MAX_FRAME_BYTES:
+            raise Exception(f"Frame length {length} exceeds the {MAX_FRAME_BYTES}-byte limit")
+        data = _recv_exact(sock, length)
+        logger.info(f"Received complete framed response ({len(data)} bytes)")
+        return data
+
     def send_command(self, command_type: str, params: Dict[str, Any] = None, read_only: bool = False) -> Dict[str, Any]:
         """Send a command to Blender and return the response.
 
@@ -226,14 +267,22 @@ class BlenderConnection:
             logger.info(f"Sending command: {command_type} with params: {params}")
             
             # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
+            payload = json.dumps(command).encode('utf-8')
+            if self.framed:
+                self.sock.sendall(_pack_frame(payload))
+            else:
+                self.sock.sendall(payload)
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
             self.sock.settimeout(180.0)  # Match the addon's timeout
             
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
+            # Read the response the same way the command was written: framed
+            # addons mirror the format, and raw addons never see a frame.
+            if self.framed:
+                response_data = self.receive_framed_response(self.sock)
+            else:
+                response_data = self.receive_full_response(self.sock)
             logger.info(f"Received {len(response_data)} bytes of data")
             
             response = json.loads(response_data.decode('utf-8'))
@@ -371,7 +420,12 @@ def _maybe_handshake_addon(blender: BlenderConnection) -> None:
         _addon_handshake_checked = True
     try:
         _addon_handshake = handshake_addon(blender)
+        # The handshake itself went over raw JSON; from here on this connection
+        # can use frames if - and only if - the addon said it understands them.
+        blender.framed = FRAMING_CAPABILITY in (_addon_handshake.capabilities or [])
         log_line = format_handshake_log(_addon_handshake)
+        if blender.framed:
+            log_line += " (length-prefixed framing enabled)"
         if _addon_handshake.up_to_date:
             logger.info(log_line)
         else:

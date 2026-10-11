@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import json
 import socket
+import struct
 import sys
 import threading
 import time
@@ -40,12 +41,23 @@ def _load_server_class():
     source = ROOT_ADDON.read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    body = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BlenderMCPServer"
-    ]
-    assert body, "BlenderMCPServer not found in addon.py"
+    body = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "BlenderMCPServer":
+            body.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
+            "_pack_frame",
+            "_take_client_message",
+        }:
+            body.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            getattr(target, "id", None) in {"MAX_FRAME_BYTES", "_RAW_JSON_FIRST_BYTES"}
+            for target in node.targets
+        ):
+            body.append(node)
+    assert any(isinstance(node, ast.ClassDef) for node in body), (
+        "BlenderMCPServer not found in addon.py"
+    )
 
     main_thread = threading.current_thread()
     registered = {}
@@ -73,6 +85,7 @@ def _load_server_class():
     namespace = {
         "bpy": bpy,
         "socket": socket,
+        "struct": struct,
         "threading": threading,
         "json": json,
         "time": time,
