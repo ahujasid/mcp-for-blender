@@ -636,7 +636,7 @@ The AI writes Blender Python itself for modelling, layout, materials, animation,
 | `execute_blender_code` | Run Python in your live Blender |
 | `look` | See the result from the `viewport`, `camera`, `angles` (auto-framed multi-view sheet, any direction) or `frames` (animation strip), drawn `solid`, `material`, `rendered`, `wireframe` or `xray`; or show a render or image file |
 | `get_scene_info` | Compact scene summary, one line per object with the fields you pick (placement, materials, topology, weights, ...); drill in with `root` or `query` |
-| `generate_3d` | One call to generate and import a model with Tripo, Hunyuan3D or Hyper3D Rodin. Premium generators are preferred automatically |
+| `generate_3d` | One call to generate and import a model with Tripo, Hunyuan3D, Hyper3D Rodin or Meshy. Premium generators are preferred automatically |
 | `search_assets` / `import_asset` | [Poly Haven](https://polyhaven.com/) HDRIs, textures and models, [Sketchfab](https://sketchfab.com/) models, [Poly Pizza](https://poly.pizza/) low-poly models |
 | `get_addon_status` | Blender version, addon version, and which libraries and generators are switched on |
 | `disable_telemetry`, `record_trajectory_feedback` | Data collection controls |
@@ -653,6 +653,14 @@ Which Tencent Cloud service the addon must call depends on where your account li
 International credentials sent to the mainland endpoint fail with `AuthFailure.SignatureFailure` or
 `ResourceUnavailable`, so tick the toggle when your SecretId/SecretKey come from tencentcloud.com.
 The toggle sits under **Tencent Hunyuan 3D → Official API** in the sidebar.
+
+#### Meshy
+
+[Meshy](https://www.meshy.ai/) generates textured 3D models from a text prompt or a reference image,
+sized to real-world height with the origin at the bottom, so models arrive standing on the ground at a plausible size.
+It runs on your own Meshy API key only, not through Premium. API keys need a paid Meshy plan:
+[get a Meshy API key](https://www.meshy.ai/developers/keys?utm_source=mcp-for-blender&utm_medium=integration&utm_campaign=blender-addon).
+Tick **Meshy** under **AI Model Generation** in the sidebar, choose a **Model**, and paste the key.
 
 #### Poly Haven
 
@@ -733,6 +741,7 @@ Here are some examples of what you can ask Claude to do:
 | Give a reference image, and create a Blender scene out of it | [Watch](https://www.youtube.com/watch?v=FDRb03XPiRo) |
 | *"Get information about the current scene, and make a threejs sketch from it"* | [Watch](https://www.youtube.com/watch?v=jxbNI5L7AH8) |
 | *"Generate a 3D model of a garden gnome through Hyper3D"* | |
+| *"Generate a wooden rocking chair with Meshy"* | |
 | *"Fill this room with low-poly furniture from Poly Pizza"* | |
 | *"Make this car red and metallic"* | |
 | *"Create a sphere and place it above the cube"* | |
@@ -754,6 +763,7 @@ You can store these values there so they survive Blender restarts:
 - Hyper3D API Key
 - Hunyuan3D SecretId / SecretKey
 - Hunyuan3D API URL
+- Meshy API Key
 
 For headless setups or CI, credentials can also be injected by environment variables:
 
@@ -765,6 +775,7 @@ For headless setups or CI, credentials can also be injected by environment varia
 | `BLENDERMCP_HUNYUAN3D_SECRET_ID` |
 | `BLENDERMCP_HUNYUAN3D_SECRET_KEY` |
 | `BLENDERMCP_HUNYUAN3D_API_URL` |
+| `BLENDERMCP_MESHY_API_KEY` |
 
 ---
 
