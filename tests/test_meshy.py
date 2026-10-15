@@ -359,7 +359,12 @@ def test_meshy_import_downloads_glb(monkeypatch):
         def iter_content(self, chunk_size=8192):
             yield b"glb-bytes"
 
-    addon.requests.get = lambda url, stream=False, **_k: _Stream()
+    def get(url, headers=None, stream=False, **_k):
+        downloaded["user_agent"] = (headers or {}).get("User-Agent", "")
+        assert "Authorization" not in (headers or {})
+        return _Stream()
+
+    addon.requests.get = get
 
     def fake_clean(filepath, mesh_name=None):
         with open(filepath, "rb") as handle:
@@ -381,6 +386,7 @@ def test_meshy_import_downloads_glb(monkeypatch):
     assert result["name"] == "Teapot"
     assert result["world_bounding_box"] == [[0, 0, 0], [1, 1, 1]]
     assert downloaded["bytes"] == b"glb-bytes"
+    assert downloaded["user_agent"].startswith("mcp-for-blender/")
 
 
 # ------------------------------------------------------------------ dispatch

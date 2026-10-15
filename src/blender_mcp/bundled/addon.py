@@ -5254,7 +5254,7 @@ class BlenderMCPServer:
         temp_dir = tempfile.mkdtemp(prefix="meshy_glb_")
         glb_path = osp.join(temp_dir, "model.glb")
         try:
-            response = requests.get(model_url, stream=True, timeout=MESHY_TIMEOUT)
+            response = requests.get(model_url, headers=MESHY_HEADERS, stream=True, timeout=MESHY_TIMEOUT)
             response.raise_for_status()
             with open(glb_path, "wb") as handle:
                 for chunk in response.iter_content(chunk_size=8192):
