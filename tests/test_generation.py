@@ -2,7 +2,8 @@
 
 A fake addon replays each provider's real reply shapes, so these pin the
 shapes the flow depends on: Premium and fal request ids, Rodin main-site
-subscription keys, and Tencent-style Hunyuan responses.
+subscription keys, Tencent-style Hunyuan responses, and Meshy's preview then
+refine tasks.
 """
 
 import asyncio
@@ -15,24 +16,27 @@ from blender_mcp.generation import GenerationError, Job, choose_provider
 
 class FakeAddon:
     def __init__(self, replies):
-        # command -> reply, or a list of replies consumed in order
+        # command -> reply, a list of replies consumed in order, or a function of the params
         self.replies = replies
         self.calls = []
 
     def __call__(self, command, params):
         self.calls.append((command, params))
         reply = self.replies[command]
+        if callable(reply):
+            return reply(params)
         if isinstance(reply, list):
             return reply.pop(0) if len(reply) > 1 else reply[0]
         return reply
 
 
-def _run(send, job, wait=100):
+def _run(send, job, wait=100, pending=None):
     async def no_sleep(_):
         pass
 
     ticks = iter(range(0, 10_000, 5))
-    return asyncio.run(generation.wait_and_import(send, job, wait, sleep=no_sleep, clock=lambda: next(ticks)))
+    return asyncio.run(generation.wait_and_import(send, job, wait, sleep=no_sleep, clock=lambda: next(ticks),
+                                                  pending=pending))
 
 
 # -------------------------------------------------------------- provider choice
@@ -247,3 +251,274 @@ def test_repeating_an_unfinished_request_resumes_instead_of_paying_again(tmp_pat
     assert 'job="tripo:rid:r1"' in first and 'job="tripo:rid:r1"' in second
     assert "resumed" in second
     assert [c for c, _ in send.calls].count("create_tripo_job") == 1
+
+
+# ------------------------------------------------------------------- Meshy
+#
+# Text is two paid Meshy tasks: a preview (mesh), then a refine (texture). One
+# preview must never get a second refine, whichever way the flow is resumed.
+
+def _meshy(statuses, **replies):
+    """A fake addon whose Meshy tasks report `statuses[task_id]` in order (the
+    last one repeats). Edit the lists between calls to move a task along."""
+    def poll(params):
+        queue = statuses[params["task_id"]]
+        reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(reply, dict):
+            return reply
+        result = {"status": reply, "progress": 100 if reply == "SUCCEEDED" else 50}
+        if reply == "SUCCEEDED" and params["kind"] != "t2p":
+            result["model_url"] = f"https://assets.meshy.ai/{params['task_id']}.glb"
+        return result
+
+    return FakeAddon({
+        "create_meshy_job": {"task_id": "p1", "kind": "t2p", "model": "latest"},
+        "refine_meshy_job": {"task_id": "r1", "kind": "t2r"},
+        "poll_meshy_job_status": poll,
+        "import_generated_asset_meshy": {"succeed": True},
+        **replies,
+    })
+
+
+def _count(send, command):
+    return [c for c, _ in send.calls].count(command)
+
+
+def _start_meshy(send, path, prompt="a teapot"):
+    """Submit as generate_3d does: the job is written down before any polling."""
+    job = generation.submit(send, "meshy", "Teapot", prompt, None, None, None, True)
+    key = generation.request_key("meshy", prompt, None, None, None)
+    generation.Pending(path).add(key, job)
+    return job, key
+
+
+def test_meshy_text_previews_refines_once_and_imports_the_refine(tmp_path):
+    path = tmp_path / "pending.json"
+    send = _meshy({"p1": ["IN_PROGRESS", "SUCCEEDED"], "r1": ["PENDING", "IN_PROGRESS", "SUCCEEDED"]})
+    job, key = _start_meshy(send, path)
+    assert job.handle == "meshy:t2p:p1"
+    assert send.calls[0] == ("create_meshy_job", {"text_prompt": "a teapot", "image": None})
+
+    assert _run(send, job, pending=generation.Pending(path)) == (True, "Teapot")
+
+    assert _count(send, "refine_meshy_job") == 1
+    assert ("refine_meshy_job", {"preview_task_id": "p1"}) in send.calls
+    assert ("poll_meshy_job_status", {"task_id": "r1", "kind": "t2r"}) in send.calls
+    assert send.calls[-1] == ("import_generated_asset_meshy",
+                              {"name": "Teapot", "model_url": "https://assets.meshy.ai/r1.glb"})
+    assert job.handle == "meshy:t2r:r1"
+    assert generation.Pending(path).find(key) is None
+
+
+def test_meshy_quality_and_bbox_are_not_sent():
+    send = _meshy({})
+    generation.submit(send, "meshy", "Teapot", "a teapot", None, "high", [1, 1, 1], True)
+    assert send.calls[0] == ("create_meshy_job", {"text_prompt": "a teapot", "image": None})
+
+
+def test_meshy_timeout_mid_preview_then_resume_refines_once(tmp_path):
+    path = tmp_path / "pending.json"
+    statuses = {"p1": ["IN_PROGRESS"], "r1": ["SUCCEEDED"]}
+    send = _meshy(statuses)
+    job, _key = _start_meshy(send, path)
+
+    imported, _detail = _run(send, job, wait=20, pending=generation.Pending(path))
+    assert not imported and job.handle == "meshy:t2p:p1"
+    assert _count(send, "refine_meshy_job") == 0
+
+    statuses["p1"] = ["SUCCEEDED"]
+    resumed = generation.Job.parse("meshy:t2p:p1", "Teapot")
+    assert _run(send, resumed, pending=generation.Pending(path)) == (True, "Teapot")
+    assert _count(send, "refine_meshy_job") == 1
+
+
+def test_meshy_resume_with_the_old_preview_handle_after_refine_does_not_refine_again(tmp_path):
+    path = tmp_path / "pending.json"
+    statuses = {"p1": ["SUCCEEDED"], "r1": ["IN_PROGRESS"]}
+    send = _meshy(statuses)
+    job, key = _start_meshy(send, path)
+
+    imported, _detail = _run(send, job, wait=20, pending=generation.Pending(path))
+    assert not imported
+    assert _count(send, "refine_meshy_job") == 1
+    # The hint the caller hands back now names the refine, and so does a retry of the request.
+    assert job.handle == "meshy:t2r:r1" and 'job="meshy:t2r:r1"' in job.resume_hint
+    assert generation.Pending(path).find(key).handle == "meshy:t2r:r1"
+
+    # The agent kept the preview handle from an earlier reply. A fresh Pending
+    # reads the file as a restarted server would.
+    statuses["r1"] = ["SUCCEEDED"]
+    stale = generation.Job.parse("meshy:t2p:p1", "Teapot")
+    assert _run(send, stale, pending=generation.Pending(path)) == (True, "Teapot")
+    assert _count(send, "refine_meshy_job") == 1
+    assert send.calls[-1][1]["model_url"] == "https://assets.meshy.ai/r1.glb"
+
+
+def test_meshy_stale_preview_handle_after_import_does_not_refine_again(tmp_path):
+    path = tmp_path / "pending.json"
+    send = _meshy({"p1": ["SUCCEEDED"], "r1": ["SUCCEEDED"]})
+    job, key = _start_meshy(send, path)
+    assert _run(send, job, pending=generation.Pending(path)) == (True, "Teapot")
+    assert generation.Pending(path).find(key) is None
+
+    stale = generation.Job.parse("meshy:t2p:p1", "Teapot")
+    assert _run(send, stale, pending=generation.Pending(path)) == (True, "Teapot")
+    assert _count(send, "refine_meshy_job") == 1
+
+
+def test_meshy_refine_records_outlive_completion_but_age_out(tmp_path):
+    path = tmp_path / "pending.json"
+    now = [1_000_000.0]
+    pending = generation.Pending(path, clock=lambda: now[0])
+    job = Job("meshy", "t2r", "r1", "Teapot")
+    pending.add("k", job)
+    pending.record_refine("p1", job.handle)
+
+    pending.remove(job)
+    assert pending.find("k") is None
+    assert pending.refine_for("p1") == "meshy:t2r:r1"
+    assert pending.refine_for("p2") is None
+
+    now[0] += generation.PENDING_MAX_AGE_S + 1
+    assert pending.refine_for("p1") is None
+
+
+def test_meshy_resent_request_resumes_across_restarts_without_paying_again(tmp_path, monkeypatch):
+    from blender_mcp import server
+
+    statuses = {"p1": ["IN_PROGRESS"], "r1": ["IN_PROGRESS"]}
+    send = _meshy(statuses)
+    path = tmp_path / "pending.json"
+    monkeypatch.setattr(server, "get_blender_connection", lambda: None)
+    monkeypatch.setattr(server, "_premium_generators", lambda _: [])
+    monkeypatch.setattr(server, "_own_key_generators", lambda _: {"meshy": True})
+    monkeypatch.setattr(server, "_generation_send", send)
+    # A new Pending per call, as a restarted server would read the file.
+    monkeypatch.setattr(server, "_pending_generations", lambda: generation.Pending(path))
+    # One poll per call, then the reply.
+    monkeypatch.setattr(generation, "POLL_INTERVAL_S", 1000.0)
+
+    class Ctx:
+        async def report_progress(self, *_):
+            pass
+
+    def call():
+        return asyncio.run(server.generate_3d(Ctx(), prompt="a ceramic teapot", provider="meshy", wait_seconds=10))
+
+    first = call()
+    assert 'job="meshy:t2p:p1"' in first
+
+    statuses["p1"] = ["SUCCEEDED"]
+    second = call()
+    assert "resumed" in second and 'job="meshy:t2r:r1"' in second
+
+    third = call()
+    assert "resumed" in third and 'job="meshy:t2r:r1"' in third
+
+    statuses["r1"] = ["SUCCEEDED"]
+    fourth = call()
+    assert "Generated and imported" in fourth
+
+    assert _count(send, "create_meshy_job") == 1
+    assert _count(send, "refine_meshy_job") == 1
+    assert _count(send, "import_generated_asset_meshy") == 1
+
+
+@pytest.mark.parametrize("image", ["https://example.com/teapot.png", "/Users/me/Pictures/teapot.png"])
+def test_meshy_image_is_one_task_then_import(image):
+    send = _meshy({"i1": ["IN_PROGRESS", "SUCCEEDED"]},
+                  create_meshy_job={"task_id": "i1", "kind": "i2m", "model": "latest"})
+    job = generation.submit(send, "meshy", "Teapot", None, image, None, None, True)
+    assert job.handle == "meshy:i2m:i1"
+    # The addon reads a local path and sends it as a data URI.
+    assert send.calls[0] == ("create_meshy_job", {"text_prompt": None, "image": image})
+
+    assert _run(send, job) == (True, "Teapot")
+    assert _count(send, "refine_meshy_job") == 0
+    assert ("poll_meshy_job_status", {"task_id": "i1", "kind": "i2m"}) in send.calls
+    assert send.calls[-1] == ("import_generated_asset_meshy",
+                              {"name": "Teapot", "model_url": "https://assets.meshy.ai/i1.glb"})
+
+
+def test_meshy_failed_preview_says_why_and_clears_pending(tmp_path):
+    path = tmp_path / "pending.json"
+    send = _meshy({"p1": [{"status": "FAILED", "progress": 10, "error": "Prompt was flagged"}]})
+    job, key = _start_meshy(send, path)
+
+    with pytest.raises(GenerationError, match="Prompt was flagged"):
+        _run(send, job, pending=generation.Pending(path))
+    assert _count(send, "refine_meshy_job") == 0
+    assert generation.Pending(path).find(key) is None
+
+
+def test_meshy_failed_refine_says_why_and_clears_pending(tmp_path):
+    path = tmp_path / "pending.json"
+    send = _meshy({"p1": ["SUCCEEDED"], "r1": [{"status": "CANCELED", "progress": 0, "error": "CANCELED"}]})
+    job, key = _start_meshy(send, path)
+
+    with pytest.raises(GenerationError, match="CANCELED"):
+        _run(send, job, pending=generation.Pending(path))
+    assert generation.Pending(path).find(key) is None
+
+
+@pytest.mark.parametrize("message", [
+    "Meshy rejected the API key",
+    "Out of Meshy credits. Top up at meshy.ai",
+    "Meshy rate limit hit, wait and retry",
+])
+def test_meshy_api_errors_are_relayed_without_retrying(tmp_path, message):
+    send = _meshy({}, create_meshy_job={"error": message})
+    with pytest.raises(GenerationError, match=message):
+        generation.submit(send, "meshy", "X", "a teapot", None, None, None, True)
+    assert _count(send, "create_meshy_job") == 1
+
+    # At refine time the preview is done and paid for: keep it resumable.
+    path = tmp_path / "pending.json"
+    send = _meshy({"p1": ["SUCCEEDED"]}, refine_meshy_job={"error": message})
+    job, key = _start_meshy(send, path)
+    with pytest.raises(GenerationError, match=message) as e:
+        _run(send, job, pending=generation.Pending(path))
+    assert 'job="meshy:t2p:p1"' in str(e.value)
+    assert _count(send, "refine_meshy_job") == 1
+    assert generation.Pending(path).find(key) is not None
+
+
+def test_meshy_long_prompts_are_rejected_before_sending():
+    send = _meshy({})
+    with pytest.raises(GenerationError, match="800"):
+        generation.submit(send, "meshy", "X", "x" * 801, None, None, None, True)
+    assert send.calls == []
+
+
+def test_meshy_handles_name_a_meshy_task_kind():
+    for kind in ("t2p", "t2r", "i2m"):
+        assert generation.Job.parse(f"meshy:{kind}:abc", "X") == Job("meshy", kind, "abc", "X")
+    with pytest.raises(GenerationError):
+        generation.Job.parse("meshy:task:abc", "X")
+
+
+def test_meshy_provider_choice():
+    assert choose_provider("meshy", [], {"meshy": True}) == ("meshy", False)
+    assert choose_provider("auto", [], {"hunyuan3d": False, "hyper3d": False, "meshy": True}) == ("meshy", False)
+    # Last in the own-key order: Sid decides where it belongs.
+    assert choose_provider("auto", [], {"hunyuan3d": True, "hyper3d": True, "meshy": True}) == ("hunyuan3d", False)
+    with pytest.raises(GenerationError, match="Meshy API key"):
+        choose_provider("meshy", [], {"meshy": False})
+    # Own key only: never picked by, or available through, Premium.
+    assert choose_provider("auto", ["hyper3d"], {"meshy": True}) == ("hyper3d", True)
+    with pytest.raises(GenerationError, match="own Meshy API key only"):
+        choose_provider("meshy", ["hyper3d"], {})
+
+
+def test_nothing_enabled_mentions_meshy():
+    with pytest.raises(GenerationError, match="Meshy"):
+        choose_provider("auto", [], {"hunyuan3d": False, "hyper3d": False, "meshy": False})
+
+
+def test_meshy_key_never_crosses_the_mcp_side(tmp_path):
+    path = tmp_path / "pending.json"
+    send = _meshy({"p1": ["SUCCEEDED"], "r1": ["SUCCEEDED"]})
+    job, _key = _start_meshy(send, path)
+    _run(send, job, pending=generation.Pending(path))
+    for command, params in send.calls:
+        assert not any("key" in name.lower() for name in params), (command, params)
