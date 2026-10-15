@@ -430,7 +430,7 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
     local settings only: Premium generators come from the handshake rather than a
     status call, which would ask the Premium server once per generator."""
     status = {}
-    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d"):
+    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy"):
         if name in (premium_generators or []):
             status[name] = "on (Premium)"
             continue
@@ -442,7 +442,7 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
     status["tripo"] = "on (Premium)" if "tripo" in (premium_generators or []) else "off (Premium only)"
     return {
         "libraries": {k: status[k] for k in ("polyhaven", "sketchfab", "polypizza")},
-        "generators": {k: status[k] for k in ("tripo", "hunyuan3d", "hyper3d")},
+        "generators": {k: status[k] for k in ("tripo", "hunyuan3d", "hyper3d", "meshy")},
     }
 
 
@@ -1670,6 +1670,8 @@ def _generation_send(command: str, params: dict):
         if _addon_lacks(e):
             if "tripo" in command:
                 raise generation.Unsupported(TRIPO_UNAVAILABLE)
+            if "meshy" in command:
+                raise generation.Unsupported(missing_feature("Meshy", "Meshy"))
             label = "Hunyuan3D" if "hunyuan" in command else "Hyper3D Rodin"
             raise generation.Unsupported(missing_feature(label, label))
         raise
@@ -1677,7 +1679,11 @@ def _generation_send(command: str, params: dict):
 
 def _own_key_generators(blender: BlenderConnection) -> dict[str, bool]:
     enabled = {}
-    for name, command in (("hunyuan3d", "get_hunyuan3d_status"), ("hyper3d", "get_hyper3d_status")):
+    for name, command in (
+        ("hunyuan3d", "get_hunyuan3d_status"),
+        ("hyper3d", "get_hyper3d_status"),
+        ("meshy", "get_meshy_status"),
+    ):
         try:
             enabled[name] = bool(blender.send_command(command).get("enabled"))
         except Exception:
@@ -1704,9 +1710,15 @@ async def _generation_reply(ctx: Context, job: "generation.Job", wait_seconds: f
         bounds = []
     for b in bounds:
         lo, hi = b["world_bounding_box"]
-        reply += (f" world_bounding_box min {lo}, max {hi} (size {b['size']} m). Generated models have "
-                  "arbitrary scale and facing: scale it to real size, put its lowest point on the ground, "
-                  "rotate it to face the right way, then look(mode=\"angles\", target=[\"" + b["name"] + "\"]).")
+        reply += f" world_bounding_box min {lo}, max {hi} (size {b['size']} m)."
+        if job.provider == "meshy":
+            # Rescaling here would undo Meshy's auto_size.
+            reply += (" Meshy sized it to real-world height with its origin at the bottom. Don't rescale unless "
+                      "the user asks; check it faces the right way")
+        else:
+            reply += (" Generated models have arbitrary scale and facing: scale it to real size, put its lowest "
+                      "point on the ground, rotate it to face the right way")
+        reply += ", then look(mode=\"angles\", target=[\"" + b["name"] + "\"])."
     return reply + note
 
 
@@ -1728,8 +1740,8 @@ async def generate_3d(
     Make one new textured 3D model from a text prompt or an image, and import it.
 
     One object per call: not a whole scene, the ground, or parts to assemble. It arrives at
-    arbitrary scale and facing. Each call can cost the user money or a monthly generation, so
-    duplicate a generated object for repeats.
+    arbitrary scale and facing (meshy: real-world size, origin at the bottom). Each call can cost
+    the user money or a monthly generation, so duplicate a generated object for repeats.
 
     Waits up to wait_seconds (at most 45), then imports. Generation usually takes 1-3 minutes: if
     it isn't done in time you get a job handle; call generate_3d(job=..., name=...) again to keep
@@ -1741,7 +1753,7 @@ async def generate_3d(
     - image: Instead of a prompt: an absolute image file path or an http(s) URL. Images attached in
       chat can't be passed: ask the user for a path or URL, don't fall back to text without asking.
     - name: Object name in the scene. Defaults to one made from the prompt.
-    - provider: auto (default), tripo, hunyuan3d or hyper3d. Auto prefers the user's MCP for
+    - provider: auto (default), tripo, hunyuan3d, hyper3d or meshy. Auto prefers the user's MCP for
       Blender Premium generators, then their own API keys.
     - quality: "standard" or "high" (Premium). Omit for the user's default; "high" only when the
       user asks for more detail.

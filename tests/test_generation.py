@@ -522,3 +522,65 @@ def test_meshy_key_never_crosses_the_mcp_side(tmp_path):
     _run(send, job, pending=generation.Pending(path))
     for command, params in send.calls:
         assert not any("key" in name.lower() for name in params), (command, params)
+
+
+# ------------------------------------------------------------ Meshy, server side
+
+class _StatusBlender:
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.commands = []
+
+    def send_command(self, command, params=None, **_kw):
+        self.commands.append(command)
+        return {"enabled": command in self.enabled}
+
+
+def test_meshy_is_an_own_key_generator_and_reported(monkeypatch):
+    from blender_mcp import server
+
+    blender = _StatusBlender({"get_meshy_status"})
+    assert server._own_key_generators(blender) == {"hunyuan3d": False, "hyper3d": False, "meshy": True}
+    assert server._integrations(blender, [])["generators"]["meshy"] == "on"
+
+
+def test_missing_meshy_commands_explain_the_setup(monkeypatch):
+    from blender_mcp import server
+
+    class OldAddon:
+        def send_command(self, command, params=None, **_kw):
+            raise Exception(f"Unknown command type: {command}")
+
+    monkeypatch.setattr(server, "get_blender_connection", lambda: OldAddon())
+    for command in ("create_meshy_job", "refine_meshy_job", "poll_meshy_job_status"):
+        with pytest.raises(generation.Unsupported, match="Meshy"):
+            server._generation_send(command, {})
+
+
+def _reply_for(monkeypatch, job, send):
+    from blender_mcp import server
+
+    class Ctx:
+        async def report_progress(self, *_):
+            pass
+
+    monkeypatch.setattr(server, "_generation_send", send)
+    monkeypatch.setattr(server, "_pending_generations", lambda: generation.Pending(None))
+    monkeypatch.setattr(server, "_run_script", lambda *_a: [
+        {"name": job.name, "world_bounding_box": [[0, 0, 0], [0.3, 0.2, 0.25]], "size": [0.3, 0.2, 0.25]}])
+    return asyncio.run(server._generation_reply(Ctx(), job, 10))
+
+
+def test_meshy_reply_keeps_its_real_world_scale(monkeypatch):
+    reply = _reply_for(monkeypatch, Job("meshy", "t2r", "r1", "Teapot"), _meshy({"r1": ["SUCCEEDED"]}))
+    assert "Meshy sized it to real-world height with its origin at the bottom" in reply
+    assert "Don't rescale unless the user asks" in reply
+    assert "scale it to real size" not in reply
+
+
+def test_other_generators_still_get_the_rescale_advice(monkeypatch):
+    send = FakeAddon({"poll_tripo_job_status": {"status": "COMPLETED"},
+                      "import_generated_asset_tripo": {"succeed": True}})
+    reply = _reply_for(monkeypatch, Job("tripo", "rid", "q1", "Chest"), send)
+    assert "scale it to real size" in reply
+    assert "Meshy" not in reply
