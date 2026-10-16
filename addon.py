@@ -6094,7 +6094,7 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
             col.prop(self, "hunyuan3d_api_url", text="Hunyuan3D API URL")
             col.separator()
             col.prop(self, "meshy_api_key", text="Meshy API Key")
-            col.operator("wm.url_open", text="Get a Meshy API key (paid plan)", icon='URL').url = MESHY_KEY_URL
+            col.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
 
         layout.separator()
         layout.label(text="Persistent API Credentials:", icon='LOCKED')
@@ -6230,7 +6230,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 col.prop(prefs, "meshy_api_key", text="API Key")
             else:
                 col.prop(scene, "blendermcp_meshy_api_key", text="API Key")
-            sub.operator("wm.url_open", text="Get a Meshy API key (paid plan)", icon='URL').url = MESHY_KEY_URL
+            sub.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
 
         # Community section
         layout.separator()
