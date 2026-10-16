@@ -1691,6 +1691,19 @@ def _own_key_generators(blender: BlenderConnection) -> dict[str, bool]:
     return enabled
 
 
+def _meshy_unavailable(blender: BlenderConnection) -> str:
+    """Why Meshy can't run, in the addon's words: switched off, no key, or
+    Premium selected. Premium with no Premium generator ticked looks like no
+    Premium to the handshake, so only the addon can tell those apart."""
+    try:
+        reply = blender.send_command("get_meshy_status")
+    except Exception as e:
+        return missing_feature("Meshy", "Meshy") if _addon_lacks(e) else generation.MESHY_UNAVAILABLE
+    if isinstance(reply, dict) and not reply.get("enabled") and reply.get("message"):
+        return " ".join(reply["message"].split())
+    return generation.MESHY_UNAVAILABLE
+
+
 def _pending_generations() -> "generation.Pending":
     return generation.Pending(context_log.context_log_path().with_name("pending-generations.json"))
 
@@ -1772,8 +1785,10 @@ async def generate_3d(
             return "Error: give exactly one of prompt or image."
         blender = get_blender_connection()
         premium = _premium_generators(blender)
-        chosen, is_premium = generation.choose_provider(
-            provider, premium, {} if premium else _own_key_generators(blender))
+        own_keys = {} if premium else _own_key_generators(blender)
+        if not premium and (provider or "").lower() == "meshy" and not own_keys.get("meshy"):
+            return f"Error: {_meshy_unavailable(blender)}"
+        chosen, is_premium = generation.choose_provider(provider, premium, own_keys)
         note = "" if is_premium else premium_hint_once(ctx, {"mode": None})
         pending = _pending_generations()
         key = generation.request_key(chosen, prompt, image, quality, bbox_condition)

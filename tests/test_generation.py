@@ -584,3 +584,39 @@ def test_other_generators_still_get_the_rescale_advice(monkeypatch):
     reply = _reply_for(monkeypatch, Job("tripo", "rid", "q1", "Chest"), send)
     assert "scale it to real size" in reply
     assert "Meshy" not in reply
+
+
+def test_meshy_under_premium_says_premium_even_with_no_premium_generators_on(monkeypatch):
+    # Premium selected but no Premium generator ticked: the handshake lists none,
+    # so the own-key path runs and must still explain why Meshy is off.
+    from blender_mcp import server
+
+    class PremiumBlender:
+        def send_command(self, command, params=None, **_kw):
+            if command == "get_meshy_status":
+                return {"enabled": False, "message": "Meshy runs on your own Meshy API key only and isn't "
+                                                     "available while Premium is the generation source."}
+            return {"enabled": False}
+
+    monkeypatch.setattr(server, "get_blender_connection", lambda: PremiumBlender())
+    monkeypatch.setattr(server, "_premium_generators", lambda _: [])
+    reply = asyncio.run(server.generate_3d(None, prompt="a stool", provider="meshy", wait_seconds=10))
+    assert "Premium" in reply
+    assert "tick Meshy" not in reply
+
+
+def test_meshy_switched_off_relays_the_addon_setup_steps(monkeypatch):
+    from blender_mcp import server
+
+    class OffBlender:
+        def send_command(self, command, params=None, **_kw):
+            if command == "get_meshy_status":
+                return {"enabled": False, "message": """Meshy integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel"""}
+            return {"enabled": False}
+
+    monkeypatch.setattr(server, "get_blender_connection", lambda: OffBlender())
+    monkeypatch.setattr(server, "_premium_generators", lambda _: [])
+    reply = asyncio.run(server.generate_3d(None, prompt="a stool", provider="meshy", wait_seconds=10))
+    assert reply == ("Error: Meshy integration is currently disabled. To enable it: 1. In the 3D Viewport, "
+                     "find the MCP for Blender panel")
