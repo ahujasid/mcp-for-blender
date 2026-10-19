@@ -72,6 +72,8 @@ def _extract_tool_params(kwargs: dict, capture_code: bool) -> dict:
         'input_image_paths', 'input_image_urls',  # Hyper3D images
         'input_image_url',  # Hunyuan
         'name', 'task_uuid', 'request_id', 'zip_file_url',  # Import
+        'prompt', 'image', 'provider', 'quality', 'job',  # generate_3d
+        'mode', 'target', 'views', 'shading',  # look
     ]
     
     if capture_code:

@@ -1,0 +1,20 @@
+{
+  "name": "mcp-for-blender",
+  "interface": {
+    "displayName": "MCP for Blender"
+  },
+  "plugins": [
+    {
+      "name": "mcp-for-blender",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mcp-for-blender"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Design"
+    }
+  ]
+}

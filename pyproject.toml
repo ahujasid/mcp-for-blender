@@ -1,7 +1,7 @@
 [project]
 name = "mcp-for-blender"
-version = "2.1.0"
-description = "Blender integration through the Model Context Protocol"
+version = "2.2.0"
+description = "Open source Blender integration through the Model Context Protocol (not affiliated with Blender Foundation)"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -13,7 +13,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "mcp>=1.9.0,<2",
+    "mcp>=1.26.0,<2",
     "httpx>=0.27.0",
 ]
 
@@ -32,7 +32,7 @@ build-backend = "setuptools.build_meta"
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-blender_mcp = ["bundled/addon.py"]
+blender_mcp = ["bundled/addon.py", "apps/*.html", "guides/*.md"]
 
 [project.urls]
 "Homepage" = "https://github.com/ahujasid/blender-mcp"

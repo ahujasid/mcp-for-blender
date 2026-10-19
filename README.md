@@ -12,11 +12,11 @@
 Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/blender-mcp?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/blender-mcp)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/SNqPn4TcKQ)
+[![Website](https://img.shields.io/badge/Website-mcp--for--blender.com-black)](https://mcp-for-blender.com/)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/ahujasid)
 [![PyPI Version](https://img.shields.io/pypi/v/mcp-for-blender?color=blue)](https://pypi.org/project/mcp-for-blender/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/SNqPn4TcKQ)
-
-[**Website**](https://mcp-for-blender.com/) · [**Full Tutorial**](https://www.youtube.com/watch?v=lCyQ717DuzQ) · [**Discord**](https://discord.gg/SNqPn4TcKQ) · [**Sponsor**](https://github.com/sponsors/ahujasid) · [**Buy me a coffee**](https://buymeacoffee.com/ahujasid) · [**Feedback**](https://cal.com/siddharth-ahuja/feedback-call)
 
 <a href="https://trendshift.io/repositories/14834?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-14834" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/14834" alt="ahujasid%2Fblender-mcp | Trendshift" width="250" height="55"/></a>
 
@@ -25,7 +25,6 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 **Supporters**
 
 [CodeRabbit](https://www.coderabbit.ai/)
-[Kevin Guanche Darias](https://github.com/KevinGuancheDarias)
 [Guillermo Rauch](https://github.com/rauchg)
 
 **All supporters:** [Support this project](https://github.com/sponsors/ahujasid)
@@ -40,6 +39,30 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 > keep working — `uvx blender-mcp` still runs the server and **no config change is
 > required**. New installs should use `mcp-for-blender`.
 > [What changed and why](https://github.com/ahujasid/mcp-for-blender/issues/366)
+
+**One command** sets up your AI apps and the Blender addon:
+
+**macOS / Linux**
+
+```bash
+curl -LsSf https://www.mcp-for-blender.com/install.sh | sh
+```
+
+**Windows** (PowerShell)
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://www.mcp-for-blender.com/install.ps1 | iex"
+```
+
+Already have uv? Run `uvx mcp-for-blender setup` instead.
+
+It installs [uv](https://docs.astral.sh/uv/) if needed, finds the MCP clients on your machine (Claude Desktop, Claude Code, Codex, Cursor, VS Code, Devin Desktop/Windsurf, OpenCode, Antigravity), and lets you pick which to set up. Then it installs the Blender addon and enables it. Your existing config is kept: it only adds a `blender` entry and saves a `.bak` of each file it changes.
+
+Then **fully quit and reopen your AI app** (on Windows, quit it from the system tray), open Blender, and ask it to build something. The addon starts its server when Blender opens.
+
+
+<details>
+<summary><b>Manual setup, in case the automatic setup doesn't work</b></summary>
 
 Three steps: install `uv`, point your MCP client at the server, install the Blender addon.
 
@@ -107,7 +130,9 @@ Then in Blender: **Edit → Preferences → Add-ons** → enable **Interface: MC
 
 **4. Connect**
 
-In Blender's 3D viewport, press `N` → open the **MCP for Blender** tab → click **Start MCP Server**. That's it — ask Claude to build something.
+The addon starts its server when Blender opens. To check, press `N` in the 3D viewport → open the **MCP for Blender** tab (click **Start MCP Server** if it isn't running). That's it — ask Claude to build something.
+
+</details>
 
 > **Note:** Only run **one** instance of the MCP server (either Cursor or Claude Desktop), not both.
 
@@ -120,6 +145,7 @@ In Blender's 3D viewport, press `N` → open the **MCP for Blender** tab → cli
 - [Premium](#premium)
 - [Components](#components)
 - [Installation](#installation)
+  - [Automatic setup](#automatic-setup)
   - [Prerequisites](#prerequisites)
   - [Make your client find uvx](#make-your-client-find-uvx)
   - [Pin the Python version](#pin-the-python-version)
@@ -159,9 +185,9 @@ In Blender's 3D viewport, press `N` → open the **MCP for Blender** tab → cli
 | **Two-way communication** | Connect Claude AI to Blender through a socket-based server |
 | **Object manipulation** | Create, modify, and delete 3D objects in Blender |
 | **Material control** | Apply and modify materials and colors |
-| **Scene inspection** | Get detailed information about the current Blender scene |
-| **Code execution** | Run arbitrary Python code in Blender from Claude |
-| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Hyper3D Rodin and Hunyuan3D |
+| **Visual verification** | Multi-angle, camera, wireframe, X-ray and animation-strip views, plus renders, so the AI checks its own work |
+| **Code execution** | The AI writes Blender Python directly |
+| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Tripo, Hyper3D Rodin and Hunyuan3D |
 
 ## Premium
 
@@ -177,6 +203,22 @@ The system consists of two main components:
 ---
 
 ## Installation
+
+### Automatic setup
+
+The quickest way is the one-line installer. It installs uv, configures your MCP clients, and installs and enables the Blender addon:
+
+```bash
+# macOS / Linux
+curl -LsSf https://www.mcp-for-blender.com/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://www.mcp-for-blender.com/install.ps1 | iex"
+```
+
+Already have uv? Run `uvx mcp-for-blender setup` instead. See [Quickstart](#quickstart) for what it changes. The rest of this section covers manual setup.
 
 ### Prerequisites
 
@@ -313,6 +355,8 @@ The following environment variables can be used to configure the Blender connect
 | `BLENDER_HOST` | `localhost` | Host address for Blender socket server |
 | `BLENDER_PORT` | `9876` | Port number for Blender socket server |
 | `BLENDER_MCP_SAFE_MODE` | off | Set to `1` to validate scripts before they run in Blender (see below) |
+| `BLENDER_MCP_APPS` | auto | Set to `1` to force the inline viewport app on for clients that support MCP Apps without advertising it (the Codex plugin sets this) |
+| `BLENDER_MCP_OPENAI_FORMS` | auto | Set to `1` to force the thumbnail asset pickers on (the Codex plugin sets this) |
 
 Example:
 
@@ -389,6 +433,21 @@ claude mcp add blender uvx mcp-for-blender
 
 The Codex CLI, desktop app, and IDE extension all share the same config file (`~/.codex/config.toml`), so setting the server up once covers all three.
 
+#### Codex plugin (recommended)
+
+The plugin adds a live viewport inline in the chat (click an object to attach it to your next message), thumbnail pickers for Poly Haven, Sketchfab and Poly Pizza, and `@`-mentions for scene objects, materials and collections. It isn't in the Codex plugin directory yet, so add it from this repo:
+
+```bash
+git clone https://github.com/ahujasid/blender-mcp.git
+codex plugin marketplace add ./blender-mcp/integrations/codex
+```
+
+Then restart Codex, install **MCP for Blender** from the plugins directory, and ask it to use MCP for Blender in chat. Once it's running, the viewport opens in a side panel next to the conversation:
+
+![MCP for Blender plugin in the Codex app, showing the live viewport beside the chat](assets/codex-screenshot.png)
+
+#### Plain MCP server
+
 Register the server with the [Codex CLI](https://github.com/openai/codex):
 
 ```bash
@@ -463,7 +522,7 @@ env = { BLENDER_HOST = "localhost", BLENDER_PORT = "9876" }
 
 *Prerequisites*: Make sure you have [Visual Studio Code](https://code.visualstudio.com/) installed before proceeding.
 
-[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_mcp--for--blender_server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=ffffff)](vscode:mcp/install?%7B%22name%22%3A%22blender-mcp%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-for-blender%22%5D%7D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_mcp--for--blender_server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=ffffff)](https://vscode.dev/redirect/mcp/install?name=blender&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-for-blender%22%5D%7D)
 
 ### OpenCode
 
@@ -504,6 +563,8 @@ env = { BLENDER_HOST = "localhost", BLENDER_PORT = "9876" }
 
 ## Installing the Blender Addon
 
+> `uvx mcp-for-blender setup` (see [Quickstart](#quickstart)) does all of this, including enabling the addon. The steps below are for doing it by hand.
+
 **1. Recommended** — from a terminal, run:
 
 ```bash
@@ -528,18 +589,23 @@ Then open the **MCP for Blender** tab in Blender's sidebar (press `N` in the 3D 
 
 > For newcomers, go straight to [Quickstart](#quickstart). For existing users, see below.
 
-**1.** Update the addon file by running:
+**1.** Run:
 
 ```bash
-uvx mcp-for-blender install-addon
-uvx mcp-for-blender addon-paths   # optional: list detected Blender addons folders
+uvx mcp-for-blender@latest update
 ```
 
-**2.** In Blender: **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender** (or restart Blender), then click **Start MCP Server** again.
+This updates the MCP server (refreshing uv's cached copy, or upgrading a `uv tool install`) and every installed copy of the Blender addon, keeping a `.bak` of each file it replaces. It never downgrades an addon that's newer than the release, and leaves alone a copy you've edited locally. Add `--dry-run` to see what it would change first.
 
-**3.** Delete the MCP server from Claude and add it back again if the server package itself needs a refresh.
+> Use `@latest` the first time: releases older than 2.1.7 don't have the `update` command, and uvx may still have one of those cached.
 
-> **Note:** the MCP server never modifies your Blender addon files on its own. When it starts, it checks whether the installed addon is behind the bundled copy and logs how to update; `install-addon` is what actually writes, and it keeps a `.bak` of the file it replaces. Trajectory capture still works on older loaded addons via an `execute_code` fallback.
+**2.** Restart your MCP client (Claude Desktop, Cursor, ...) so it starts the new server.
+
+**3.** In Blender: restart it, or **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender**, then click **Start MCP Server** again.
+
+If a client is still set up with the old `blender-mcp` package name, `update` says so; `uvx mcp-for-blender setup` switches it over.
+
+> **Note:** the MCP server never modifies your Blender addon files on its own. When it starts, it checks whether the installed addon is behind the bundled copy and logs how to update; `update` and `install-addon` are what actually write. Trajectory capture still works on older loaded addons via an `execute_code` fallback.
 
 ---
 
@@ -563,16 +629,17 @@ Once the config file has been set on Claude, and the addon is running on Blender
 
 ### Capabilities
 
-- Get scene and object information
-- Create, delete and modify shapes
-- Apply or create materials for objects
-- Execute any Python code in Blender
-- Export the scene, the selection or named objects to GLB/FBX for other applications (`export_scene`)
-- Look up node schemas and the bpy API reference instead of guessing socket order or enum names
-- Search and download free CC0 HDRIs, textures and models from [Poly Haven](https://polyhaven.com/)
-- Search and download models from [Sketchfab](https://sketchfab.com/)
-- Search and download low-poly models from [Poly Pizza](https://poly.pizza/)
-- AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/) and [Hunyuan3D](https://3d.hunyuan.tencent.com/)
+The AI writes Blender Python itself for modelling, layout, materials, animation, rigging and retopology. The MCP adds what Python can't do on its own, as nine tools:
+
+| Tool | What it's for |
+|---|---|
+| `execute_blender_code` | Run Python in your live Blender |
+| `look` | See the result from the `viewport`, `camera`, `angles` (auto-framed multi-view sheet, any direction) or `frames` (animation strip), drawn `solid`, `material`, `rendered`, `wireframe` or `xray`; or show a render or image file |
+| `get_scene_info` | Compact scene summary, one line per object with the fields you pick (placement, materials, topology, weights, ...); drill in with `root` or `query` |
+| `generate_3d` | One call to generate and import a model with Tripo, Hunyuan3D, Hyper3D Rodin or Meshy. Premium generators are preferred automatically |
+| `search_assets` / `import_asset` | [Poly Haven](https://polyhaven.com/) HDRIs, textures and models, [Sketchfab](https://sketchfab.com/) models, [Poly Pizza](https://poly.pizza/) low-poly models |
+| `get_addon_status` | Blender version, addon version, and which libraries and generators are switched on |
+| `disable_telemetry`, `record_trajectory_feedback` | Data collection controls |
 
 #### Hunyuan3D on Tencent Cloud (Official API mode)
 
@@ -587,6 +654,14 @@ International credentials sent to the mainland endpoint fail with `AuthFailure.S
 `ResourceUnavailable`, so tick the toggle when your SecretId/SecretKey come from tencentcloud.com.
 The toggle sits under **Tencent Hunyuan 3D → Official API** in the sidebar.
 
+#### Meshy
+
+[Meshy](https://www.meshy.ai/) generates textured 3D models from a text prompt or a reference image,
+sized to real-world height with the origin at the bottom, so models arrive standing on the ground at a plausible size.
+It runs on your own Meshy API key only, not through Premium. API keys need a paid Meshy plan:
+[get a Meshy API key](https://www.meshy.ai/developers/keys?utm_source=mcp-for-blender&utm_medium=integration&utm_campaign=blender-addon).
+Tick **Meshy** under **AI Model Generation** in the sidebar, choose a **Model**, and paste the key.
+
 #### Poly Haven
 
 [Poly Haven](https://polyhaven.com/) publishes around 2,400 HDRIs, textures and models,
@@ -599,18 +674,15 @@ Worked example:
 
 > *"Light the scene with an overcast afternoon HDRI and put a rusty metal texture on the wall"*
 
-Claude calls `search_polyhaven_assets(query="overcast afternoon", asset_type="hdris")`,
+Claude calls `search_assets(source="polyhaven", query="overcast afternoon", asset_type="hdris")`,
 which understands the intent rather than matching keywords - "couch" finds sofas, and it
-works in any language. It can then check the thumbnail with
-`get_polyhaven_asset_preview(asset_id="...")` before spending the bandwidth, and import
-with `download_polyhaven_asset(...)`.
+works in any language. `previews=3` attaches thumbnails of the top results before spending
+the bandwidth, and `import_asset(source="polyhaven", id="...", asset_type="textures", apply_to=["Wall"])`
+downloads a texture and applies it in one call.
 
-`get_polyhaven_categories(asset_type="textures")` returns the category tree and every
-attribute that type can be filtered on, each with the values it accepts - weather and time
-of day for HDRIs, surface use and condition for textures, material and whether a model is
-rigged or ships level-of-detail variants. Pass a category path or those attributes to
-`search_polyhaven_assets`; matching on a category is inclusive, so a parent selects
-everything nested beneath it.
+Searches can also filter on a category path or on attributes such as weather and time of
+day for HDRIs, or surface use and condition for textures; an unknown attribute errors with
+the valid ones.
 
 Models are imported from the `.blend`, which is the file the artist authored - the glTF,
 FBX and USD versions are generated from it and lose material detail. Textures build a
@@ -643,9 +715,9 @@ Worked example:
 
 > *"Search Poly Pizza for a low-poly chair under a CC0 licence and import one at 1 metre tall"*
 
-Claude calls `search_polypizza_models(query="chair", licence="CC0")`, which returns each
+Claude calls `search_assets(source="polypizza", query="chair", licence="CC0")`, which returns each
 match with its licence and triangle count, then
-`download_polypizza_model(model_id="...", normalize_size=True, target_size=1.0)`.
+`import_asset(source="polypizza", id="...", target_size=1.0)`.
 
 You can also filter by category (`"Animals"`, `"Furniture & Decor"`, `"Transport"`,
 `"Nature"`, `"Buildings"`, `"People & Characters"`, `"Food & Drink"`, `"Weapons"`,
@@ -669,6 +741,7 @@ Here are some examples of what you can ask Claude to do:
 | Give a reference image, and create a Blender scene out of it | [Watch](https://www.youtube.com/watch?v=FDRb03XPiRo) |
 | *"Get information about the current scene, and make a threejs sketch from it"* | [Watch](https://www.youtube.com/watch?v=jxbNI5L7AH8) |
 | *"Generate a 3D model of a garden gnome through Hyper3D"* | |
+| *"Generate a wooden rocking chair with Meshy"* | |
 | *"Fill this room with low-poly furniture from Poly Pizza"* | |
 | *"Make this car red and metallic"* | |
 | *"Create a sphere and place it above the cube"* | |
@@ -690,6 +763,7 @@ You can store these values there so they survive Blender restarts:
 - Hyper3D API Key
 - Hunyuan3D SecretId / SecretKey
 - Hunyuan3D API URL
+- Meshy API Key
 
 For headless setups or CI, credentials can also be injected by environment variables:
 
@@ -701,6 +775,7 @@ For headless setups or CI, credentials can also be injected by environment varia
 | `BLENDERMCP_HUNYUAN3D_SECRET_ID` |
 | `BLENDERMCP_HUNYUAN3D_SECRET_KEY` |
 | `BLENDERMCP_HUNYUAN3D_API_URL` |
+| `BLENDERMCP_MESHY_API_KEY` |
 
 ---
 

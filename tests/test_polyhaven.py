@@ -1849,7 +1849,7 @@ def test_the_tool_response_says_where_the_asset_came_from():
     original = server.get_blender_connection
     server.get_blender_connection = lambda: FakeBlender()
     try:
-        out = asyncio.run(server.download_polyhaven_asset(
+        out = asyncio.run(server._download_polyhaven(
             None, asset_id="rock_wall_10", asset_type="textures", user_prompt=""))
     finally:
         server.get_blender_connection = original
@@ -2058,7 +2058,7 @@ def test_a_models_three_axis_size_is_reported_in_full():
     original = server.get_blender_connection
     server.get_blender_connection = lambda: FakeBlender()
     try:
-        out = asyncio.run(server.search_polyhaven_assets(None, query="chair", user_prompt=""))
+        out = asyncio.run(server._search_polyhaven(None, query="chair", user_prompt=""))
     finally:
         server.get_blender_connection = original
 
@@ -2246,7 +2246,7 @@ def test_the_download_message_says_how_big_the_texture_is_and_how_to_tile_it():
     original = server.get_blender_connection
     server.get_blender_connection = lambda: FakeBlender()
     try:
-        out = asyncio.run(server.download_polyhaven_asset(
+        out = asyncio.run(server._download_polyhaven(
             None, "wooden_planks", "textures", user_prompt=""))
     finally:
         server.get_blender_connection = original
@@ -2274,7 +2274,7 @@ def test_a_texture_with_no_published_size_says_nothing_about_tiling():
     original = server.get_blender_connection
     server.get_blender_connection = lambda: FakeBlender()
     try:
-        out = asyncio.run(server.download_polyhaven_asset(None, "x", "textures", user_prompt=""))
+        out = asyncio.run(server._download_polyhaven(None, "x", "textures", user_prompt=""))
     finally:
         server.get_blender_connection = original
 

@@ -221,6 +221,8 @@ SEMANTIC_ACTIONS: dict[str, str] = {
     "get_scene_info": "OBSERVE",
     "get_object_info": "OBSERVE",
     "get_viewport_screenshot": "OBSERVE",
+    "look": "OBSERVE",
+    "generate_3d": "GENERATE_3D",
     "episode_end": "EPISODE_END",
 }
 

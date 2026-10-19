@@ -181,29 +181,3 @@ def test_command_is_always_routed(monkeypatch, tmp_path):
 
     assert command["status"] == "success"
     assert command["result"]["exported"] == ["A"]
-
-
-def test_mcp_tool_forwards_the_command_to_blender():
-    from blender_mcp import server
-
-    sent = []
-
-    class FakeBlender:
-        def send_command(self, command, params=None):
-            sent.append((command, params))
-            return {"path": "/tmp/x.glb", "bytes": 10, "selection_only": False, "exported": ["A"]}
-
-    original = server.get_blender_connection
-    server.get_blender_connection = lambda: FakeBlender()
-    try:
-        out = asyncio.run(server.export_scene(
-            None, filepath="/tmp/x.glb", format="glb", object_names=None, selection_only=False,
-            apply_modifiers=True, user_prompt=""))
-    finally:
-        server.get_blender_connection = original
-
-    # The trajectory decorator also sends get_telemetry_consent, so match on the export.
-    exports = [entry for entry in sent if entry[0] == "export_scene"]
-    assert exports == [("export_scene", {"filepath": "/tmp/x.glb", "format": "glb", "object_names": None,
-                                         "selection_only": False, "apply_modifiers": True})]
-    assert json.loads(out)["exported"] == ["A"]

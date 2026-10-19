@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "mcp-for-blender": {
+      "command": "uvx",
+      "args": [
+        "mcp-for-blender"
+      ],
+      "env_vars": [
+        "PATH",
+        "HOME",
+        "BLENDER_MCP_SAFE_MODE",
+        "DISABLE_TELEMETRY",
+        "BLENDER_MCP_DISABLE_TELEMETRY"
+      ],
+      "tool_timeout_sec": 600,
+      "env": {
+        "BLENDER_MCP_APPS": "1",
+        "BLENDER_MCP_OPENAI_FORMS": "1"
+      }
+    }
+  }
+}

@@ -360,7 +360,7 @@ wheels = [
 
 [[package]]
 name = "mcp-for-blender"
-version = "2.0.3"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -370,7 +370,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "mcp", specifier = ">=1.9.0,<2" },
+    { name = "mcp", specifier = ">=1.26.0,<2" },
 ]
 
 [[package]]

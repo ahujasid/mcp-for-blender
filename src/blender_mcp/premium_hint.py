@@ -39,3 +39,26 @@ def premium_hint_once(ctx: Any, status: Any) -> str:
             return ""
         _hinted_sessions.add(session_key)
     return PREMIUM_HINT
+
+
+_GENERATOR_TOOLS = {
+    "tripo": "Tripo",
+    "hunyuan3d": "Hunyuan3D",
+    "hyper3d": "Hyper3D Rodin",
+}
+
+
+def premium_generation_guidance(generators: Any) -> str:
+    """Say which generators the user's Premium plan gives them.
+
+    `generators` is the addon's `premium_generators` handshake field: the
+    generators Premium has switched on. Returns "" when there are none, so
+    own-key users see no change.
+    """
+    names = [_GENERATOR_TOOLS[g] for g in (generators or []) if g in _GENERATOR_TOOLS]
+    if not names:
+        return ""
+    return (
+        "\n\nMCP for Blender Premium is on, with " + ", ".join(names) + " for generate_3d. These "
+        "don't use the user's own API keys; each generation uses one of their monthly generations."
+    )

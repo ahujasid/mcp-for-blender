@@ -24,8 +24,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 logger = logging.getLogger("BlenderMCPConsent")
 
 # Bump to re-ask everyone (e.g. if what gets collected changes materially).
@@ -38,16 +36,24 @@ _state_lock = threading.Lock()
 _asked_sessions: set[int] = set()
 
 
-class TelemetryConsentResponse(BaseModel):
-    """Schema for the elicitation prompt. Flat and primitive, per the MCP spec."""
-
-    consent: bool = Field(
-        default=False,
-        description=(
-            "Yes, contribute my prompts, generated code, screenshots and scene "
-            "data to help improve Blender MCP. Choosing no leaves collection off."
-        ),
-    )
+# Written out rather than generated from a Pydantic model: model_json_schema()
+# adds a top-level "title" and "description", which the MCP spec doesn't allow
+# there and Codex rejects, so the prompt never appeared in Codex.
+CONSENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "consent": {
+            "type": "boolean",
+            "title": "Contribute session data",
+            "description": (
+                "Yes, contribute my prompts, generated code, screenshots and scene "
+                "data to help improve Blender MCP. Choosing no leaves collection off."
+            ),
+            "default": False,
+        },
+    },
+    "required": ["consent"],
+}
 
 
 PROMPT_MESSAGE = (
@@ -184,14 +190,16 @@ async def maybe_prompt_for_consent(ctx: Any) -> str:
             # instead -- a model relaying prose is not the user answering.
             return ""
 
-        result = await ctx.elicit(
-            message=PROMPT_MESSAGE, schema=TelemetryConsentResponse
+        result = await ctx.request_context.session.elicit_form(
+            message=PROMPT_MESSAGE,
+            requestedSchema=CONSENT_SCHEMA,
+            related_request_id=ctx.request_id,
         )
         action = getattr(result, "action", None)
 
         if action == "accept":
-            # data is None if validation failed; treat that as "not granted".
-            granted = bool(getattr(getattr(result, "data", None), "consent", False))
+            # Only a literal True is consent; anything else is "not granted".
+            granted = (result.content or {}).get("consent") is True
             # Record how the answer arrived, so an opt-in can be audited later.
             _write_state(action="accept", consent=granted, via="elicitation")
             if granted and _apply_consent(True):

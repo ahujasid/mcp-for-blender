@@ -33,3 +33,6 @@ supabase/.temp/
 *.pem
 *.key
 .secrets/
+
+# Local eval harness (see evals/README.md)
+evals/

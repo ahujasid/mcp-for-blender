@@ -12,7 +12,7 @@ def _listed_tools():
 def test_every_registered_tool_has_explicit_annotations():
     tools = _listed_tools()
 
-    assert set(tools) == set(TOOL_ANNOTATIONS)
+    assert set(TOOL_ANNOTATIONS) <= set(tools)
     for name, tool in tools.items():
         assert tool.annotations is not None, name
         assert tool.annotations.readOnlyHint is not None, name
@@ -30,11 +30,11 @@ def test_scene_inspection_does_not_require_telemetry_context():
 def test_read_only_tools_are_marked_as_observation():
     tools = _listed_tools()
 
-    for name in ("get_scene_info", "get_object_info", "describe_node_type", "bpy_api_lookup"):
+    for name in ("get_scene_info", "get_addon_status", "look", "search_mentions", "viewport_latest", "viewport_pick"):
         assert tools[name].annotations.readOnlyHint is True
 
-    assert tools["search_polyhaven_assets"].annotations.readOnlyHint is True
-    assert tools["search_polyhaven_assets"].annotations.openWorldHint is True
+    assert tools["search_assets"].annotations.readOnlyHint is True
+    assert tools["search_assets"].annotations.openWorldHint is True
 
 
 def test_mutations_and_external_actions_are_not_marked_read_only():
@@ -45,16 +45,16 @@ def test_mutations_and_external_actions_are_not_marked_read_only():
     assert code.destructiveHint is True
     assert code.openWorldHint is True
 
-    texture = tools["set_texture"].annotations
+    texture = tools["import_asset"].annotations
     assert texture.readOnlyHint is False
     assert texture.destructiveHint is True
 
-    download = tools["download_polyhaven_asset"].annotations
+    download = tools["generate_3d"].annotations
     assert download.readOnlyHint is False
     assert download.destructiveHint is False
     assert download.openWorldHint is True
 
-    export = tools["export_scene"].annotations
-    assert export.readOnlyHint is False
-    assert export.destructiveHint is True
-    assert export.openWorldHint is False
+    telemetry = tools["disable_telemetry"].annotations
+    assert telemetry.readOnlyHint is False
+    assert telemetry.idempotentHint is True
+    assert telemetry.openWorldHint is False

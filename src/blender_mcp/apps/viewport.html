@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blender Viewport</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: var(--color-background-primary, #ffffff);
+    --bg-2: var(--color-background-secondary, #f4f4f5);
+    --fg: var(--color-text-primary, #18181b);
+    --fg-2: var(--color-text-secondary, #71717a);
+    --border: var(--color-border-primary, rgba(0, 0, 0, 0.1));
+    --accent: #f59e0b;
+    --radius: var(--border-radius-md, 8px);
+    --font: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
+  }
+  :root[data-theme="dark"] {
+    --bg: var(--color-background-primary, #18181b);
+    --bg-2: var(--color-background-secondary, #27272a);
+    --fg: var(--color-text-primary, #fafafa);
+    --fg-2: var(--color-text-secondary, #a1a1aa);
+    --border: var(--color-border-primary, rgba(255, 255, 255, 0.12));
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  /* Fill a fixed-height container (fullscreen); otherwise size to content. */
+  :root[data-fill] body { height: 100vh; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.4 var(--font);
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  #status { flex: 1; color: var(--fg-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status[data-busy]::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+  button {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  main {
+    flex: 1;
+    min-height: 240px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px;
+  }
+  :root[data-display="inline"] main { min-height: 0; }
+  #stage { position: relative; max-width: 100%; line-height: 0; }
+  #stage[data-clickable] { cursor: crosshair; }
+  img {
+    display: block;
+    max-width: 100%;
+    max-height: calc(100vh - 96px);
+    border-radius: var(--radius);
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  :root[data-display="inline"] img { max-height: 420px; }
+  .marker {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    pointer-events: none;
+    line-height: 1.2;
+  }
+  .marker::before {
+    content: "";
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--accent);
+    border-radius: 50%;
+    background: rgba(245, 158, 11, 0.25);
+    flex: none;
+  }
+  .marker span {
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  #hint { color: var(--fg-2); font-size: 12px; text-align: center; }
+  #empty { max-width: 320px; text-align: center; color: var(--fg-2); }
+  #error { color: #dc2626; padding: 0 12px 8px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <span id="status">Connecting…</span>
+  <button id="refresh" title="Capture the Blender viewport now">Refresh</button>
+</header>
+<div id="error" hidden></div>
+<main>
+  <div id="stage" hidden>
+    <img id="shot" alt="Blender viewport">
+  </div>
+  <p id="hint" hidden></p>
+  <p id="empty">No viewport screenshot yet. It appears here whenever the assistant looks at your scene, or press Refresh to capture one now.</p>
+</main>
+<script>
+(() => {
+  const POLL_MS = 2000;
+  // While the scene has changed but Blender is still busy, check back sooner
+  // so the new capture lands soon after the assistant's last edit.
+  const STALE_POLL_MS = 500;
+  // After a failed automatic capture, wait before trying again on our own.
+  const AUTO_RETRY_MS = 15000;
+  const STATE_META = "mcp-for-blender/viewport";
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    seq: 0, image: null, capturedAt: null, source: null, file: null, scene: null, sceneCount: null,
+    pickable: false, addonOutdated: false, stale: false, quiet: true,
+    capturing: false, autoBlockedUntil: 0,
+    displayMode: null,
+    canAttach: false, canLink: false,
+    // Objects the user clicked on the image showing capture `picksSeq`.
+    picks: [], picksSeq: null, picking: false,
+  };
+  let ready = false;
+  let nextId = 0;
+  const pending = new Map();
+
+  const send = (message) => window.parent.postMessage({ jsonrpc: "2.0", ...message }, "*");
+  const notify = (method, params = {}) => send({ method, params });
+  const request = (method, params = {}, timeoutMs = 30000) =>
+    new Promise((resolve, reject) => {
+      const id = ++nextId;
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error(method + " timed out")); }, timeoutMs);
+      pending.set(id, { resolve, reject, timer });
+      send({ id, method, params });
+    });
+
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (event.source !== window.parent || !msg || msg.jsonrpc !== "2.0") return;
+    if (msg.id != null && !msg.method) {
+      const call = pending.get(msg.id);
+      if (!call) return;
+      pending.delete(msg.id);
+      clearTimeout(call.timer);
+      msg.error ? call.reject(new Error(msg.error.message)) : call.resolve(msg.result);
+    } else if (msg.method === "ui/resource-teardown") {
+      send({ id: msg.id, result: {} });
+    } else if (msg.method === "ui/notifications/tool-result") {
+      applyResult(msg.params);
+    } else if (msg.method === "ui/notifications/host-context-changed") {
+      applyHost(msg.params || {});
+    } else if (msg.id != null) {
+      send({ id: msg.id, error: { code: -32601, message: "Unsupported method: " + msg.method } });
+    }
+  });
+
+  function applyHost(ctx) {
+    if (ctx.theme) document.documentElement.dataset.theme = ctx.theme;
+    for (const [key, value] of Object.entries(ctx.styles?.variables || {}))
+      if (value) document.documentElement.style.setProperty(key, value);
+    if (ctx.displayMode) state.displayMode = ctx.displayMode;
+    if (state.displayMode) document.documentElement.dataset.display = state.displayMode;
+    const dims = ctx.containerDimensions;
+    if (dims) {
+      document.documentElement.toggleAttribute("data-fill", "height" in dims);
+      document.documentElement.style.maxHeight = dims.maxHeight ? dims.maxHeight + "px" : "";
+    } else if (ctx.displayMode) {
+      document.documentElement.toggleAttribute("data-fill", ctx.displayMode !== "inline");
+    }
+    if ("openai/modelContext" in ctx) syncPicks(ctx["openai/modelContext"]);
+    render();
+  }
+
+  // The user can remove attachments in the composer: drop the markers for
+  // any object whose link is no longer attached.
+  function syncPicks(context) {
+    if (context == null) { state.picks = []; return; }
+    const uris = new Set((context.content || []).map((c) => c.uri).filter(Boolean));
+    if (state.canLink) state.picks = state.picks.filter((p) => uris.has(p.link.uri));
+  }
+
+  function applyResult(result) {
+    if (!result) return;
+    if (result.isError) {
+      showError(result.content?.find((c) => c.type === "text")?.text || "Something went wrong.");
+      return;
+    }
+    showError(null);
+    // get_viewport_screenshot keeps its state in _meta so the model doesn't see it.
+    const s = result.structuredContent || result._meta?.[STATE_META] || {};
+    // The server restarted and its counter began again: poll from zero.
+    if (typeof s.seq === "number" && s.seq < state.seq) { state.seq = 0; poll(); return; }
+    const image = result.content?.find((c) => c.type === "image");
+    if (image && (s.seq || 0) >= state.seq) {
+      state.image = image;
+      state.seq = s.seq || state.seq;
+      state.capturedAt = s.captured_at ?? Date.now() / 1000;
+      state.source = s.source ?? "model";
+      state.pickable = !!s.pickable;
+      state.file = s.file ?? null;
+      state.scene = s.scene ?? null;
+      state.sceneCount = s.scene_count ?? null;
+    }
+    if (typeof s.stale === "boolean") state.stale = s.stale;
+    if (typeof s.blender_quiet === "boolean") state.quiet = s.blender_quiet;
+    if (typeof s.addon_outdated === "boolean") state.addonOutdated = s.addon_outdated;
+    render();
+  }
+
+  function ago(seconds) {
+    const s = Math.max(0, Math.round(Date.now() / 1000 - seconds));
+    if (s < 10) return "just now";
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.floor(s / 60) + " min ago";
+    return new Date(seconds * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  const SOURCE_LABELS = {
+    user: "Captured by you",
+    model: "Seen by the assistant",
+    auto: "Updated after the assistant's changes",
+  };
+
+  // "robot.blend", plus the scene when the file has more than one. Null for
+  // addons that don't say which file a capture came from.
+  function where() {
+    if (state.file == null) return null;
+    const name = state.file ? state.file.split(/[\\/]/).pop() : "Unsaved file";
+    return state.scene && state.sceneCount > 1 ? name + " › " + state.scene : name;
+  }
+
+  function render() {
+    const has = !!state.image;
+    $("stage").hidden = !has;
+    $("empty").hidden = has;
+    const busy = state.capturing || state.stale;
+    $("status").toggleAttribute("data-busy", busy);
+    if (state.capturing) {
+      $("status").textContent = "Updating…";
+    } else if (busy) {
+      $("status").textContent = "The scene changed · updating when Blender is idle";
+    } else if (has) {
+      const parts = [SOURCE_LABELS[state.source] || SOURCE_LABELS.model, where(), ago(state.capturedAt)];
+      $("status").textContent = parts.filter(Boolean).join(" · ");
+    } else {
+      $("status").textContent = "Waiting for a screenshot";
+    }
+    if (has) {
+      const src = "data:" + (state.image.mimeType || "image/png") + ";base64," + state.image.data;
+      if ($("shot").src !== src) $("shot").src = src;
+    }
+    $("status").title = state.file || "";
+    $("refresh").disabled = state.capturing;
+    renderPicks(has);
+  }
+
+  function renderPicks(has) {
+    $("stage").toggleAttribute("data-clickable", has && state.canAttach);
+    $("hint").hidden = !has || !state.canAttach;
+    const shown = state.picksSeq === state.seq ? state.picks : [];
+    $("hint").textContent = state.picking ? "Finding what you clicked…"
+      : shown.length ? "Attached to your next message. Click more objects, or empty space to attach just the view."
+      : state.pickable ? "Click an object to mention it in your next message."
+      : state.addonOutdated ? "Click the image to attach it to your next message. To click on objects, "
+        + "update the Blender addon (uvx mcp-for-blender install-addon) and restart Blender."
+      : "Click the image to attach it to your next message.";
+    for (const el of $("stage").querySelectorAll(".marker")) el.remove();
+    for (const pick of shown) {
+      const marker = document.createElement("div");
+      marker.className = "marker";
+      marker.style.left = pick.x * 100 + "%";
+      marker.style.top = pick.y * 100 + "%";
+      const label = document.createElement("span");
+      label.textContent = pick.name;
+      marker.append(label);
+      $("stage").append(marker);
+    }
+  }
+
+  function showError(text) {
+    $("error").hidden = !text;
+    $("error").textContent = text || "";
+  }
+
+  const callTool = (name, args = {}) => request("tools/call", { name, arguments: args });
+
+  async function capture(auto) {
+    if (state.capturing) return;
+    state.capturing = true;
+    render();
+    try {
+      const result = await callTool("viewport_capture", { auto });
+      if (result?.isError && auto) state.autoBlockedUntil = Date.now() + AUTO_RETRY_MS;
+      // A failed automatic capture shouldn't put an error over a good image.
+      if (!(result?.isError && auto && state.image)) applyResult(result);
+    } catch (e) {
+      if (auto) state.autoBlockedUntil = Date.now() + AUTO_RETRY_MS;
+      else showError("Couldn't reach Blender: " + e.message);
+    } finally {
+      state.capturing = false;
+      render();
+    }
+  }
+
+  async function poll() {
+    if (!ready || document.visibilityState !== "visible") return;
+    try { applyResult(await callTool("viewport_latest", { since: state.seq })); } catch (_) { /* host busy; next tick retries */ }
+    if (state.stale && state.quiet && Date.now() >= state.autoBlockedUntil) capture(true);
+  }
+
+  function schedule() {
+    setTimeout(async () => {
+      await poll();
+      if (state.image) render();
+      schedule();
+    }, state.stale ? STALE_POLL_MS : POLL_MS);
+  }
+
+  $("refresh").addEventListener("click", () => capture(false));
+
+  // The app is fullscreen-only; ask again if a host starts it inline anyway.
+  async function goFullscreen() {
+    if (state.displayMode !== "inline") return;
+    // The host answers with the mode it actually set, which may not be the one asked for.
+    try { applyHost({ displayMode: (await request("ui/request-display-mode", { mode: "fullscreen" }))?.mode }); }
+    catch (_) { /* stays inline, still live */ }
+  }
+
+  $("shot").addEventListener("click", async (event) => {
+    if (!state.image || !state.canAttach || state.picking) return;
+    const box = $("shot").getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (event.clientX - box.left) / box.width));
+    const y = Math.min(1, Math.max(0, (event.clientY - box.top) / box.height));
+    if (state.picksSeq !== state.seq) { state.picks = []; state.picksSeq = state.seq; }
+    let hit = null;
+    let failed = false;
+    if (state.pickable) {
+      state.picking = true;
+      render();
+      try {
+        const result = await callTool("viewport_pick", { seq: state.seq, x, y });
+        if (result?.isError) { failed = true; showError(result.content?.find((c) => c.type === "text")?.text); }
+        else hit = result?.structuredContent?.object || null;
+      } catch (e) {
+        failed = true;
+        showError("Couldn't reach Blender: " + e.message);
+      } finally {
+        state.picking = false;
+      }
+    }
+    // A refused click (another file or scene, Blender gone) attaches nothing.
+    if (failed) { render(); return; }
+    if (hit) {
+      // Clicking an object that's already attached detaches it.
+      const already = state.picks.findIndex((p) => p.name === hit.name);
+      if (already >= 0) state.picks.splice(already, 1);
+      else state.picks.push({ ...hit, x, y });
+    } else {
+      state.picks = [];
+    }
+    await attach();
+  });
+
+  // Replace this app's model context with the image and the picked objects.
+  async function attach() {
+    const content = [{
+      type: "image", data: state.image.data, mimeType: state.image.mimeType || "image/png",
+      _meta: { "openai/title": "Blender viewport" },
+    }];
+    for (const pick of state.picks) {
+      content.push(state.canLink ? pick.link
+        : { type: "text", text: `Blender object: ${pick.name} (${pick.detail})`, _meta: { "openai/title": pick.name } });
+    }
+    const names = state.picks.map((p) => `"${p.name}" (${p.detail})`).join(", ");
+    content.push({
+      type: "text",
+      annotations: { audience: ["assistant"] },
+      text: state.picks.length
+        ? `The user clicked these objects in the attached Blender viewport screenshot: ${names}. `
+          + "When they say \"this\" or \"these\", they mean these objects; use their exact names in bpy.data.objects."
+        : "The user attached the current Blender 3D viewport from the Viewport panel.",
+    });
+    try {
+      await request("ui/update-model-context", { content });
+      showError(null);
+    } catch (e) {
+      showError("Couldn't attach to your message: " + e.message);
+    }
+    render();
+  }
+
+  new ResizeObserver(() =>
+    notify("ui/notifications/size-changed", { width: document.body.scrollWidth, height: document.body.scrollHeight })
+  ).observe(document.body);
+  schedule();
+  document.addEventListener("visibilitychange", poll);
+
+  if (window.parent === window) {
+    $("status").textContent = "Open this in an MCP Apps host (Codex or ChatGPT) to see your viewport.";
+    return;
+  }
+  request("ui/initialize", {
+    protocolVersion: "2026-01-26",
+    appInfo: { name: "mcp-for-blender-viewport", version: "1.1.0" },
+    appCapabilities: { availableDisplayModes: ["fullscreen"] },
+  }).then((result) => {
+    const caps = result.hostCapabilities || {};
+    const openaiContext = !!caps.experimental?.["openai/modelContext"];
+    state.canAttach = !!(caps.updateModelContext?.image || openaiContext);
+    state.canLink = !!(caps.updateModelContext?.resourceLink || openaiContext);
+    notify("ui/notifications/initialized");
+    ready = true;
+    // The first render comes from the tool result the host sends next, so no poll here.
+    applyHost(result.hostContext || {});
+    goFullscreen();
+  }).catch((e) => showError("Couldn't connect to the host: " + e.message));
+})();
+</script>
+</body>
+</html>
