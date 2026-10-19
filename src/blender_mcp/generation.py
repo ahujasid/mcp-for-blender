@@ -7,8 +7,9 @@ passes it back to resume, so no client timeout ever strands a paid generation.
 
 The addon still does the provider work (and the Premium routing), through the
 commands it has always had, so this needs no addon update. Meshy is the
-exception: it is new, and its text generation is two paid tasks, a preview
-(mesh) and then a refine (texture), which this module chains and resumes.
+exception: it is new, and on the user's own key its text generation is two
+paid tasks, a preview (mesh) and then a refine (texture), which this module
+chains and resumes. Through Premium, the Premium server runs both as one job.
 """
 
 import asyncio
@@ -30,12 +31,14 @@ PROVIDERS = ("tripo", "hunyuan3d", "hyper3d", "meshy")
 
 # Auto-pick order. Premium generators come first because the user is paying
 # for them and they run the stronger models; among those Tripo is Premium-only.
-# Meshy runs on the user's own key only.
-PREMIUM_ORDER = ("tripo", "hunyuan3d", "hyper3d")
+PREMIUM_ORDER = ("meshy", "tripo", "hunyuan3d", "hyper3d")
 OWN_KEY_ORDER = ("hunyuan3d", "hyper3d", "meshy")
 
-# Meshy task kinds: text preview, text refine, image to model.
-MESHY_KINDS = ("t2p", "t2r", "i2m")
+# Meshy task kinds: text preview, text refine, image to model, and a Premium
+# job (either input, preview and refine done by the Premium server).
+MESHY_KINDS = ("t2p", "t2r", "i2m", "prm")
+# Addons from this protocol on can run Meshy through Premium.
+MESHY_PREMIUM_PROTOCOL = 14
 MESHY_PROMPT_MAX = 800
 
 POLL_INTERVAL_S = 5.0
@@ -51,9 +54,9 @@ TRIPO_UNAVAILABLE = ("Tripo is only available with MCP for Blender Premium. If P
                      "addon: run `uvx mcp-for-blender install-addon`, then restart Blender.")
 MESHY_UNAVAILABLE = ("Meshy is not enabled. In the MCP for Blender sidebar in Blender (press N in the 3D Viewport), "
                      "tick Meshy under AI Model Generation and paste a Meshy API key (needs a paid Meshy plan).")
-MESHY_NOT_IN_PREMIUM = ("Meshy runs on the user's own Meshy API key only and isn't available while MCP for Blender "
-                        "Premium is the generation source. Use another provider, or switch Generation Source to "
-                        "Your own API keys in the add-on preferences.")
+MESHY_PREMIUM_NEEDS_UPDATE = ("Meshy through MCP for Blender Premium needs the latest Blender addon: run "
+                              "`uvx mcp-for-blender install-addon`, then restart Blender and tick Meshy in the "
+                              "MCP for Blender sidebar.")
 
 Send = Callable[[str, dict], Any]
 Progress = Callable[[float, float], Awaitable[None]]
@@ -204,8 +207,6 @@ def choose_provider(requested: str, premium: list[str], own_key_enabled: dict[st
         if requested not in PROVIDERS:
             raise GenerationError(f"Unknown provider {requested!r}. Use one of: auto, {', '.join(PROVIDERS)}")
         if premium:
-            if requested == "meshy":
-                raise GenerationError(MESHY_NOT_IN_PREMIUM)
             if requested not in premium:
                 raise GenerationError(f"{requested} is not switched on in MCP for Blender Premium. "
                                       f"On: {', '.join(premium)}. Tick it in the Blender sidebar.")
@@ -272,7 +273,8 @@ def submit(send: Send, provider: str, name: str, prompt: str | None, image: str 
                                   f"this one is {len(prompt)}. Shorten it.")
         result = send("create_meshy_job", {"text_prompt": prompt, "image": image})
         _relay(result)
-        if not isinstance(result, dict) or not result.get("task_id") or result.get("kind") not in ("t2p", "i2m"):
+        started = ("t2p", "i2m", "prm")
+        if not isinstance(result, dict) or not result.get("task_id") or result.get("kind") not in started:
             raise GenerationError(f"Meshy returned no task: {result}")
         return Job("meshy", result["kind"], result["task_id"], name)
 
@@ -319,11 +321,14 @@ def poll(send: Send, job: Job) -> tuple[str, Any]:
         if status == "SUCCEEDED":
             if job.kind == "t2p":
                 return "refine", None
+            if job.kind == "prm":
+                # The addon imports a Premium job by its id.
+                return "done", None
             if not result.get("model_url"):
                 return "failed", "finished without a model URL"
             return "done", result["model_url"]
         parts = [status or "PENDING"]
-        if job.kind != "i2m":
+        if job.kind in ("t2p", "t2r"):
             parts.append("texturing" if job.kind == "t2r" else "modelling")
         if isinstance(result, dict) and result.get("progress") is not None:
             parts.append(f"{result['progress']}%")
@@ -369,7 +374,9 @@ def poll(send: Send, job: Job) -> tuple[str, Any]:
 
 
 def import_result(send: Send, job: Job, detail: Any) -> Any:
-    if job.provider == "meshy":
+    if job.provider == "meshy" and job.kind == "prm":
+        result = send("import_generated_asset_meshy", {"name": job.name, "task_id": job.ident})
+    elif job.provider == "meshy":
         result = send("import_generated_asset_meshy", {"name": job.name, "model_url": detail})
     elif job.provider == "tripo":
         result = send("import_generated_asset_tripo", {"request_id": job.ident, "name": job.name})

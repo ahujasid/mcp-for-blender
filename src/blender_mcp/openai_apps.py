@@ -244,6 +244,7 @@ SCENE_CHANGING_COMMANDS = frozenset({
     "import_generated_asset",
     "import_generated_asset_hunyuan",
     "import_generated_asset_tripo",
+    "import_generated_asset_meshy",
 })
 
 # How long Blender must have been quiet before the app captures on its own, so

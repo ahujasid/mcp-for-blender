@@ -1691,17 +1691,21 @@ def _own_key_generators(blender: BlenderConnection) -> dict[str, bool]:
     return enabled
 
 
-def _meshy_unavailable(blender: BlenderConnection) -> str:
-    """Why Meshy can't run, in the addon's words: switched off, no key, or
-    Premium selected. Premium with no Premium generator ticked looks like no
-    Premium to the handshake, so only the addon can tell those apart."""
+def _meshy_unavailable(blender: BlenderConnection, premium: list[str]) -> str:
+    """Why Meshy can't run, in the addon's words: switched off, no key, or not
+    ticked for Premium. Premium with no Premium generator ticked looks like no
+    Premium to the handshake, so only the addon can tell those apart. An addon
+    from before Meshy was in Premium says own key only, so say to update it."""
     try:
         reply = blender.send_command("get_meshy_status")
     except Exception as e:
         return missing_feature("Meshy", "Meshy") if _addon_lacks(e) else generation.MESHY_UNAVAILABLE
-    if isinstance(reply, dict) and not reply.get("enabled") and reply.get("message"):
-        return " ".join(reply["message"].split())
-    return generation.MESHY_UNAVAILABLE
+    message = reply.get("message") if isinstance(reply, dict) and not reply.get("enabled") else None
+    protocol = _addon_protocol()
+    if (protocol is not None and protocol < generation.MESHY_PREMIUM_PROTOCOL
+            and (premium or "Premium" in (message or ""))):
+        return generation.MESHY_PREMIUM_NEEDS_UPDATE
+    return " ".join(message.split()) if message else generation.MESHY_UNAVAILABLE
 
 
 def _pending_generations() -> "generation.Pending":
@@ -1768,8 +1772,8 @@ async def generate_3d(
     - name: Object name in the scene. Defaults to one made from the prompt.
     - provider: auto (default), tripo, hunyuan3d, hyper3d or meshy. Auto prefers the user's MCP for
       Blender Premium generators, then their own API keys.
-    - quality: "standard" or "high" (Premium). Omit for the user's default; "high" only when the
-      user asks for more detail.
+    - quality: "standard" or "high" (Premium, not meshy). Omit for the user's default; "high" only
+      when the user asks for more detail.
     - bbox_condition: hyper3d only: [length, width, height] proportions.
     - job: A handle from an earlier call, to resume waiting for it.
     - user_prompt: The user's own words describing what they want, quoted verbatim.
@@ -1786,8 +1790,9 @@ async def generate_3d(
         blender = get_blender_connection()
         premium = _premium_generators(blender)
         own_keys = {} if premium else _own_key_generators(blender)
-        if not premium and (provider or "").lower() == "meshy" and not own_keys.get("meshy"):
-            return f"Error: {_meshy_unavailable(blender)}"
+        if (provider or "").lower() == "meshy" and not (
+                "meshy" in premium if premium else own_keys.get("meshy")):
+            return f"Error: {_meshy_unavailable(blender, premium)}"
         chosen, is_premium = generation.choose_provider(provider, premium, own_keys)
         note = "" if is_premium else premium_hint_once(ctx, {"mode": None})
         pending = _pending_generations()
