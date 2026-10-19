@@ -236,15 +236,19 @@ def test_meshy_rejects_unsupported_image_type(monkeypatch, tmp_path):
     assert "error" in result and posts == []
 
 
-@pytest.mark.parametrize("status_code, message", [
-    (401, "Meshy rejected the API key"),
-    (402, "Out of Meshy credits. Top up at meshy.ai"),
-    (429, "Meshy rate limit hit, wait and retry"),
-    (400, "Prompt is invalid"),
+@pytest.mark.parametrize("status_code, reply, message", [
+    (401, {"message": "Invalid API key"}, "Meshy rejected the API key"),
+    # 402 covers more than an empty balance (key credit limit, workspace
+    # limits, free plan), so Meshy's own words win when it sends them.
+    (402, {"message": "API key credit limit reached"}, "API key credit limit reached"),
+    (402, {}, "Out of Meshy credits. Top up at meshy.ai"),
+    (429, {"message": "Too many pending tasks"}, "Too many pending tasks"),
+    (429, None, "Meshy rate limit hit, wait and retry"),
+    (400, {"message": "Prompt is invalid"}, "Prompt is invalid"),
 ])
-def test_meshy_errors_are_readable_and_never_show_the_key(monkeypatch, status_code, message):
+def test_meshy_errors_are_readable_and_never_show_the_key(monkeypatch, status_code, reply, message):
     addon, _bpy, _scene = _ready(monkeypatch)
-    posts = _capture_posts(addon, {"message": "Prompt is invalid"}, status_code)
+    posts = _capture_posts(addon, reply if reply is not None else "not json", status_code)
     server = addon.BlenderMCPServer()
 
     result = server.create_meshy_job(text_prompt="a teapot")
@@ -290,9 +294,9 @@ def test_meshy_refine_inherits_the_preview_and_happens_once(monkeypatch):
 
 def test_meshy_failed_refine_is_not_remembered(monkeypatch):
     addon, _bpy, _scene = _ready(monkeypatch)
-    _capture_posts(addon, {"message": "nope"}, 429)
+    _capture_posts(addon, {"message": "Too many pending tasks"}, 429)
     server = addon.BlenderMCPServer()
-    assert "rate limit" in server.refine_meshy_job(preview_task_id="prev_9")["error"]
+    assert server.refine_meshy_job(preview_task_id="prev_9")["error"] == "Too many pending tasks"
 
     posts = _capture_posts(addon, {"result": "ref_9"})
     assert server.refine_meshy_job(preview_task_id="prev_9")["task_id"] == "ref_9"

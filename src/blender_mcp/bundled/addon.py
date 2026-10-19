@@ -5132,15 +5132,16 @@ class BlenderMCPServer:
             payload = None
         if response.ok and isinstance(payload, dict):
             return payload, None
-        fixed = {
-            401: "Meshy rejected the API key",
+        if response.status_code == 401:
+            return None, {"error": "Meshy rejected the API key"}
+        # 402 also means a key credit limit, a workspace limit or a free plan,
+        # so Meshy's own message wins; the fixed text is only a fallback.
+        fallback = {
             402: "Out of Meshy credits. Top up at meshy.ai",
             429: "Meshy rate limit hit, wait and retry",
-        }
-        if response.status_code in fixed:
-            return None, {"error": fixed[response.status_code]}
+        }.get(response.status_code, f"Meshy request failed with status {response.status_code}")
         message = payload.get("message") if isinstance(payload, dict) else None
-        return None, {"error": message or f"Meshy request failed with status {response.status_code}"}
+        return None, {"error": message or fallback}
 
     def _meshy_post(self, path, body):
         headers, error = self._meshy_headers()
