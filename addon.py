@@ -39,7 +39,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 13
+ADDON_PROTOCOL_VERSION = 14
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -1606,9 +1606,11 @@ class BlenderMCPServer:
         # Tripo is only offered through Premium
         handlers.update(premium_tripo_handlers())
 
-        # Meshy runs on the user's own key only, so not while Premium is the
-        # generation source. getattr so scenes from before Meshy still dispatch.
-        if getattr(bpy.context.scene, "blendermcp_use_meshy", False) and not premium_active():
+        # Meshy runs through Premium when it's the generation source, else on
+        # the user's own key. getattr so scenes from before Meshy still dispatch.
+        if getattr(bpy.context.scene, "blendermcp_use_meshy", False) and premium_active():
+            handlers.update(premium_meshy_handlers())
+        elif getattr(bpy.context.scene, "blendermcp_use_meshy", False):
             handlers.update({
                 "create_meshy_job": self.create_meshy_job,
                 "refine_meshy_job": self.refine_meshy_job,
@@ -5080,12 +5082,7 @@ class BlenderMCPServer:
     def get_meshy_status(self):
         """Get the current status of Meshy integration."""
         if premium_active():
-            return {
-                "enabled": False,
-                "message": "Meshy runs on your own Meshy API key only and isn't available while Premium is the "
-                           "generation source. To use it, switch Generation Source to Your own API keys in the "
-                           "MCP for Blender add-on preferences.",
-            }
+            return premium_integration_status("meshy", getattr(bpy.context.scene, "blendermcp_use_meshy", False))
         if not getattr(bpy.context.scene, "blendermcp_use_meshy", False):
             return {
                 "enabled": False,
@@ -5221,6 +5218,9 @@ class BlenderMCPServer:
         """Query one Meshy task. Does not wait; the MCP client polls again."""
         if not task_id:
             return {"error": "task_id is required"}
+        if kind == "prm":
+            return {"error": "This Meshy generation was started through Premium. Switch Generation Source "
+                             "back to Premium in the add-on preferences to finish it."}
         path = {"t2p": "/v2/text-to-3d", "t2r": "/v2/text-to-3d", "i2m": "/v1/image-to-3d"}.get(kind)
         if not path:
             return {"error": f"Unknown Meshy task kind: {kind}"}
@@ -5282,9 +5282,9 @@ class BlenderMCPServer:
 
 #region Premium
 # Premium is a different key, not a different set of tools. With the Premium
-# toggle on, the Hyper3D and Hunyuan3D commands send the same request through
+# toggle on, the Hyper3D, Hunyuan3D and Meshy commands send the same request through
 # the MCP for Blender server, which holds the fal key and decides quotas, and
-# replies are reshaped into the fal/Tencent shapes the MCP tools already
+# replies are reshaped into the fal/Tencent/Meshy shapes the MCP tools already
 # parse. Tripo is only offered through Premium. With generation_source left at
 # BYOK nothing here runs, and nothing here touches the network until the user
 # activates a key.
@@ -5430,6 +5430,7 @@ PREMIUM_ERROR_MESSAGES = {
 
 # The scene checkboxes that turn each generator on, in both modes.
 PREMIUM_INTEGRATIONS = {
+    "meshy": ("Meshy", "blendermcp_use_meshy"),
     "hyper3d": ("Hyper3D Rodin", "blendermcp_use_hyper3d"),
     "hunyuan3d": ("Hunyuan3D", "blendermcp_use_hunyuan3d"),
     "tripo": ("Tripo", "blendermcp_use_tripo"),
@@ -5609,7 +5610,7 @@ def _premium_quality(model, quality, from_image):
 
 
 def premium_integration_status(integration, enabled):
-    """Reply for get_hyper3d_status / get_hunyuan3d_status / get_tripo_status."""
+    """Reply for get_hyper3d_status / get_hunyuan3d_status / get_tripo_status / get_meshy_status."""
     label, prop = PREMIUM_INTEGRATIONS[integration]
     if not enabled:
         return {"enabled": False, "mode": "PREMIUM", "message": (
@@ -5631,6 +5632,8 @@ def premium_integration_status(integration, enabled):
                       "poll_hunyuan_job_status, then import_generated_asset_hunyuan with the ResultFile3Ds URL. "
                       + quality),
         "tripo": "Mode: PREMIUM. From an image, Tripo is high-quality only. " + quality,
+        "meshy": ("Mode: PREMIUM. Meshy uses its latest model and every generation counts as standard "
+                  "quality. Models arrive at real-world size with their origin at the bottom."),
     }[integration]
     return {"enabled": True, "mode": "PREMIUM", "message": f"{summary}. {flow}"}
 
@@ -5765,6 +5768,51 @@ def premium_tripo_handlers():
         "create_tripo_job": premium_create_tripo_job,
         "poll_tripo_job_status": premium_poll_fal_job,
         "import_generated_asset_tripo": premium_import_job,
+    }
+
+
+# Meshy: Meshy-style shapes. The Premium server runs a text job's preview and
+# refine as one job, so there's no refine step here, and "prm" tells these
+# jobs apart from tasks started on the user's own key.
+
+_PREMIUM_MESHY_STATUS = {"reserved": "PENDING", "running": "IN_PROGRESS", "succeeded": "SUCCEEDED",
+                         "failed": "FAILED"}
+
+
+def premium_create_meshy_job(text_prompt=None, image=None):
+    result = premium_create_job("meshy", "standard", text_prompt=text_prompt, image=image)
+    if not result.get("job_id"):
+        return result
+    return {"task_id": result["job_id"], "kind": "prm", "message": premium_summary()}
+
+
+def premium_poll_meshy_job(task_id=None, kind=None):
+    if not task_id:
+        return {"error": "task_id is required"}
+    if kind != "prm":
+        return {"error": "This Meshy generation was started with your own Meshy API key. Switch Generation "
+                         "Source back to Your own API keys in the add-on preferences to finish it."}
+    job = _premium_job(task_id)
+    if job.get("code") or "status" not in job:
+        return job
+    reply = {"status": _PREMIUM_MESHY_STATUS.get(job["status"], "IN_PROGRESS")}
+    if job.get("progress") is not None:
+        reply["progress"] = job["progress"]
+    if job["status"] == "failed":
+        reply["error"] = (job.get("error") or "Generation failed") + ". This attempt wasn't counted."
+    return reply
+
+
+def premium_import_meshy(name, task_id=None, model_url=None):
+    return premium_import_job(task_id, name)
+
+
+def premium_meshy_handlers():
+    """Meshy commands in Premium mode; the caller checks the checkbox."""
+    return {
+        "create_meshy_job": premium_create_meshy_job,
+        "poll_meshy_job_status": premium_poll_meshy_job,
+        "import_generated_asset_meshy": premium_import_meshy,
     }
 
 
@@ -6223,7 +6271,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
 
         sub = self._integration_header(layout, scene, "blendermcp_use_meshy", "Meshy", 'OUTLINER_OB_MESH')
         if sub and premium:
-            sub.label(text="Own key only, not in Premium")
+            sub.label(text="Runs through Premium")
         elif sub:
             col = sub.column(align=True)
             col.prop(scene, "blendermcp_meshy_model", text="Model")
@@ -6626,7 +6674,7 @@ def register():
 
     bpy.types.Scene.blendermcp_use_meshy = bpy.props.BoolProperty(
         name="Use Meshy",
-        description="Enable Meshy model generation with your own API key",
+        description="Enable Meshy model generation",
         default=False,
     )
 

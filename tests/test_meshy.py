@@ -144,17 +144,153 @@ def test_meshy_status_reports_sidebar_state(monkeypatch):
     assert KEY not in str(ready)
 
 
-def test_meshy_is_off_under_premium(monkeypatch):
-    addon, _bpy, _scene = _ready(monkeypatch)
+def _premium(monkeypatch, addon, jobs=None):
+    """Premium on, with the Premium server stubbed. Returns the requests it got."""
+    calls = []
+
+    def premium_request(method, path, payload=None, auth=True):
+        calls.append((method, path, payload))
+        if method == "POST" and path == "/jobs":
+            return {"job_id": "pjob_1"}
+        if path.startswith("/jobs/"):
+            return (jobs or {}).get(path.rsplit("/", 1)[1], {"code": "NOT_FOUND", "message": "No such job"})
+        return {}
+
     monkeypatch.setattr(addon, "premium_active", lambda: True)
+    monkeypatch.setattr(addon, "premium_request", premium_request)
+    return calls
+
+
+# ------------------------------------------------------------------ premium
+
+def test_meshy_runs_through_premium_without_a_meshy_key(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    calls = _premium(monkeypatch, addon)
+    server = addon.BlenderMCPServer()
+
+    status = server.get_meshy_status()
+    assert status["enabled"] is True
+    assert status["mode"] == "PREMIUM"
+    assert "real-world" in status["message"]
+
+    reply = server._execute_command_internal({"type": "create_meshy_job", "params": {"text_prompt": "a teapot"}})
+    assert reply["status"] == "success"
+    assert reply["result"]["task_id"] == "pjob_1"
+    assert reply["result"]["kind"] == "prm"
+    payload = calls[-1][2]
+    assert calls[-1][:2] == ("POST", "/jobs")
+    assert payload["model"] == "meshy"
+    assert payload["prompt"] == "a teapot"
+
+
+def test_meshy_through_premium_is_always_standard_quality(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    calls = _premium(monkeypatch, addon)
+
+    addon.premium_create_meshy_job(image="https://example.com/chair.png")
+
+    payload = calls[-1][2]
+    assert payload["quality"] == "standard"
+    assert payload["image_url"] == "https://example.com/chair.png"
+    assert "prompt" not in payload
+
+
+def test_meshy_through_premium_has_no_refine_step(monkeypatch):
+    # The Premium server runs a text job's preview and refine as one job.
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    _premium(monkeypatch, addon)
+    server = addon.BlenderMCPServer()
+
+    reply = server._execute_command_internal({"type": "refine_meshy_job", "params": {"preview_task_id": "p"}})
+    assert reply["status"] == "error"
+    assert "Unknown command type" in reply["message"]
+
+
+@pytest.mark.parametrize("premium_status, meshy_status", [
+    ("reserved", "PENDING"),
+    ("running", "IN_PROGRESS"),
+    ("succeeded", "SUCCEEDED"),
+])
+def test_meshy_premium_poll_uses_meshy_statuses(monkeypatch, premium_status, meshy_status):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    _premium(monkeypatch, addon, {"pjob_1": {"status": premium_status, "progress": 40}})
+    server = addon.BlenderMCPServer()
+
+    reply = server._execute_command_internal(
+        {"type": "poll_meshy_job_status", "params": {"task_id": "pjob_1", "kind": "prm"}})
+    assert reply["result"]["status"] == meshy_status
+    assert reply["result"]["progress"] == 40
+
+
+def test_meshy_premium_failure_is_not_counted(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    _premium(monkeypatch, addon, {"pjob_1": {"status": "failed", "error": "Meshy task failed"}})
+
+    reply = addon.premium_poll_meshy_job(task_id="pjob_1", kind="prm")
+    assert reply["status"] == "FAILED"
+    assert reply["error"] == "Meshy task failed. This attempt wasn't counted."
+
+
+def test_meshy_premium_relays_premium_error_codes(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    _premium(monkeypatch, addon)
+
+    reply = addon.premium_poll_meshy_job(task_id="gone", kind="prm")
+    assert reply["code"] == "NOT_FOUND"
+
+
+def test_meshy_own_key_job_cant_finish_through_premium(monkeypatch):
+    # A preview started on the user's key, resumed after switching to Premium.
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    calls = _premium(monkeypatch, addon)
+
+    reply = addon.premium_poll_meshy_job(task_id="prev_1", kind="t2p")
+    assert "own Meshy API key" in reply["error"]
+    assert calls == []
+
+
+def test_meshy_premium_job_cant_finish_on_the_own_key(monkeypatch):
+    addon, _bpy, _scene = _ready(monkeypatch)
+    server = addon.BlenderMCPServer()
+
+    reply = server.poll_meshy_job_status(task_id="pjob_1", kind="prm")
+    assert "through Premium" in reply["error"]
+
+
+def test_meshy_premium_import_uses_the_premium_job(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    _premium(monkeypatch, addon)
+    imported = []
+    monkeypatch.setattr(addon, "premium_import_job", lambda job_id, name: imported.append((job_id, name)) or
+                        {"succeed": True, "name": name})
+    server = addon.BlenderMCPServer()
+
+    reply = server._execute_command_internal(
+        {"type": "import_generated_asset_meshy", "params": {"name": "Teapot", "task_id": "pjob_1"}})
+    assert reply["result"]["succeed"] is True
+    assert imported == [("pjob_1", "Teapot")]
+
+
+def test_meshy_premium_off_until_ticked(monkeypatch):
+    addon, _bpy, scene = _load_addon(monkeypatch)
+    calls = _premium(monkeypatch, addon)
     server = addon.BlenderMCPServer()
 
     status = server.get_meshy_status()
     assert status["enabled"] is False
-    assert "Premium" in status["message"]
-
+    assert "check 'Meshy'" in status["message"]
     blocked = server._execute_command_internal({"type": "create_meshy_job", "params": {"text_prompt": "a teapot"}})
     assert blocked["status"] == "error"
+    assert calls == []
+
+    assert "meshy" not in addon.premium_enabled_generators()
+    scene.blendermcp_use_meshy = True
+    assert "meshy" in addon.premium_enabled_generators()
+
+
+def test_premium_activation_ticks_meshy(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch)
+    assert addon.PREMIUM_INTEGRATIONS["meshy"] == ("Meshy", "blendermcp_use_meshy")
 
 
 # ------------------------------------------------------------------ create
