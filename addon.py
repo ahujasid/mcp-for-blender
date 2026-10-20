@@ -7,6 +7,7 @@ import mathutils
 import json
 import threading
 import socket
+import struct
 import queue
 import time
 import requests
@@ -40,6 +41,20 @@ bl_info = {
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
 ADDON_PROTOCOL_VERSION = 14
+
+# Wire framing: [4-byte big-endian length][UTF-8 JSON]. The server opts in by
+# capability, so raw-JSON servers (everything published before this change)
+# and raw-JSON clients both keep working. Replies mirror the format of the
+# request that produced them.
+FRAMING_CAPABILITY = "length_prefixed_framing"
+# A frame length is read from the wire and must never be trusted; this bounds
+# it. Responses are capped well below this by the commands that produce them.
+MAX_FRAME_BYTES = 64 * 1024 * 1024
+# First bytes a raw JSON message can start with (RFC 8259, plus leading
+# whitespace). A frame length is at most MAX_FRAME_BYTES - under 0x04000000 -
+# so a frame starts with 0x00-0x04. The sets never overlap, which is what lets
+# the addon serve both wire formats on one socket without negotiating first.
+_RAW_JSON_FIRST_BYTES = frozenset(b'{["-0123456789tfn \t\r\n')
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -1202,6 +1217,53 @@ def _object_detail(obj):
     return detail
 
 
+def _pack_frame(payload):
+    """Prefix a JSON payload with its 4-byte big-endian length."""
+    return struct.pack(">I", len(payload)) + payload
+
+
+def _take_client_message(buffer):
+    """Split one complete client message off the front of `buffer`.
+
+    Returns (command, framed, remainder). Both are None when the buffer holds
+    only part of a message, so the caller just reads more. `framed` records
+    which wire format the request used; the reply mirrors it.
+
+    The first byte tells the formats apart: raw JSON starts with a JSON
+    character while a frame starts with one of the length header's bytes,
+    and those sets are disjoint (see _RAW_JSON_FIRST_BYTES).
+    """
+    if buffer[0] not in _RAW_JSON_FIRST_BYTES:
+        if len(buffer) < 4:
+            return None, None, buffer
+        length = struct.unpack(">I", buffer[:4])[0]
+        if length > MAX_FRAME_BYTES:
+            raise ValueError(f"frame length {length} exceeds {MAX_FRAME_BYTES} bytes")
+        if len(buffer) < 4 + length:
+            return None, None, buffer
+        payload = buffer[4:4 + length]
+        try:
+            command = json.loads(payload.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ValueError(f"invalid frame payload: {e}")
+        return command, True, buffer[4 + length:]
+
+    # Legacy bare JSON. raw_decode stops at the end of the first document, so
+    # two commands coalesced into one recv() are both served instead of
+    # jamming the connection with an "Extra data" parse error.
+    try:
+        text = buffer.decode('utf-8')
+    except UnicodeDecodeError:
+        # A multi-byte character split across a recv() boundary is incomplete
+        # data, not garbage; wait for the rest.
+        return None, None, buffer
+    try:
+        command, end = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        return None, None, buffer
+    return command, False, buffer[len(text[:end].encode('utf-8')):]
+
+
 class BlenderMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
@@ -1435,7 +1497,7 @@ class BlenderMCPServer:
 
         while True:
             try:
-                command, client = self.command_queue.get_nowait()
+                command, client, framed = self.command_queue.get_nowait()
             except queue.Empty:
                 break
 
@@ -1448,7 +1510,10 @@ class BlenderMCPServer:
                 response_json = json.dumps({"status": "error", "message": str(e)})
 
             try:
-                client.sendall(response_json.encode('utf-8'))
+                payload = response_json.encode('utf-8')
+                if framed:
+                    payload = _pack_frame(payload)
+                client.sendall(payload)
             except Exception:
                 print("Failed to send response - client disconnected")
 
@@ -1472,30 +1537,31 @@ class BlenderMCPServer:
                     if not data:
                         print("Client disconnected")
                         break
-
                     buffer += data
-                    try:
-                        # Try to parse command
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
-
-                        # Hand off to the main thread. Never call
-                        # bpy.app.timers.register() from here - it is not
-                        # thread-safe and the callback can be silently lost.
-                        print(f"Queued command: {command.get('type')}")
-                        self.command_queue.put((command, client))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        # Incomplete data, wait for more. A multi-byte UTF-8
-                        # character can land split across a recv() chunk
-                        # boundary, which fails decode() before json.loads()
-                        # ever runs - that's incomplete data too, not garbage.
-                        pass
                 except socket.timeout:
                     # Expected; loop round and re-check self.running.
                     continue
                 except Exception as e:
                     print(f"Error receiving data: {str(e)}")
                     break
+
+                # Serve every complete message the buffer holds. A recv() may
+                # deliver several messages at once, or half of one, so the
+                # buffer is drained in a loop and partial messages are kept.
+                while buffer:
+                    try:
+                        command, framed, buffer = _take_client_message(buffer)
+                    except ValueError as e:
+                        print(f"Rejecting malformed command: {e}")
+                        return
+                    if command is None:
+                        break  # incomplete message, wait for more data
+
+                    # Hand off to the main thread. Never call
+                    # bpy.app.timers.register() from here - it is not
+                    # thread-safe and the callback can be silently lost.
+                    print(f"Queued command: {command.get('type')}")
+                    self.command_queue.put((command, client, framed))
         except Exception as e:
             print(f"Error in client handler: {str(e)}")
         finally:
@@ -1654,6 +1720,7 @@ class BlenderMCPServer:
                 "drain_human_activity",
                 "get_telemetry_consent",
                 "set_telemetry_consent",
+                FRAMING_CAPABILITY,
             ]),
             "blender_version": bpy.app.version_string,
             "premium_generators": premium_enabled_generators(),

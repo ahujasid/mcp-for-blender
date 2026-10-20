@@ -817,6 +817,8 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - **Commands** are sent as JSON objects with a `type` and optional `params`
 - **Responses** are JSON objects with a `status` and `result` or `message`
 
+To prevent packet fragmentation and timeouts on large payloads, newer versions support framing messages with a 4-byte big-endian length prefix (`[uint32 length][UTF-8 JSON]`), negotiated dynamically via `get_addon_info` with backward compatibility for legacy clients.
+
 ## Limitations & Security Considerations
 
 > **Warning:** The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. **ALWAYS save your work before using it.**
