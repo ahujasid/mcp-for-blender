@@ -680,13 +680,29 @@ async def get_scene_info(
 
 
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
-    """Have the addon render the viewport to a temp file.
+    """Have the addon render the viewport and hand back the PNG.
 
     Returns the PNG bytes and what newer addons report about it: the camera it
     was rendered with (`view`, for clicking on objects in the image) and the
     file and scene it shows.
     """
     blender = get_blender_connection()
+    # Protocol 14+ sends the image over the socket. Older addons can only write
+    # it to a path we pick, which we can read back only when we share a
+    # filesystem with Blender: not in Docker, WSL or on another machine.
+    if (_addon_protocol() or 0) >= 14:
+        result = blender.send_command("get_viewport_screenshot", {
+            "max_size": max_size,
+            "format": "png",
+            "return_data": True,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        image_data = result.pop("image_data", None)
+        if not image_data:
+            raise Exception("Screenshot data was not returned")
+        return base64.b64decode(image_data), result
+
     temp_path = os.path.join(tempfile.gettempdir(), f"blender_screenshot_{os.getpid()}.png")
 
     result = blender.send_command("get_viewport_screenshot", {
