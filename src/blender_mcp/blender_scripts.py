@@ -560,7 +560,7 @@ return info
 # Bounding box of freshly imported objects, so a generation or import result
 # says how big the thing is and whether it sits on the ground.
 BOUNDS = r'''
-import bpy, math
+import bpy
 from mathutils import Vector
 ''' + WORLD_BOUNDS_FN + r'''
 dg = bpy.context.evaluated_depsgraph_get()
@@ -572,10 +572,13 @@ for name in ARGS["names"]:
     objs = [o] + list(o.children_recursive)
     pts = []
     for x in objs:
-        b = world_bounds(x, dg)
-        if b is not None:
-            pts.append(Vector(b[0]))
-            pts.append(Vector(b[1]))
+        # Geometry only. An armature or lattice bound_box is not the model, and
+        # folding it in makes a rigged import look bigger than it is.
+        if x.type in {"MESH", "CURVE", "SURFACE", "FONT", "META", "CURVES", "POINTCLOUD", "VOLUME"}:
+            b = world_bounds(x, dg)
+            if b is not None:
+                pts.append(Vector(b[0]))
+                pts.append(Vector(b[1]))
     if not pts:
         continue
     lo = [round(min(p[i] for p in pts), 3) for i in range(3)]
