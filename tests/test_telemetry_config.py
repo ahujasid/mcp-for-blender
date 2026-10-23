@@ -70,7 +70,15 @@ def test_addon_status_error_names_the_exception(monkeypatch):
 
     monkeypatch.setattr(server, "get_blender_connection", fail)
     reply = asyncio.run(server.get_addon_status(None))
-    assert reply.startswith("Error checking addon status:")
-    assert "RuntimeError: socket closed" in reply
-    assert "assembling the status report" in reply
-    assert reply != "Error checking addon status: socket closed"
+    assert reply == "Error checking addon status: RuntimeError: socket closed."
+
+
+def test_addon_status_error_keeps_one_full_stop(monkeypatch):
+    """A message that already ends in a full stop does not get a second one."""
+    def fail():
+        raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
+
+    monkeypatch.setattr(server, "get_blender_connection", fail)
+    reply = asyncio.run(server.get_addon_status(None))
+    assert reply.endswith("addon is running.")
+    assert ".." not in reply

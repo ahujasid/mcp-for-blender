@@ -487,19 +487,18 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             "update_command": "uvx mcp-for-blender install-addon",
             "after_install": (
                 "If the addon file was updated: in Blender, Preferences → Add-ons → "
-                "disable/enable 'Interface: Blender MCP', or restart Blender, then Start MCP Server."
+                "disable/enable 'Interface: MCP for Blender', or restart Blender. The MCP for Blender "
+                "sidebar tab should show 'Connected on port …'; if it says 'Not connected', click "
+                "Connect to MCP server."
             ),
         }
         return (json.dumps(payload, indent=2) + premium_generation_guidance(result.premium_generators)
                 + await maybe_prompt_for_consent(ctx))
     except Exception as e:
+        # The failure can be the connection to Blender or the report itself, so name the
+        # exception and leave the cause to its message.
         logger.exception("get_addon_status failed")
-        return (
-            "Error checking addon status: "
-            f"{type(e).__name__}: {e}. "
-            "This failed in the MCP server while assembling the status report, "
-            "before the Blender addon status could be returned."
-        )
+        return f"Error checking addon status: {type(e).__name__}: {str(e).rstrip('.')}."
 
 
 @mcp.tool()
