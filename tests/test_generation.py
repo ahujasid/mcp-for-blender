@@ -317,6 +317,18 @@ def test_meshy_quality_and_bbox_are_not_sent():
     assert send.calls[0] == ("create_meshy_job", {"text_prompt": "a teapot", "image": None})
 
 
+def test_meshy_pose_mode_is_sent_only_when_set():
+    send = _meshy({})
+    generation.submit(send, "meshy", "Cat", "a ninja cat", None, None, None, True, pose_mode="a-pose")
+    assert send.calls[0] == ("create_meshy_job", {"text_prompt": "a ninja cat", "image": None, "pose_mode": "a-pose"})
+
+
+def test_pose_mode_keeps_request_keys_apart():
+    plain = generation.request_key("meshy", "a cat", None, None, None)
+    assert plain == generation.request_key("meshy", "a cat", None, None, None, None)
+    assert plain != generation.request_key("meshy", "a cat", None, None, None, "a-pose")
+
+
 def test_meshy_timeout_mid_preview_then_resume_refines_once(tmp_path):
     path = tmp_path / "pending.json"
     statuses = {"p1": ["IN_PROGRESS"], "r1": ["SUCCEEDED"]}
@@ -719,3 +731,50 @@ def test_meshy_switched_off_relays_the_addon_setup_steps(monkeypatch):
     reply = asyncio.run(server.generate_3d(None, prompt="a stool", provider="meshy", wait_seconds=10))
     assert reply == ("Error: Meshy integration is currently disabled. To enable it: 1. In the 3D Viewport, "
                      "find the MCP for Blender panel")
+
+
+def _pose_call(monkeypatch, premium=(), own_keys=None, protocol=15, **kwargs):
+    from blender_mcp import server
+
+    send = _meshy({"p1": ["IN_PROGRESS"]})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: None)
+    monkeypatch.setattr(server, "_premium_generators", lambda _: list(premium))
+    monkeypatch.setattr(server, "_own_key_generators", lambda _: own_keys or {"hunyuan3d": True, "meshy": True})
+    monkeypatch.setattr(server, "_generation_send", send)
+    monkeypatch.setattr(server, "_pending_generations", lambda: generation.Pending(None))
+    monkeypatch.setattr(server, "_addon_protocol", lambda: protocol)
+    monkeypatch.setattr(generation, "POLL_INTERVAL_S", 1000.0)
+
+    class Ctx:
+        async def report_progress(self, *_):
+            pass
+
+    return asyncio.run(server.generate_3d(Ctx(), prompt="a ninja cat", wait_seconds=10, **kwargs)), send
+
+
+def test_pose_mode_on_auto_picks_meshy_over_other_own_keys(monkeypatch):
+    reply, send = _pose_call(monkeypatch, pose_mode="a-pose")
+    assert 'job="meshy:t2p:p1"' in reply
+    assert send.calls[0] == ("create_meshy_job", {"text_prompt": "a ninja cat", "image": None, "pose_mode": "a-pose"})
+
+
+@pytest.mark.parametrize("kwargs, needle", [
+    ({"pose_mode": "sitting"}, "must be 'a-pose' or 't-pose'"),
+    ({"pose_mode": "a-pose", "provider": "hyper3d"}, "only available with meshy"),
+])
+def test_pose_mode_rejects_bad_requests_before_generating(monkeypatch, kwargs, needle):
+    reply, send = _pose_call(monkeypatch, **kwargs)
+    assert needle in reply
+    assert send.calls == []
+
+
+def test_pose_mode_under_premium_says_own_key_only(monkeypatch):
+    reply, send = _pose_call(monkeypatch, premium=["meshy"], pose_mode="t-pose")
+    assert reply == f"Error: {generation.MESHY_POSE_NOT_IN_PREMIUM}"
+    assert send.calls == []
+
+
+def test_pose_mode_with_an_older_addon_says_update(monkeypatch):
+    reply, send = _pose_call(monkeypatch, protocol=14, pose_mode="a-pose")
+    assert reply == f"Error: {generation.MESHY_POSE_NEEDS_UPDATE}"
+    assert send.calls == []

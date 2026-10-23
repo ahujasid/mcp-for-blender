@@ -344,8 +344,34 @@ def test_meshy_local_image_becomes_a_data_uri(monkeypatch, tmp_path):
     assert posts[0]["json"]["image_url"] == expected
 
 
+@pytest.mark.parametrize("kwargs, endpoint", [
+    ({"text_prompt": "a ninja cat"}, "/v2/text-to-3d"),
+    ({"image": "https://example.com/cat.png"}, "/v1/image-to-3d"),
+])
+def test_meshy_pose_mode_reaches_both_endpoints(monkeypatch, kwargs, endpoint):
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon)
+    server = addon.BlenderMCPServer()
+
+    server.create_meshy_job(pose_mode="a-pose", **kwargs)
+
+    assert posts[0]["url"].endswith(endpoint)
+    assert posts[0]["json"]["pose_mode"] == "a-pose"
+
+
+def test_meshy_through_premium_refuses_pose_mode(monkeypatch):
+    addon, _bpy, _scene = _load_addon(monkeypatch, blendermcp_use_meshy=True)
+    calls = _premium(monkeypatch, addon)
+
+    reply = addon.premium_create_meshy_job(text_prompt="a ninja cat", pose_mode="t-pose")
+
+    assert "own Meshy API key" in reply["error"]
+    assert calls == []
+
+
 @pytest.mark.parametrize("kwargs, needle", [
     ({"text_prompt": "a teapot", "image": "https://example.com/a.png"}, "not both"),
+    ({"text_prompt": "a teapot", "pose_mode": "sitting"}, "pose_mode"),
     ({}, "not both"),
     ({"text_prompt": "x" * 801}, "800"),
     ({"image": "/no/such/file.png"}, "not found"),

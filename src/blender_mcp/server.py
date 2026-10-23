@@ -1750,6 +1750,7 @@ async def generate_3d(
     provider: str = "auto",
     quality: str | None = None,
     bbox_condition: list[float] | None = None,
+    pose_mode: str | None = None,
     job: str | None = None,
     wait_seconds: int = 50,
     user_prompt: str = "",
@@ -1776,11 +1777,17 @@ async def generate_3d(
     - quality: "standard" or "high" (Premium, not meshy). Omit for the user's default; "high" only
       when the user asks for more detail.
     - bbox_condition: hyper3d only: [length, width, height] proportions.
+    - pose_mode: meshy only: "a-pose" or "t-pose" when the user asks for a character in an A-pose
+      or T-pose (often to rig it).
     - job: A handle from an earlier call, to resume waiting for it.
     - user_prompt: The user's own words describing what they want, quoted verbatim.
     """
     if quality not in (None, "standard", "high"):
         return "Error: quality must be 'standard' or 'high'"
+    if pose_mode not in (None, *generation.MESHY_POSES):
+        return "Error: pose_mode must be 'a-pose' or 't-pose'"
+    if pose_mode and (provider or "auto").lower() not in ("auto", "meshy"):
+        return "Error: pose_mode is only available with meshy."
     call_start = time.monotonic()
     wait_seconds = max(10, min(int(wait_seconds or 50), generation.MAX_CALL_S))
     try:
@@ -1788,6 +1795,8 @@ async def generate_3d(
             return await _generation_reply(ctx, generation.Job.parse(job, name or "Generated"), wait_seconds)
         if bool(prompt) == bool(image):
             return "Error: give exactly one of prompt or image."
+        if pose_mode:
+            provider = "meshy"
         blender = get_blender_connection()
         premium = _premium_generators(blender)
         own_keys = {} if premium else _own_key_generators(blender)
@@ -1795,9 +1804,13 @@ async def generate_3d(
                 "meshy" in premium if premium else own_keys.get("meshy")):
             return f"Error: {_meshy_unavailable(blender, premium)}"
         chosen, is_premium = generation.choose_provider(provider, premium, own_keys)
+        if pose_mode and is_premium:
+            return f"Error: {generation.MESHY_POSE_NOT_IN_PREMIUM}"
+        if pose_mode and (_addon_protocol() or 0) < generation.MESHY_POSE_PROTOCOL:
+            return f"Error: {generation.MESHY_POSE_NEEDS_UPDATE}"
         note = "" if is_premium else premium_hint_once(ctx, {"mode": None})
         pending = _pending_generations()
-        key = generation.request_key(chosen, prompt, image, quality, bbox_condition)
+        key = generation.request_key(chosen, prompt, image, quality, bbox_condition, pose_mode)
         started = pending.find(key)
         if started:
             note = (" This request was already generating from an earlier call, so it resumed that "
@@ -1805,7 +1818,7 @@ async def generate_3d(
         else:
             started = generation.submit(
                 _generation_send, chosen, name or generation.default_name(prompt), prompt, image, quality,
-                bbox_condition, supports_quality=(_addon_protocol() or 0) >= 11)
+                bbox_condition, supports_quality=(_addon_protocol() or 0) >= 11, pose_mode=pose_mode)
             if isinstance(started, str):
                 return started + note
             pending.add(key, started)

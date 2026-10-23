@@ -680,6 +680,7 @@ Through Premium, Meshy uses its latest model and each model counts as one standa
 Your own API key needs a paid Meshy plan:
 [get a Meshy API key](https://www.meshy.ai/developers/keys?utm_source=mcp-for-blender&utm_medium=integration&utm_campaign=blender-addon).
 Tick **Meshy** under **AI Model Generation** in the sidebar, choose a **Model**, and paste the key.
+On your own key, ask for a character "in an A-pose" or "in a T-pose" and Meshy generates it in that pose, ready to rig.
 
 #### Poly Haven
 
