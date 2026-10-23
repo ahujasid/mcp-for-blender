@@ -493,7 +493,13 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
         return (json.dumps(payload, indent=2) + premium_generation_guidance(result.premium_generators)
                 + await maybe_prompt_for_consent(ctx))
     except Exception as e:
-        return f"Error checking addon status: {e}"
+        logger.exception("get_addon_status failed")
+        return (
+            "Error checking addon status: "
+            f"{type(e).__name__}: {e}. "
+            "This failed in the MCP server while assembling the status report, "
+            "before the Blender addon status could be returned."
+        )
 
 
 @mcp.tool()
