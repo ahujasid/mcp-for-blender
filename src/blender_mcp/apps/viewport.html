@@ -406,7 +406,8 @@
       annotations: { audience: ["assistant"] },
       text: state.picks.length
         ? `The user clicked these objects in the attached Blender viewport screenshot: ${names}. `
-          + "When they say \"this\" or \"these\", they mean these objects; use their exact names in bpy.data.objects."
+          + "When they say \"this\" or \"these\", they mean these objects; use their exact names in bpy.data.objects. "
+          + "Where a face and a connected piece are given, they mean that piece, not the whole object."
         : "The user attached the current Blender 3D viewport from the Viewport panel.",
     });
     try {
