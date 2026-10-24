@@ -898,3 +898,11 @@ This is a third-party integration and not made by Blender. Made by [Siddharth](h
 **If MCP for Blender is useful to you, consider starring the repo**
 
 </div>
+
+### MiniMax reference images
+
+Set `MINIMAX_API_KEY` in your MCP server environment to enable the
+`generate_image` tool. Call it with a text `prompt` and optionally `region`
+(`global_en` by default, or `cn_zh` for a China-region account). It returns
+`image_urls` that expire after 24 hours. You can use a returned URL as the
+`image` argument to `generate_3d`. Image generation may incur a charge.
