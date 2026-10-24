@@ -1313,7 +1313,14 @@ class BlenderMCPServer:
         try:
             # Create socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                # Windows. SO_REUSEADDR there lets a second Blender bind a port
+                # the first is still listening on, and each new connection then
+                # lands on either one at random. Claim the port exclusively so
+                # the second start fails with "address in use" instead.
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.host, self.port))
             # Backlog of 1 meant a reconnecting client could complete the TCP
             # handshake and then never be accept()ed - a connection that looks
@@ -1425,20 +1432,34 @@ class BlenderMCPServer:
 
         print("Server thread stopped")
 
+    # Main-thread time one timer tick may spend on commands before handing
+    # control back to Blender's UI. With several MCP sessions queueing at
+    # once, draining everything in one tick froze the UI for the sum of them.
+    DRAIN_BUDGET_SECONDS = 0.05
+
     def _drain_command_queue(self):
         """Run queued commands on Blender's main thread.
 
         Registered once by start(); returns the poll interval so Blender keeps
-        calling it. All bpy access happens here, on the main thread.
+        calling it. All bpy access happens here, on the main thread. Replies
+        go back to the client's own thread to send, so a slow or vanished
+        client can never stall Blender's main thread on a socket write.
         """
         if not self.running:
             return None
 
+        started = time.monotonic()
         while True:
             try:
-                command, client = self.command_queue.get_nowait()
+                command, reply = self.command_queue.get_nowait()
             except queue.Empty:
                 break
+
+            if reply.full():
+                # The client disconnected while this waited its turn (it timed
+                # out, or its MCP session closed). Running it now would only
+                # repeat the command if the client retries.
+                continue
 
             try:
                 response = self.execute_command(command)
@@ -1449,11 +1470,97 @@ class BlenderMCPServer:
                 response_json = json.dumps({"status": "error", "message": str(e)})
 
             try:
-                client.sendall(response_json.encode('utf-8'))
-            except Exception:
-                print("Failed to send response - client disconnected")
+                reply.put_nowait(response_json.encode('utf-8'))
+            except queue.Full:
+                pass  # client went away while the command ran
+
+            if time.monotonic() - started >= self.DRAIN_BUDGET_SECONDS:
+                # More may be queued; come straight back after the UI updates.
+                return 0.0
 
         return 0.05
+
+    @staticmethod
+    def _take_command(buffer):
+        """Split one complete JSON command off the front of buffer.
+
+        Returns (command, rest); command is None until a whole one has
+        arrived. Messages have no framing, so parse only once the data ends
+        in "}" - every command is an object - and keep whatever follows the
+        first object: an older server could write two commands back to back,
+        and json.loads() rejecting that as "extra data" hung the connection.
+        """
+        if not buffer.rstrip().endswith(b"}"):
+            return None, buffer
+        try:
+            text = buffer.decode('utf-8').lstrip()
+            command, end = json.JSONDecoder().raw_decode(text)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Incomplete: a nested object ended on a chunk boundary, or a
+            # multi-byte character was split across recv() calls.
+            return None, buffer
+        rest = text[end:].lstrip().encode('utf-8')
+        return command, rest
+
+    def _client_gone(self, client):
+        """True once the client has closed or reset its end of the socket."""
+        client.settimeout(0.0)
+        try:
+            return client.recv(1, socket.MSG_PEEK) == b''
+        except BlockingIOError:
+            return False  # nothing to read: still connected
+        except OSError:
+            return True
+        finally:
+            client.settimeout(1.0)
+
+    def _run_on_main_thread(self, client, command):
+        """Queue command for the main thread, wait for it, send the reply.
+
+        Returns False when the connection should be closed.
+        """
+        # Holds the reply bytes; a None in it instead tells the main thread
+        # this client is gone and the command should be skipped.
+        reply = queue.Queue(maxsize=1)
+
+        # Hand off to the main thread. Never call bpy.app.timers.register()
+        # from here - it is not thread-safe and the callback can be silently
+        # lost.
+        print(f"Queued command: {command.get('type')}")
+        self.command_queue.put((command, reply))
+
+        while True:
+            if not self.running:
+                return False
+            try:
+                response = reply.get(timeout=0.25)
+                break
+            except queue.Empty:
+                if self._client_gone(client):
+                    try:
+                        reply.put_nowait(None)
+                    except queue.Full:
+                        pass
+                    print("Client disconnected before its command ran")
+                    return False
+
+        # Sent from this thread, not the main thread, where a client slow to
+        # read stalled Blender's UI. The timeout covers the whole sendall(),
+        # so the 1 s used for recv() polling could also cut a large reply
+        # (screenshot, scene dump) off mid-message, leaving the client to
+        # wait out its 180 s timeout.
+        client.settimeout(60.0)
+        try:
+            client.sendall(response)
+        except Exception as e:
+            print(f"Failed to send response: {str(e)}")
+            return False
+        finally:
+            try:
+                client.settimeout(1.0)
+            except OSError:
+                pass
+        return True
 
     def _handle_client(self, client):
         """Handle connected client"""
@@ -1475,22 +1582,13 @@ class BlenderMCPServer:
                         break
 
                     buffer += data
-                    try:
-                        # Try to parse command
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
-
-                        # Hand off to the main thread. Never call
-                        # bpy.app.timers.register() from here - it is not
-                        # thread-safe and the callback can be silently lost.
-                        print(f"Queued command: {command.get('type')}")
-                        self.command_queue.put((command, client))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        # Incomplete data, wait for more. A multi-byte UTF-8
-                        # character can land split across a recv() chunk
-                        # boundary, which fails decode() before json.loads()
-                        # ever runs - that's incomplete data too, not garbage.
-                        pass
+                    # One command at a time per connection: the reply has to
+                    # go out before the next command on it is looked at.
+                    command, buffer = self._take_command(buffer)
+                    while command is not None:
+                        if not self._run_on_main_thread(client, command):
+                            return
+                        command, buffer = self._take_command(buffer)
                 except socket.timeout:
                     # Expected; loop round and re-check self.running.
                     continue
