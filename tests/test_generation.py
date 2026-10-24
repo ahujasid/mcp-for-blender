@@ -48,17 +48,25 @@ def test_auto_prefers_premium_generators():
 
 
 def test_auto_falls_back_to_own_keys():
-    assert choose_provider("auto", [], {"hunyuan3d": False, "hyper3d": True}) == ("hyper3d", False)
+    assert choose_provider("auto", [], {"tripo": False, "hunyuan3d": False, "hyper3d": True}) == ("hyper3d", False)
+    assert choose_provider("auto", [], {"tripo": True, "hunyuan3d": True, "hyper3d": True}) == ("hunyuan3d", False)
+    assert choose_provider("auto", [], {"tripo": True, "hunyuan3d": False, "hyper3d": False}) == ("tripo", False)
 
 
 def test_nothing_enabled_points_at_setup():
     with pytest.raises(GenerationError, match="No 3D generator"):
-        choose_provider("auto", [], {"hunyuan3d": False, "hyper3d": False})
+        choose_provider("auto", [], {"tripo": False, "hunyuan3d": False, "hyper3d": False})
 
 
-def test_tripo_needs_premium():
-    with pytest.raises(GenerationError, match="Premium"):
-        choose_provider("tripo", [], {"hunyuan3d": True})
+def test_tripo_own_key_when_enabled():
+    assert choose_provider("tripo", [], {"tripo": True}) == ("tripo", False)
+    assert choose_provider("auto", [], {"hunyuan3d": False, "hyper3d": False, "tripo": True, "meshy": True}) == (
+        "tripo", False)
+
+
+def test_tripo_needs_key_or_premium():
+    with pytest.raises(GenerationError, match="Tripo"):
+        choose_provider("tripo", [], {"hunyuan3d": True, "tripo": False})
 
 
 def test_explicit_provider_must_be_on_in_premium():
@@ -79,6 +87,59 @@ def test_tripo_submit_poll_import():
     assert send.calls[0] == ("create_tripo_job", {"text_prompt": "a chest", "image": None, "quality": "high"})
     assert _run(send, job) == (True, "Chest")
     assert send.calls[-1] == ("import_generated_asset_tripo", {"request_id": "r1", "name": "Chest"})
+
+
+def test_tripo_own_key_submit_poll_import():
+    send = FakeAddon({
+        "create_tripo_job": {"task_id": "t1", "model": "H3.1"},
+        "poll_tripo_job_status": [
+            {"status": "running", "progress": 10},
+            {"status": "success", "model_url": "https://cdn.example/model.glb"},
+        ],
+        "import_generated_asset_tripo": {"succeed": True},
+    })
+    job = generation.submit(send, "tripo", "Teapot", "a teapot", None, None, None, False)
+    assert job.handle == "tripo:task:t1"
+    assert send.calls[0] == ("create_tripo_job", {"text_prompt": "a teapot", "image": None})
+    assert _run(send, job) == (True, "Teapot")
+    assert send.calls[-1] == (
+        "import_generated_asset_tripo",
+        {"name": "Teapot", "model_url": "https://cdn.example/model.glb"},
+    )
+
+
+def test_tripo_long_prompts_are_rejected_before_sending():
+    send = FakeAddon({})
+    with pytest.raises(GenerationError, match="1024"):
+        generation.submit(send, "tripo", "X", "x" * 1025, None, None, None, True)
+    assert send.calls == []
+
+
+def test_tripo_failed_task_says_why():
+    send = FakeAddon({
+        "create_tripo_job": {"task_id": "t1"},
+        "poll_tripo_job_status": [{"status": "failed", "error": "banned content"}],
+    })
+    job = generation.submit(send, "tripo", "Teapot", "a teapot", None, None, None, False)
+    with pytest.raises(GenerationError, match="banned content"):
+        _run(send, job)
+
+
+def test_tripo_switched_off_relays_the_addon_setup_steps(monkeypatch):
+    from blender_mcp import server
+
+    class OffBlender:
+        def send_command(self, command, params=None, **_kw):
+            if command == "get_tripo_status":
+                return {"enabled": False, "message": """Tripo integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel"""}
+            return {"enabled": False}
+
+    monkeypatch.setattr(server, "get_blender_connection", lambda: OffBlender())
+    monkeypatch.setattr(server, "_premium_generators", lambda _: [])
+    reply = asyncio.run(server.generate_3d(None, prompt="a stool", provider="tripo", wait_seconds=10))
+    assert reply == ("Error: Tripo integration is currently disabled. To enable it: 1. In the 3D Viewport, "
+                     "find the MCP for Blender panel")
 
 
 def test_premium_error_codes_are_relayed_not_retried():
@@ -554,7 +615,8 @@ def test_meshy_is_an_own_key_generator_and_reported(monkeypatch):
     from blender_mcp import server
 
     blender = _StatusBlender({"get_meshy_status"})
-    assert server._own_key_generators(blender) == {"hunyuan3d": False, "hyper3d": False, "meshy": True}
+    assert server._own_key_generators(blender) == {
+        "hunyuan3d": False, "hyper3d": False, "meshy": True, "tripo": False}
     assert server._integrations(blender, [])["generators"]["meshy"] == "on"
 
 

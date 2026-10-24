@@ -433,7 +433,7 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
     local settings only: Premium generators come from the handshake rather than a
     status call, which would ask the Premium server once per generator."""
     status = {}
-    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy"):
+    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy", "tripo"):
         if name in (premium_generators or []):
             status[name] = "on (Premium)"
             continue
@@ -442,7 +442,6 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
             status[name] = "on" if reply.get("enabled") else "off"
         except Exception as e:
             status[name] = "not in this addon version" if _addon_lacks(e) else "unknown"
-    status["tripo"] = "on (Premium)" if "tripo" in (premium_generators or []) else "off (Premium only)"
     return {
         "libraries": {k: status[k] for k in ("polyhaven", "sketchfab", "polypizza")},
         "generators": {k: status[k] for k in ("tripo", "hunyuan3d", "hyper3d", "meshy")},
@@ -1687,6 +1686,7 @@ def _own_key_generators(blender: BlenderConnection) -> dict[str, bool]:
         ("hunyuan3d", "get_hunyuan3d_status"),
         ("hyper3d", "get_hyper3d_status"),
         ("meshy", "get_meshy_status"),
+        ("tripo", "get_tripo_status"),
     ):
         try:
             enabled[name] = bool(blender.send_command(command).get("enabled"))
@@ -1710,6 +1710,17 @@ def _meshy_unavailable(blender: BlenderConnection, premium: list[str]) -> str:
             and (premium or "Premium" in (message or ""))):
         return generation.MESHY_PREMIUM_NEEDS_UPDATE
     return " ".join(message.split()) if message else generation.MESHY_UNAVAILABLE
+
+
+def _tripo_unavailable(blender: BlenderConnection) -> str:
+    """Why Tripo can't run, in the addon's words: switched off, no key, or not
+    ticked for Premium. An addon from before own-key Tripo says Premium only."""
+    try:
+        reply = blender.send_command("get_tripo_status")
+    except Exception:
+        return generation.TRIPO_UNAVAILABLE
+    message = reply.get("message") if isinstance(reply, dict) and not reply.get("enabled") else None
+    return " ".join(message.split()) if message else generation.TRIPO_UNAVAILABLE
 
 
 def _pending_generations() -> "generation.Pending":
@@ -1777,8 +1788,8 @@ async def generate_3d(
     - name: Object name in the scene. Defaults to one made from the prompt.
     - provider: auto (default), tripo, hunyuan3d, hyper3d or meshy. Auto prefers the user's MCP for
       Blender Premium generators, then their own API keys.
-    - quality: "standard" or "high" (Premium, not meshy). Omit for the user's default; "high" only
-      when the user asks for more detail.
+    - quality: "standard" or "high" (Premium; not Meshy, and not Tripo on your own key). Omit for
+      the user's default; "high" only when the user asks for more detail.
     - bbox_condition: hyper3d only: [length, width, height] proportions.
     - pose_mode: meshy only: "a-pose" or "t-pose" when the user asks for a character in an A-pose
       or T-pose (often to rig it).
@@ -1806,6 +1817,9 @@ async def generate_3d(
         if (provider or "").lower() == "meshy" and not (
                 "meshy" in premium if premium else own_keys.get("meshy")):
             return f"Error: {_meshy_unavailable(blender, premium)}"
+        if (provider or "").lower() == "tripo" and not (
+                "tripo" in premium if premium else own_keys.get("tripo")):
+            return f"Error: {_tripo_unavailable(blender)}"
         chosen, is_premium = generation.choose_provider(provider, premium, own_keys)
         if pose_mode and is_premium:
             return f"Error: {generation.MESHY_POSE_NOT_IN_PREMIUM}"

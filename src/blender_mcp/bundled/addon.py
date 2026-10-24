@@ -80,6 +80,21 @@ MESHY_TIMEOUT = (10, 60)
 # a socket timeout, or from a second MCP server) gets the refine already paid for.
 _meshy_refines = {}
 
+# Tripo, with the user's own key. Sidebar model id -> label; the id is what
+# the request sends. Text and image are each one task.
+TRIPO_API_BASE = "https://openapi.tripo3d.ai/v3"
+TRIPO_DEFAULT_MODEL = "v3.1-20260211"
+TRIPO_MODELS = {
+    "v3.1-20260211": "H3.1",
+    "P2-20260801": "P2.0",
+}
+TRIPO_KEY_URL = "https://developers.tripo3d.ai/en/keys"
+TRIPO_PROMPT_MAX = 1024
+TRIPO_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+TRIPO_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+TRIPO_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
+TRIPO_TIMEOUT = (10, 60)
+
 # Set when the user disconnects so opening another blend file does not restart
 # the server behind their back. A manual connect or add-on reload clears it.
 _user_stopped_server = False
@@ -1298,6 +1313,19 @@ class BlenderMCPServer:
             return None, {"error": f"Unknown Meshy model. Choose one of: {', '.join(MESHY_MODELS)}"}
         return model, None
 
+    def _get_tripo_api_key(self):
+        return self._get_config_value(
+            "blendermcp_tripo_api_key",
+            "tripo_api_key",
+            "BLENDERMCP_TRIPO_API_KEY",
+        )
+
+    def _resolve_tripo_model(self):
+        model = getattr(bpy.context.scene, "blendermcp_tripo_model", TRIPO_DEFAULT_MODEL) or TRIPO_DEFAULT_MODEL
+        if model not in TRIPO_MODELS:
+            return None, {"error": f"Unknown Tripo model. Choose one of: {', '.join(TRIPO_MODELS)}"}
+        return model, None
+
     def start(self):
         if bpy.app.background:
             print("BlenderMCP: cannot start server in background mode (blender -b) - commands would never execute\n"
@@ -1553,7 +1581,7 @@ class BlenderMCPServer:
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_polypizza_status": self.get_polypizza_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
-            "get_tripo_status": premium_tripo_status,
+            "get_tripo_status": self.get_tripo_status,
             "get_meshy_status": self.get_meshy_status,
             "export_scene": self.export_scene,
         }
@@ -1604,8 +1632,16 @@ class BlenderMCPServer:
             }
             handlers.update(hunyuan_handlers)
 
-        # Tripo is only offered through Premium
-        handlers.update(premium_tripo_handlers())
+        # Tripo runs through Premium when it's the generation source, else on
+        # the user's own key. getattr so scenes from before Tripo still dispatch.
+        if getattr(bpy.context.scene, "blendermcp_use_tripo", False) and premium_active():
+            handlers.update(premium_tripo_handlers())
+        elif getattr(bpy.context.scene, "blendermcp_use_tripo", False):
+            handlers.update({
+                "create_tripo_job": self.create_tripo_job,
+                "poll_tripo_job_status": self.poll_tripo_job_status,
+                "import_generated_asset_tripo": self.import_generated_asset_tripo,
+            })
 
         # Meshy runs through Premium when it's the generation source, else on
         # the user's own key. getattr so scenes from before Meshy still dispatch.
@@ -5079,6 +5115,233 @@ class BlenderMCPServer:
                 shutil.rmtree(temp_dir)
     #endregion
 
+    #region Tripo
+    def get_tripo_status(self):
+        """Get the current status of Tripo integration."""
+        if premium_active():
+            return premium_integration_status("tripo", getattr(bpy.context.scene, "blendermcp_use_tripo", False))
+        if not getattr(bpy.context.scene, "blendermcp_use_tripo", False):
+            return {
+                "enabled": False,
+                "message": """Tripo integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, check Tripo
+                            3. Choose a model and fill in the API Key""",
+            }
+        if not self._get_tripo_api_key():
+            return {
+                "enabled": False,
+                "message": """Tripo integration is currently enabled, but the API key is not given. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, keep Tripo checked
+                            3. Choose a model and fill in the API Key""",
+            }
+        model, error = self._resolve_tripo_model()
+        if error:
+            return {"enabled": False, "message": error["error"]}
+        choices = ", ".join(f"{label} ({ident})" for ident, label in TRIPO_MODELS.items())
+        return {
+            "enabled": True,
+            "model": model,
+            "message": (
+                f"Tripo integration is enabled and ready to use. Model: {TRIPO_MODELS[model]}. "
+                f"Sidebar choices: {choices}."
+            ),
+        }
+
+    def _tripo_headers(self):
+        api_key = self._get_tripo_api_key()
+        if not api_key:
+            return None, {"error": "Tripo API key is not given"}
+        return {**TRIPO_HEADERS, "Authorization": f"Bearer {api_key}"}, None
+
+    @staticmethod
+    def _tripo_parse(response):
+        """(data, None) on success, else (None, {"error": readable message}).
+        Messages come from fixed text or Tripo's reply, never the request, so
+        the key can't leak into them."""
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            payload = None
+        code = payload.get("code") if payload else None
+        message = payload.get("message") if payload else None
+        message = message.strip() if isinstance(message, str) and message.strip() else None
+        suggestion = payload.get("suggestion") if payload else None
+        suggestion = suggestion.strip() if isinstance(suggestion, str) and suggestion.strip() else None
+        if message and suggestion and suggestion not in message:
+            joiner = "" if message[-1] in ".!?" else ". "
+            message = f"{message}{joiner}{suggestion}"
+        # 401, 1000 and 1001 can echo the key, so ignore the body.
+        if response.status_code == 401 or code in (1000, 1001):
+            return None, {"error": "Tripo rejected the API key"}
+        if code == 2010:
+            return None, {"error": message or "Out of Tripo credits. Top up at tripo3d.ai"}
+        if code == 2000:
+            return None, {"error": message or "Tripo concurrency limit hit, wait and retry"}
+        if code == 1007 or response.status_code == 429:
+            return None, {"error": message or "Tripo rate limit hit, wait and retry"}
+        if response.status_code == 403:
+            return None, {"error": message or "Tripo refused the request: no permission, or not enough credits"}
+        if response.status_code == 404:
+            return None, {"error": message or "Tripo could not find that resource"}
+        if response.status_code == 500:
+            return None, {"error": message or "Tripo request failed. Try again later"}
+        if not response.ok or payload is None:
+            return None, {"error": message or f"Tripo request failed with status {response.status_code}"}
+        if code not in (0, None):
+            return None, {"error": message or "Tripo request failed"}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None, {"error": "Tripo response did not include data"}
+        return data, None
+
+    def _tripo_post(self, path, body, files=None):
+        headers, error = self._tripo_headers()
+        if error:
+            return None, error
+        try:
+            response = requests.post(
+                f"{TRIPO_API_BASE}{path}", headers=headers, json=body, files=files, timeout=TRIPO_TIMEOUT)
+        except Exception:
+            return None, {"error": "Tripo request failed. Check the internet connection and try again"}
+        return self._tripo_parse(response)
+
+    def _tripo_upload_image(self, path, headers):
+        if not os.path.isfile(path):
+            return None, {"error": f"Image file not found: {path}"}
+        mime = TRIPO_IMAGE_TYPES.get(os.path.splitext(path)[1].lower())
+        if not mime:
+            return None, {"error": "Tripo accepts JPEG or PNG images"}
+        if os.path.getsize(path) > TRIPO_IMAGE_MAX_BYTES:
+            return None, {"error": "Tripo accepts images up to 20 MB"}
+        try:
+            with open(path, "rb") as handle:
+                response = requests.post(
+                    f"{TRIPO_API_BASE}/files",
+                    headers=headers,
+                    files={"file": (os.path.basename(path), handle, mime)},
+                    timeout=TRIPO_TIMEOUT,
+                )
+        except Exception:
+            return None, {"error": "Tripo request failed. Check the internet connection and try again"}
+        data, error = self._tripo_parse(response)
+        if error:
+            return None, error
+        file_token = data.get("file_token")
+        if not file_token:
+            return None, {"error": "Tripo upload did not return a file_token"}
+        return file_token, None
+
+    def create_tripo_job(self, text_prompt=None, image=None, quality=None):
+        """Start one Tripo text-to-model or image-to-model task. quality is Premium-only."""
+        text_prompt = (text_prompt or "").strip()
+        image = (image or "").strip()
+        if bool(text_prompt) == bool(image):
+            return {"error": "Provide either a text prompt or an image, not both"}
+        if len(text_prompt) > TRIPO_PROMPT_MAX:
+            return {"error": f"Tripo prompts are limited to {TRIPO_PROMPT_MAX} characters"}
+        model, error = self._resolve_tripo_model()
+        if error:
+            return error
+        headers, error = self._tripo_headers()
+        if error:
+            return error
+
+        if text_prompt:
+            data, error = self._tripo_post(
+                "/generation/text-to-model",
+                {"model": model, "prompt": text_prompt, "texture": True, "pbr": True},
+            )
+        else:
+            if re.match(r"^https?://", image, re.IGNORECASE):
+                tripo_input = image
+            else:
+                tripo_input, error = self._tripo_upload_image(image, headers)
+                if error:
+                    return error
+            data, error = self._tripo_post(
+                "/generation/image-to-model",
+                {"model": model, "input": tripo_input, "texture": True, "pbr": True},
+            )
+        if error:
+            return error
+        task_id = data.get("task_id")
+        if not task_id:
+            return {"error": "Tripo response did not include a task id"}
+        return {"task_id": task_id, "model": model}
+
+    def poll_tripo_job_status(self, task_id=None, request_id=None):
+        """Query one Tripo task. Does not wait; the MCP client polls again."""
+        if not task_id:
+            return {"error": "task_id is required"}
+        headers, error = self._tripo_headers()
+        if error:
+            return error
+        try:
+            response = requests.get(
+                f"{TRIPO_API_BASE}/tasks/{quote(str(task_id), safe='')}",
+                headers=headers,
+                timeout=TRIPO_TIMEOUT,
+            )
+        except Exception:
+            return {"error": "Tripo request failed. Check the internet connection and try again"}
+        data, error = self._tripo_parse(response)
+        if error:
+            return error
+        result = {
+            "task_id": data.get("task_id", task_id),
+            "status": data.get("status"),
+            "progress": data.get("progress"),
+        }
+        status = data.get("status")
+        if status == "success":
+            output = data.get("output") or {}
+            model_url = output.get("model_url") or output.get("pbr_model") or output.get("model")
+            if not model_url:
+                return {**result, "error": "Tripo task succeeded but returned no model URL"}
+            result["model_url"] = model_url
+        elif status in ("failed", "cancelled", "banned", "expired"):
+            result["error"] = data.get("error_message") or data.get("message") or data.get("error") or status
+        return result
+
+    def import_generated_asset_tripo(self, name, model_url=None, request_id=None):
+        """Download a Tripo GLB and import it into the current scene."""
+        if not model_url:
+            return {"succeed": False, "error": "No file URL provided"}
+        if not re.match(r"^https?://", model_url, re.IGNORECASE):
+            return {"succeed": False, "error": "Invalid URL format. Must start with http:// or https://"}
+
+        temp_dir = tempfile.mkdtemp(prefix="tripo_glb_")
+        glb_path = osp.join(temp_dir, "model.glb")
+        try:
+            response = requests.get(model_url, headers=TRIPO_HEADERS, stream=True, timeout=TRIPO_TIMEOUT)
+            response.raise_for_status()
+            with open(glb_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    handle.write(chunk)
+            obj = self._clean_imported_glb(filepath=glb_path, mesh_name=name)
+            if obj is None:
+                return {"succeed": False, "error": "No mesh objects imported from GLB"}
+            result = {
+                "name": obj.name,
+                "type": obj.type,
+                "location": [obj.location.x, obj.location.y, obj.location.z],
+                "rotation": [obj.rotation_euler.x, obj.rotation_euler.y, obj.rotation_euler.z],
+                "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
+            }
+            if obj.type == "MESH":
+                result["world_bounding_box"] = self._get_aabb(obj)
+            return {"succeed": True, **result}
+        except Exception:
+            return {"succeed": False, "error": "Failed to import Tripo model"}
+        finally:
+            with suppress(Exception):
+                shutil.rmtree(temp_dir)
+    #endregion
+
     #region Meshy
     def get_meshy_status(self):
         """Get the current status of Meshy integration."""
@@ -5292,7 +5555,7 @@ class BlenderMCPServer:
 # toggle on, the Hyper3D, Hunyuan3D and Meshy commands send the same request through
 # the MCP for Blender server, which holds the fal and Meshy keys and decides quotas, and
 # replies are reshaped into the fal/Tencent/Meshy shapes the MCP tools already
-# parse. Tripo is only offered through Premium. With generation_source left at
+# parse. With generation_source left at
 # BYOK nothing here runs, and nothing here touches the network until the user
 # activates a key.
 
@@ -5761,14 +6024,6 @@ def premium_create_tripo_job(text_prompt=None, image=None, quality=None):
     return _premium_fal_reply(premium_create_job("tripo", quality, text_prompt=text_prompt, image=image))
 
 
-def premium_tripo_status():
-    enabled = bool(getattr(bpy.context.scene, "blendermcp_use_tripo", False))
-    if premium_active():
-        return premium_integration_status("tripo", enabled)
-    return {"enabled": False, "message": "Tripo is only available with MCP for Blender Premium: "
-                                         f"{PREMIUM_PRICING_URL}?ref=addon-tripo"}
-
-
 def premium_tripo_handlers():
     """Tripo commands, registered in Premium mode when its checkbox is on."""
     if not (premium_active() and getattr(bpy.context.scene, "blendermcp_use_tripo", False)):
@@ -6073,7 +6328,7 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         name="Generation Source",
         description="Where 3D model generation runs",
         items=[
-            ("BYOK", "Your own API keys", "Use your own Hyper3D, fal.ai, Meshy or Tencent Cloud keys"),
+            ("BYOK", "Your own API keys", "Use your own Hyper3D, fal.ai, Tripo, Meshy or Tencent Cloud keys"),
             ("PREMIUM", "Premium", "Generate through MCP for Blender Premium with one license key"),
         ],
         default="BYOK",
@@ -6098,6 +6353,12 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
             ("high", "High", "More detail; uses a high-quality generation (Pro)"),
         ],
         default="standard",
+    )
+    tripo_api_key: bpy.props.StringProperty(
+        name="Tripo API Key",
+        subtype="PASSWORD",
+        description="Persistent Tripo API Key",
+        default=""
     )
     meshy_api_key: bpy.props.StringProperty(
         name="Meshy API Key",
@@ -6152,6 +6413,9 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
             col.operator("wm.url_open", text="Tencent Cloud keys", icon='URL').url = \
                 "https://console.cloud.tencent.com/cam/capi"
             col.prop(self, "hunyuan3d_api_url", text="Hunyuan3D API URL")
+            col.separator()
+            col.prop(self, "tripo_api_key", text="Tripo API Key")
+            col.operator("wm.url_open", text="Get Tripo API Key", icon='URL').url = TRIPO_KEY_URL
             col.separator()
             col.prop(self, "meshy_api_key", text="Meshy API Key")
             col.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
@@ -6275,10 +6539,17 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 col.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
                 col.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
 
-        if premium:
-            sub = self._integration_header(layout, scene, "blendermcp_use_tripo", "Tripo", 'MESH_TORUS')
-            if sub:
-                sub.label(text="Runs through Premium")
+        sub = self._integration_header(layout, scene, "blendermcp_use_tripo", "Tripo", 'OUTLINER_OB_MESH')
+        if sub and premium:
+            sub.label(text="Runs through Premium")
+        elif sub:
+            col = sub.column(align=True)
+            col.prop(scene, "blendermcp_tripo_model", text="Model")
+            if prefs:
+                col.prop(prefs, "tripo_api_key", text="API Key")
+            else:
+                col.prop(scene, "blendermcp_tripo_api_key", text="API Key")
+            sub.operator("wm.url_open", text="Get Tripo API Key", icon='KEYINGSET').url = TRIPO_KEY_URL
 
         sub = self._integration_header(layout, scene, "blendermcp_use_meshy", "Meshy", 'OUTLINER_OB_MESH')
         if sub and premium:
@@ -6679,8 +6950,22 @@ def register():
 
     bpy.types.Scene.blendermcp_use_tripo = bpy.props.BoolProperty(
         name="Use Tripo",
-        description="Enable Tripo 3D model generation (Premium)",
-        default=False
+        description="Enable Tripo model generation",
+        default=False,
+    )
+
+    bpy.types.Scene.blendermcp_tripo_model = bpy.props.EnumProperty(
+        name="Tripo Model",
+        description="Tripo model used for each generation",
+        items=[(ident, label, f"{label} model") for ident, label in TRIPO_MODELS.items()],
+        default=TRIPO_DEFAULT_MODEL,
+    )
+
+    bpy.types.Scene.blendermcp_tripo_api_key = bpy.props.StringProperty(
+        name="Tripo API Key",
+        subtype="PASSWORD",
+        description="API Key provided by Tripo",
+        default="",
     )
 
     bpy.types.Scene.blendermcp_use_meshy = bpy.props.BoolProperty(
@@ -6772,6 +7057,8 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_sketchfab
     del bpy.types.Scene.blendermcp_sketchfab_api_key
     del bpy.types.Scene.blendermcp_use_tripo
+    del bpy.types.Scene.blendermcp_tripo_model
+    del bpy.types.Scene.blendermcp_tripo_api_key
     del bpy.types.Scene.blendermcp_use_meshy
     del bpy.types.Scene.blendermcp_meshy_model
     del bpy.types.Scene.blendermcp_meshy_api_key
