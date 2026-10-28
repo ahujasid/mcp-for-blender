@@ -32,15 +32,19 @@ logger = logging.getLogger("BlenderMCPServer")
 PROVIDERS = ("tripo", "hunyuan3d", "hyper3d", "meshy")
 
 # Auto-pick order. Premium generators come first because the user is paying
-# for them and they run the stronger models.
-PREMIUM_ORDER = ("meshy", "tripo", "hunyuan3d", "hyper3d")
+PREMIUM_ORDER = ("tripo", "meshy", "hyper3d", "hunyuan3d")
 OWN_KEY_ORDER = ("hunyuan3d", "hyper3d", "tripo", "meshy")
+
 
 # Meshy task kinds: text preview, text refine, image to model, and a Premium
 # job (either input, preview and refine done by the Premium server).
 MESHY_KINDS = ("t2p", "t2r", "i2m", "prm")
 # Addons from this protocol on can run Meshy through Premium.
 MESHY_PREMIUM_PROTOCOL = 14
+# Addons from this protocol on pass pose_mode to Meshy.
+MESHY_POSE_PROTOCOL = 15
+# Meshy's pose_mode values; the model comes out in that pose, ready to rig.
+MESHY_POSES = ("a-pose", "t-pose")
 MESHY_PROMPT_MAX = 800
 TRIPO_PROMPT_MAX = 1024
 
@@ -62,6 +66,11 @@ MESHY_UNAVAILABLE = ("Meshy is not enabled. In the MCP for Blender sidebar in Bl
 MESHY_PREMIUM_NEEDS_UPDATE = ("Meshy through MCP for Blender Premium needs the latest Blender addon: run "
                               "`uvx mcp-for-blender install-addon`, then restart Blender and tick Meshy in the "
                               "MCP for Blender sidebar.")
+MESHY_POSE_NEEDS_UPDATE = ("pose_mode needs the latest Blender addon: run `uvx mcp-for-blender install-addon`, "
+                           "then restart Blender.")
+MESHY_POSE_NOT_IN_PREMIUM = ("pose_mode isn't available through MCP for Blender Premium yet, only on your own Meshy "
+                             "API key. Generate without pose_mode, or switch Generation Source to Your own API keys "
+                             "in the addon preferences.")
 
 Send = Callable[[str, dict], Any]
 Progress = Callable[[float, float], Awaitable[None]]
@@ -100,9 +109,13 @@ class Job:
 
 
 def request_key(provider: str, prompt: str | None, image: str | None,
-                quality: str | None, bbox_condition: list | None) -> str:
+                quality: str | None, bbox_condition: list | None, pose_mode: str | None = None) -> str:
     """Identifies a request, so a retry of one still running can be recognised."""
-    raw = json.dumps([provider, prompt, image, quality, bbox_condition])
+    fields = [provider, prompt, image, quality, bbox_condition]
+    # Only when set, so requests without a pose keep the keys they had.
+    if pose_mode:
+        fields.append(pose_mode)
+    raw = json.dumps(fields)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -257,7 +270,8 @@ def process_bbox(bbox: list | None) -> list[int] | None:
 
 
 def submit(send: Send, provider: str, name: str, prompt: str | None, image: str | None,
-           quality: str | None, bbox_condition: list | None, supports_quality: bool) -> Job | str:
+           quality: str | None, bbox_condition: list | None, supports_quality: bool,
+           pose_mode: str | None = None) -> Job | str:
     """Start a generation. Returns a Job, or a finished message for providers
     that generate synchronously (Hunyuan3D LOCAL_API)."""
     if provider == "tripo":
@@ -280,7 +294,10 @@ def submit(send: Send, provider: str, name: str, prompt: str | None, image: str 
         if prompt and len(prompt) > MESHY_PROMPT_MAX:
             raise GenerationError(f"Meshy prompts are limited to {MESHY_PROMPT_MAX} characters; "
                                   f"this one is {len(prompt)}. Shorten it.")
-        result = send("create_meshy_job", {"text_prompt": prompt, "image": image})
+        params = {"text_prompt": prompt, "image": image}
+        if pose_mode:
+            params["pose_mode"] = pose_mode
+        result = send("create_meshy_job", params)
         _relay(result)
         started = ("t2p", "i2m", "prm")
         if not isinstance(result, dict) or not result.get("task_id") or result.get("kind") not in started:

@@ -39,7 +39,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 14
+ADDON_PROTOCOL_VERSION = 15
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -68,6 +68,7 @@ MESHY_MODELS = {
 MESHY_KEY_URL = ("https://www.meshy.ai/developers/keys"
                  "?utm_source=mcp-for-blender&utm_medium=integration&utm_campaign=blender-addon")
 MESHY_PROMPT_MAX = 800
+MESHY_POSES = ("a-pose", "t-pose")
 MESHY_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 MESHY_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
 # Every task: GLB only, sized to real-world height, origin at the bottom.
@@ -5435,7 +5436,7 @@ class BlenderMCPServer:
             encoded = base64.b64encode(handle.read()).decode("ascii")
         return f"data:{mime};base64,{encoded}", None
 
-    def create_meshy_job(self, text_prompt=None, image=None):
+    def create_meshy_job(self, text_prompt=None, image=None, pose_mode=None):
         """Start a Meshy text preview task ("t2p") or image-to-3D task ("i2m")."""
         text_prompt = (text_prompt or "").strip()
         image = (image or "").strip()
@@ -5443,12 +5444,16 @@ class BlenderMCPServer:
             return {"error": "Provide either a text prompt or an image, not both"}
         if len(text_prompt) > MESHY_PROMPT_MAX:
             return {"error": f"Meshy prompts are limited to {MESHY_PROMPT_MAX} characters"}
+        if pose_mode and pose_mode not in MESHY_POSES:
+            return {"error": "pose_mode must be 'a-pose' or 't-pose'"}
         model, error = self._resolve_meshy_model()
         if error:
             return error
 
         if text_prompt:
             body = {"mode": "preview", "prompt": text_prompt, "ai_model": model, **MESHY_OUTPUT}
+            if pose_mode:
+                body["pose_mode"] = pose_mode
             task_id, error = self._meshy_post("/v2/text-to-3d", body)
             kind = "t2p"
         else:
@@ -5457,6 +5462,8 @@ class BlenderMCPServer:
                 return error
             body = {"image_url": image_url, "ai_model": model, "should_texture": True, "enable_pbr": True,
                     **MESHY_OUTPUT}
+            if pose_mode:
+                body["pose_mode"] = pose_mode
             task_id, error = self._meshy_post("/v1/image-to-3d", body)
             kind = "i2m"
         if error:
@@ -6036,7 +6043,9 @@ _PREMIUM_MESHY_STATUS = {"reserved": "PENDING", "running": "IN_PROGRESS", "succe
                          "failed": "FAILED"}
 
 
-def premium_create_meshy_job(text_prompt=None, image=None):
+def premium_create_meshy_job(text_prompt=None, image=None, pose_mode=None):
+    if pose_mode:
+        return {"error": "pose_mode isn't available through Premium yet, only on your own Meshy API key"}
     result = premium_create_job("meshy", "standard", text_prompt=text_prompt, image=image)
     if not result.get("job_id"):
         return result

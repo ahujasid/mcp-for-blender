@@ -1,6 +1,6 @@
 [project]
 name = "mcp-for-blender"
-version = "2.2.2"
+version = "2.2.5"
 description = "Open source Blender integration through the Model Context Protocol (not affiliated with Blender Foundation)"
 readme = "README.md"
 requires-python = ">=3.10"
