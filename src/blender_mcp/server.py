@@ -104,6 +104,9 @@ _addon_handshake = None
 _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
 
+# Serializes the creation of the shared Blender connection (#387).
+_connection_lock = threading.Lock()
+
 @dataclass
 class BlenderConnection:
     host: str
@@ -266,42 +269,58 @@ class BlenderConnection:
             self.sock = None
             raise Exception(f"Communication error with Blender: {str(e)}")
 
+
+def _startup_checks() -> None:
+    """The checks the server makes while it starts.
+
+    They only report: whether the on-disk addon is current, whether Blender is
+    there, and the startup telemetry event. None of them is needed to serve a
+    tool, so they run in the background (see [`server_lifespan`]) and a slow or
+    unreachable Blender cannot hold up the MCP handshake.
+    """
+    try:
+        status = check_addon_status_on_startup()
+        if status.needs_action:
+            logger.warning(status.message)
+        elif status.message:
+            logger.info(status.message)
+    except Exception as e:
+        logger.debug(f"Addon status check skipped: {e}")
+
+    # Record startup event for telemetry
+    try:
+        record_startup()
+    except Exception as e:
+        logger.debug(f"Failed to record startup telemetry: {e}")
+
+    # Try to connect to Blender on startup to verify it's available
+    try:
+        # This will initialize the global connection if needed
+        blender = get_blender_connection()
+        logger.info("Successfully connected to Blender on startup")
+        if _addon_handshake and not _addon_handshake.up_to_date:
+            logger.warning(format_handshake_log(_addon_handshake))
+    except Exception as e:
+        logger.warning(f"Could not connect to Blender on startup: {str(e)}")
+        logger.warning("Make sure the Blender addon is running before using Blender resources or tools")
+
+
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle"""
     # We don't need to create a connection here since we're using the global connection
     # for resources and tools
 
+    # The startup checks connect to Blender, which can take seconds: Blender may be
+    # busy, and the addon handshake waits for the addon to answer. The MCP client is
+    # still waiting for `initialize` while that happens, and a client that gives up
+    # tears the process down before the handshake completes (#387). The checks are
+    # informational, so they run in the background and the tools connect to Blender
+    # when they are first used.
+    logger.info("BlenderMCP server starting up")
+    threading.Thread(target=_startup_checks, name="mcp-startup", daemon=True).start()
+
     try:
-        # Just log that we're starting up
-        logger.info("BlenderMCP server starting up")
-
-        try:
-            status = check_addon_status_on_startup()
-            if status.needs_action:
-                logger.warning(status.message)
-            elif status.message:
-                logger.info(status.message)
-        except Exception as e:
-            logger.debug(f"Addon status check skipped: {e}")
-
-        # Record startup event for telemetry
-        try:
-            record_startup()
-        except Exception as e:
-            logger.debug(f"Failed to record startup telemetry: {e}")
-
-        # Try to connect to Blender on startup to verify it's available
-        try:
-            # This will initialize the global connection if needed
-            blender = get_blender_connection()
-            logger.info("Successfully connected to Blender on startup")
-            if _addon_handshake and not _addon_handshake.up_to_date:
-                logger.warning(format_handshake_log(_addon_handshake))
-        except Exception as e:
-            logger.warning(f"Could not connect to Blender on startup: {str(e)}")
-            logger.warning("Make sure the Blender addon is running before using Blender resources or tools")
-
         # Return an empty context - we're using the global connection
         yield {}
     finally:
@@ -414,16 +433,22 @@ def get_blender_connection():
     if _blender_connection is not None and _blender_connection.sock is not None:
         return _blender_connection
 
-    # Create a new connection if needed
-    if _blender_connection is None:
-        host, port = resolve_connection(CLI_HOST, CLI_PORT)
-        _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
-        _maybe_handshake_addon(_blender_connection)
+    # Create a new connection if needed. The startup check runs in a background
+    # thread (#387), so the creation is serialized: without the lock it and a
+    # tool call could each open a socket to Blender.
+    with _connection_lock:
+        if _blender_connection is None:
+            host, port = resolve_connection(CLI_HOST, CLI_PORT)
+            connection = BlenderConnection(host=host, port=port)
+            if not connection.connect():
+                logger.error("Failed to connect to Blender")
+                raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
+            logger.info("Created new persistent connection to Blender")
+            _blender_connection = connection
+
+    # The handshake waits for the addon to answer, so it stays out of the lock: a
+    # tool call must not queue behind it.
+    _maybe_handshake_addon(_blender_connection)
 
     return _blender_connection
 
