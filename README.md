@@ -866,6 +866,11 @@ Or add it to your MCP config:
 }
 ```
 
+Public source checkouts do not include the private telemetry backend configuration.
+Without it, collection stays disabled and the server does not create a telemetry
+install ID or start its telemetry worker. Blender tools, including addon status
+and the consent setting reported by Blender, remain available.
+
 Telemetry data is not linked to your name or account. It may be used to improve MCP for Blender, for research, and to train AI models.
 
 Full detail on what is collected, and the license you grant by opting in, is in [TERMS_AND_CONDITIONS.md](TERMS_AND_CONDITIONS.md).

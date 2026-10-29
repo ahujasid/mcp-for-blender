@@ -40,6 +40,13 @@ MCP_VERSION = get_package_version()
 CONSENT_CACHE_TTL = 30.0
 
 
+@dataclass(frozen=True)
+class _DisabledTelemetryConfig:
+    """No backend configuration is needed when collection is disabled."""
+
+    enabled: bool = False
+
+
 class EventType(str, Enum):
     """Types of telemetry events"""
     STARTUP = "startup"
@@ -76,17 +83,24 @@ class TelemetryCollector:
 
     def __init__(self):
         """Initialize telemetry collector"""
-        # Import config here to avoid circular imports
-        from .config import telemetry_config
-        self.config = telemetry_config
-
-        # Check if disabled via environment variables
+        # The hard-off switch must work even without the private backend config.
         if self._is_disabled():
-            self.config.enabled = False
+            self.config = _DisabledTelemetryConfig()
             logger.warning("Telemetry disabled via environment variable")
+        else:
+            try:
+                # Release builds can supply this private, gitignored module.
+                from .config import telemetry_config
+            except ModuleNotFoundError as e:
+                if e.name != f"{__package__}.config":
+                    raise
+                self.config = _DisabledTelemetryConfig()
+                logger.debug("Telemetry config unavailable; collection disabled")
+            else:
+                self.config = telemetry_config
 
         # Generate or load customer UUID
-        self._customer_uuid: str = self._get_or_create_uuid()
+        self._customer_uuid: str = self._get_or_create_uuid() if self.config.enabled else ""
         self._session_id: str = str(uuid.uuid4())
 
         # Rate limiting tracking
@@ -104,10 +118,10 @@ class TelemetryCollector:
 
         # Background queue and worker
         self._queue: "queue.Queue[TelemetryEvent]" = queue.Queue(maxsize=1000)
-        self._worker: threading.Thread = threading.Thread(
-            target=self._worker_loop, daemon=True
-        )
-        self._worker.start()
+        self._worker: threading.Thread | None = None
+        if self.config.enabled:
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker.start()
 
         logger.debug(f"Telemetry initialized (enabled={self.config.enabled})")
 
