@@ -827,6 +827,35 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - **Commands** are sent as JSON objects with a `type` and optional `params`
 - **Responses** are JSON objects with a `status` and `result` or `message`
 
+### Configure the Blender add-on listener
+
+The Blender add-on listens on `localhost` by default. To accept connections from
+another trusted PC, Docker, or WSL, open **Edit > Preferences > Add-ons > MCP for
+Blender > Server Connection**, or disconnect and use the same settings beside
+**Port** in the sidebar:
+
+1. Set **Bind Address** to the IPv4 address of the Blender machine's network
+   interface. `localhost` and loopback IPv4 addresses work without remote access.
+2. For a non-loopback address, explicitly enable **Allow Remote Connections**.
+3. Disconnect and reconnect, or restart Blender with auto-start enabled. The panel
+   shows the address and port the running server actually uses.
+
+These settings live in Blender's add-on preferences, not the current `.blend`
+file, so they apply to both manual connections and auto-start. If automatic
+preference saving is disabled, use Blender's **Save Preferences** to retain them
+across restarts. Changing settings does not move an already running listener.
+
+On the MCP-client machine, set `BLENDER_HOST` to the reachable address of the
+Blender machine and `BLENDER_PORT` to the port shown in Blender. A bind address of
+`0.0.0.0` listens on all IPv4 interfaces; it is not the address a remote client
+should connect to. IPv6 and arbitrary hostnames other than `localhost` are not
+supported by the add-on's IPv4 listener.
+
+**Remote access has no authentication or encryption and permits Python execution
+inside Blender.** Prefer a specific trusted LAN interface over `0.0.0.0`, limit
+access with firewall rules, and do not expose the listener to the public internet.
+An SSH tunnel is an alternative that preserves the default loopback-only listener.
+
 ## Limitations & Security Considerations
 
 > **Warning:** The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. **ALWAYS save your work before using it.**

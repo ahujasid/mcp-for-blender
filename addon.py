@@ -7,6 +7,7 @@ import mathutils
 import json
 import threading
 import socket
+import ipaddress
 import queue
 import time
 import requests
@@ -100,12 +101,44 @@ TRIPO_TIMEOUT = (10, 60)
 _user_stopped_server = False
 
 
+def _blendermcp_bind_address(context=None):
+    """Read persistent listener settings, requiring opt-in beyond loopback."""
+    prefs = get_blendermcp_addon_preferences(context)
+    host = getattr(prefs, "bind_address", "localhost").strip()
+    if host.lower() == "localhost":
+        return "localhost"
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("Bind Address must be localhost or an IPv4 address") from exc
+    if not address.is_loopback and not getattr(prefs, "allow_remote_connections", False):
+        raise ValueError(
+            "Non-loopback binding requires Allow Remote Connections in add-on preferences"
+        )
+    return str(address)
+
+
+def _blendermcp_draw_bind_settings(layout, prefs):
+    """Expose the same persistent settings in Preferences and the sidebar."""
+    layout.prop(prefs, "bind_address")
+    layout.prop(prefs, "allow_remote_connections")
+    if prefs.allow_remote_connections:
+        warning = layout.column()
+        warning.alert = True
+        warning.label(text="Remote clients can run Python.", icon='ERROR')
+        warning.label(text="No authentication or encryption.")
+        warning.label(text="Use a trusted LAN and a firewall.")
+        warning.label(text="Prefer a specific LAN address.")
+
+
 def _blendermcp_port_has_listener(host, port):
     """Return True when another process already owns the MCP endpoint."""
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.settimeout(0.15)
     try:
-        return probe.connect_ex((host, port)) == 0
+        # A wildcard is a listening address, not a portable connect target.
+        probe_host = "127.0.0.1" if host == "0.0.0.0" else host
+        return probe.connect_ex((probe_host, port)) == 0
     finally:
         probe.close()
 
@@ -128,18 +161,31 @@ def _blendermcp_ensure_server_running():
         scene.blendermcp_server_running = bool(server is not None and server.running)
         return None
 
+    if server is not None and server.running:
+        scene.blendermcp_server_running = True
+        return None
+
+    try:
+        host = _blendermcp_bind_address()
+    except ValueError as exc:
+        scene.blendermcp_server_running = False
+        print(f"BlenderMCP: auto-start skipped: {exc}")
+        return None
+
     port = scene.blendermcp_port
     if server is None:
-        if _blendermcp_port_has_listener("localhost", port):
+        if _blendermcp_port_has_listener(host, port):
             scene.blendermcp_server_running = False
-            print(f"BlenderMCP: port {port} is already in use; auto-start skipped.")
+            print(f"BlenderMCP: {host}:{port} is already in use; auto-start skipped.")
             return None
-        server = BlenderMCPServer(port=port)
+        server = BlenderMCPServer(host=host, port=port)
         bpy.types.blendermcp_server = server
 
     if not server.running:
         # Safe while stopped and necessary when a newly loaded scene selects a
-        # different port. Never retarget an active connection.
+        # different port or the preferences select a different bind address.
+        # Never retarget an active connection.
+        server.host = host
         server.port = port
         server.start()
 
@@ -6277,6 +6323,21 @@ PREMIUM_CLASSES = (
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
+
+    bind_address: bpy.props.StringProperty(
+        name="Bind Address",
+        description="Listener address: localhost or an IPv4 address. Applied on next connection",
+        default="localhost",
+    )
+    allow_remote_connections: BoolProperty(
+        name="Allow Remote Connections",
+        description=(
+            "Allow non-loopback binding on the next connection. Remote clients can execute "
+            "Python without authentication or encryption. Use only on a trusted network "
+            "with firewall restrictions"
+        ),
+        default=False,
+    )
     
     def _on_telemetry_consent_changed(self, context):
         try:
@@ -6370,6 +6431,12 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     def draw(self, context):
         layout = self.layout
 
+        layout.label(text="Server Connection:", icon='NETWORK_DRIVE')
+        connection_box = layout.box()
+        _blendermcp_draw_bind_settings(connection_box, self)
+        connection_box.label(text="Disconnect and reconnect to apply changes.", icon='INFO')
+        layout.separator()
+
         # Telemetry section
         layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
         
@@ -6453,11 +6520,14 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         col = box.column()
         if scene.blendermcp_server_running:
             server = getattr(bpy.types, "blendermcp_server", None)
+            running_host = getattr(server, "host", "localhost")
             running_port = getattr(server, "port", scene.blendermcp_port)
-            col.label(text=f"Connected on port {running_port}", icon='CHECKMARK')
+            col.label(text=f"Connected on {running_host}:{running_port}", icon='CHECKMARK')
             col.operator("blendermcp.stop_server", text="Disconnect", icon='X')
         else:
             col.label(text="Not connected", icon='RADIOBUT_OFF')
+            if prefs is not None:
+                _blendermcp_draw_bind_settings(col, prefs)
             col.prop(scene, "blendermcp_port")
             col.operator("blendermcp.start_server", text="Connect to MCP server", icon='PLAY')
 
@@ -6610,16 +6680,31 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
 
     def execute(self, context):
         global _user_stopped_server
-        _user_stopped_server = False
         scene = context.scene
 
+        server = getattr(bpy.types, "blendermcp_server", None)
+        if server is not None and server.running:
+            scene.blendermcp_server_running = True
+            return {'FINISHED'}
+        try:
+            host = _blendermcp_bind_address(context)
+        except ValueError as exc:
+            scene.blendermcp_server_running = False
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        _user_stopped_server = False
+
         # Create a new server instance
-        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+        if server is None:
+            server = BlenderMCPServer(host=host, port=scene.blendermcp_port)
+            bpy.types.blendermcp_server = server
+        else:
+            server.host = host
+            server.port = scene.blendermcp_port
 
         # Start the server
-        bpy.types.blendermcp_server.start()
-        scene.blendermcp_server_running = bpy.types.blendermcp_server.running
+        server.start()
+        scene.blendermcp_server_running = server.running
 
         return {'FINISHED'}
 
