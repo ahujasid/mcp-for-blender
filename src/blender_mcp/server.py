@@ -1755,6 +1755,20 @@ async def _generation_reply(ctx: Context, job: "generation.Job", wait_seconds: f
 
 
 @mcp.tool()
+async def generate_image(prompt: str, region: str = "global_en") -> dict:
+    """Create one MiniMax reference image from text, returning temporary image URLs.
+
+    Requires MINIMAX_API_KEY in the server environment. Use region global_en
+    (default) or cn_zh for your account. URLs expire after 24 hours. Each call
+    may incur a charge. Pass a returned URL to generate_3d's image parameter
+    to use it as a reference; this tool does not alter the Blender scene.
+    """
+    from .minimax_image import generate_image as request_image
+
+    return await request_image(prompt, region)
+
+
+@mcp.tool()
 @trajectory_tool("generate_3d")
 async def generate_3d(
     ctx: Context,
