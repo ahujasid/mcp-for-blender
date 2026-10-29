@@ -1234,6 +1234,8 @@ class BlenderMCPServer:
         # Live client sockets, so stop() can unblock threads parked in recv().
         self._clients = set()
         self._clients_lock = threading.Lock()
+        self._pending_responses = {}
+        self._read_closed_clients = set()
 
     def _get_config_value(self, scene_attr, pref_attr=None, env_var=None):
         """Read config in order: addon preferences -> scene -> env var."""
@@ -1392,6 +1394,8 @@ class BlenderMCPServer:
         with self._clients_lock:
             clients = list(self._clients)
             self._clients.clear()
+            self._pending_responses.clear()
+            self._read_closed_clients.clear()
         for client in clients:
             try:
                 client.shutdown(socket.SHUT_RDWR)
@@ -1480,8 +1484,29 @@ class BlenderMCPServer:
                 client.sendall(response_json.encode('utf-8'))
             except Exception:
                 print("Failed to send response - client disconnected")
+            finally:
+                with self._clients_lock:
+                    pending = self._pending_responses.get(client, 0)
+                    if pending > 1:
+                        self._pending_responses[client] = pending - 1
+                        close_client = False
+                    else:
+                        self._pending_responses.pop(client, None)
+                        close_client = client in self._read_closed_clients
+                if close_client:
+                    self._close_client(client)
 
         return 0.05
+
+    def _close_client(self, client):
+        with self._clients_lock:
+            self._clients.discard(client)
+            self._pending_responses.pop(client, None)
+            self._read_closed_clients.discard(client)
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def _handle_client(self, client):
         """Handle connected client"""
@@ -1492,6 +1517,7 @@ class BlenderMCPServer:
         with self._clients_lock:
             self._clients.add(client)
         buffer = b''
+        read_closed = False
 
         try:
             while self.running:
@@ -1499,7 +1525,8 @@ class BlenderMCPServer:
                 try:
                     data = client.recv(8192)
                     if not data:
-                        print("Client disconnected")
+                        print("Client finished sending")
+                        read_closed = True
                         break
 
                     buffer += data
@@ -1512,7 +1539,13 @@ class BlenderMCPServer:
                         # bpy.app.timers.register() from here - it is not
                         # thread-safe and the callback can be silently lost.
                         print(f"Queued command: {command.get('type')}")
-                        self.command_queue.put((command, client))
+                        with self._clients_lock:
+                            if not self.running:
+                                break
+                            self._pending_responses[client] = (
+                                self._pending_responses.get(client, 0) + 1
+                            )
+                            self.command_queue.put((command, client))
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         # Incomplete data, wait for more. A multi-byte UTF-8
                         # character can land split across a recv() chunk
@@ -1529,11 +1562,17 @@ class BlenderMCPServer:
             print(f"Error in client handler: {str(e)}")
         finally:
             with self._clients_lock:
-                self._clients.discard(client)
-            try:
-                client.close()
-            except:
-                pass
+                # EOF only closes the request stream. Let the main-thread
+                # drain own this socket until its last queued response is
+                # attempted, without keeping a handler thread waiting.
+                defer_close = (
+                    read_closed and self.running
+                    and self._pending_responses.get(client, 0) > 0
+                )
+                if defer_close:
+                    self._read_closed_clients.add(client)
+            if not defer_close:
+                self._close_client(client)
             print("Client handler stopped")
 
     def execute_command(self, command):
