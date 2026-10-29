@@ -26,6 +26,11 @@ def test_instructions_name_the_apis_that_keep_scripts_portable():
     assert "get_addon_status" in SERVER_INSTRUCTIONS
 
 
+def test_instructions_warn_that_blender_code_is_executable():
+    assert "execute_blender_code" in SERVER_INSTRUCTIONS
+    assert "untrusted scene or asset content" in SERVER_INSTRUCTIONS
+
+
 def test_instructions_stay_small_enough_to_inject_every_turn():
     # Instructions go into every conversation; #347 tracks context cost.
     assert len(SERVER_INSTRUCTIONS) < 2500
