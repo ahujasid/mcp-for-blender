@@ -1254,16 +1254,20 @@ class BlenderMCPServer:
         return ""
 
     def _get_hyper3d_api_key(self):
-        # Let the free-trial button temporarily override persistent keys
-        # without overwriting user-saved private keys.
+        # The trial key is only valid on the main site. Keep a session trial
+        # override from masking a saved private fal.ai key after switching modes.
+        main_site = bpy.context.scene.blendermcp_hyper3d_mode == 'MAIN_SITE'
         scene_value = getattr(bpy.context.scene, "blendermcp_hyper3d_api_key", "")
-        if scene_value == RODIN_FREE_TRIAL_KEY:
+        if main_site and scene_value == RODIN_FREE_TRIAL_KEY:
             return scene_value
-        return self._get_config_value(
+        api_key = self._get_config_value(
             "blendermcp_hyper3d_api_key",
             "hyper3d_api_key",
             "BLENDERMCP_HYPER3D_API_KEY",
         )
+        if not main_site and api_key == RODIN_FREE_TRIAL_KEY:
+            return ""
+        return api_key
 
     def _get_sketchfab_api_key(self):
         return self._get_config_value(
@@ -3589,7 +3593,7 @@ class BlenderMCPServer:
             """Call Rodin API, get the job uuid and subscription key"""
             files = [
                 *[("images", (f"{i:04d}{img_suffix}", base64.b64decode(img) if isinstance(img, str) else img)) for i, (img_suffix, img) in enumerate(images)],
-                ("tier", (None, "Sketch")),
+                ("tier", (None, "Gen-2.5-Medium")),
                 ("mesh_mode", (None, "Raw")),
                 ("texture_mode", (None, "high")),
             ]
@@ -3621,16 +3625,21 @@ class BlenderMCPServer:
             if not api_key:
                 return {"error": "Hyper3D API key is not given"}
             req_data = {
-                "tier": "Sketch",
+                "tier": "Gen-2.5-Medium",
             }
             if images:
-                req_data["input_image_urls"] = images
+                req_data["image_urls"] = [
+                    image if isinstance(image, str) else
+                    f"data:image/{image[0].lstrip('.').replace('jpg', 'jpeg')};base64,{image[1]}"
+                    for image in images
+                ]
             if text_prompt:
                 req_data["prompt"] = text_prompt
             if bbox_condition:
                 req_data["bbox_condition"] = bbox_condition
             response = requests.post(
-                "https://queue.fal.run/fal-ai/hyper3d/rodin",
+                ("https://queue.fal.run/fal-ai/hyper3d/rodin/v2.5"
+                 if images else "https://queue.fal.run/fal-ai/hyper3d/rodin/v2.5/text-to-3d"),
                 headers={
                     "Authorization": f"Key {api_key}",
                     "Content-Type": "application/json",
@@ -6510,8 +6519,9 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 col.prop(prefs, "hyper3d_api_key", text="API Key")
             else:
                 col.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
-            sub.operator("blendermcp.set_hyper3d_free_trial_api_key",
-                         text="Set Free Trial API Key", icon='KEYINGSET')
+            if scene.blendermcp_hyper3d_mode == 'MAIN_SITE':
+                sub.operator("blendermcp.set_hyper3d_free_trial_api_key",
+                             text="Set Free Trial API Key", icon='KEYINGSET')
 
         sub = self._integration_header(
             layout, scene, "blendermcp_use_hunyuan3d", "Tencent Hunyuan 3D", 'MESH_CUBE')
@@ -6586,6 +6596,10 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
 class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
     bl_idname = "blendermcp.set_hyper3d_free_trial_api_key"
     bl_label = "Set Free Trial API Key"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.blendermcp_hyper3d_mode == 'MAIN_SITE'
 
     def execute(self, context):
         prefs = get_blendermcp_addon_preferences(context)
