@@ -186,14 +186,15 @@ def test_tripo_runs_through_premium_without_a_tripo_key(monkeypatch):
     assert "task_id" not in reply["result"]
 
 
-def test_tripo_text_job_uses_sidebar_model(monkeypatch):
-    addon, _bpy, _scene = _ready(monkeypatch, blendermcp_tripo_model="P2-20260801")
+@pytest.mark.parametrize("domain", ["ai", "com"])
+def test_tripo_text_job_uses_sidebar_model(monkeypatch, domain):
+    addon, _bpy, _scene = _ready(monkeypatch, blendermcp_tripo_model="P2-20260801", blendermcp_tripo_domain=domain)
     posts = _capture_posts(addon)
     result = addon.BlenderMCPServer().create_tripo_job(text_prompt="a ceramic teapot")
 
     assert result["task_id"] == "task_abc"
     assert result["model"] == "P2-20260801"
-    assert posts[0]["url"].endswith("/generation/text-to-model")
+    assert posts[0]["url"] == f"https://openapi.tripo3d.{domain}/v3/generation/text-to-model"
     assert posts[0]["json"]["model"] == "P2-20260801"
     assert posts[0]["json"]["prompt"] == "a ceramic teapot"
     assert posts[0]["json"]["texture"] is True
@@ -212,14 +213,15 @@ def test_tripo_own_key_drops_quality(monkeypatch):
     assert "quality" not in posts[0]["json"]
 
 
-def test_tripo_image_url_skips_upload(monkeypatch):
-    addon, _bpy, _scene = _ready(monkeypatch)
+@pytest.mark.parametrize("domain", ["ai", "com"])
+def test_tripo_image_url_skips_upload(monkeypatch, domain):
+    addon, _bpy, _scene = _ready(monkeypatch, blendermcp_tripo_domain=domain)
     posts = _capture_posts(addon)
     result = addon.BlenderMCPServer().create_tripo_job(image="https://example.com/teapot.png")
 
     assert result["task_id"] == "task_abc"
     assert len(posts) == 1
-    assert posts[0]["url"].endswith("/generation/image-to-model")
+    assert posts[0]["url"] == f"https://openapi.tripo3d.{domain}/v3/generation/image-to-model"
     assert posts[0]["json"]["input"] == "https://example.com/teapot.png"
     assert posts[0]["json"]["model"] == MODEL
 
@@ -229,18 +231,19 @@ def test_tripo_image_url_skips_upload(monkeypatch):
     ("ref.jpeg", b"\xff\xd8\xff", "image/jpeg"),
     ("ref.png", b"\x89PNG\r\n", "image/png"),
 ])
-def test_tripo_local_image_uploads_then_submits(monkeypatch, tmp_path, name, payload, mime):
+@pytest.mark.parametrize("domain", ["ai", "com"])
+def test_tripo_local_image_uploads_then_submits(monkeypatch, tmp_path, name, payload, mime, domain):
     image = tmp_path / name
     image.write_bytes(payload)
-    addon, _bpy, _scene = _ready(monkeypatch)
+    addon, _bpy, _scene = _ready(monkeypatch, blendermcp_tripo_domain=domain)
     posts = _capture_posts(addon)
     result = addon.BlenderMCPServer().create_tripo_job(image=str(image))
 
     assert result["task_id"] == "task_abc"
-    assert posts[0]["url"].endswith("/files")
+    assert posts[0]["url"] == f"https://openapi.tripo3d.{domain}/v3/files"
     assert posts[0]["files"]["file"][2] == mime
     assert "Authorization" not in str(posts[0]["files"])
-    assert posts[1]["url"].endswith("/generation/image-to-model")
+    assert posts[1]["url"] == f"https://openapi.tripo3d.{domain}/v3/generation/image-to-model"
     assert posts[1]["json"]["input"] == "file_abc"
 
 
@@ -325,8 +328,9 @@ def test_tripo_network_failure_never_shows_the_key(monkeypatch):
     assert KEY not in str(result)
 
 
-def test_tripo_poll_returns_model_url_and_quotes_task_id(monkeypatch):
-    addon, _bpy, _scene = _ready(monkeypatch)
+@pytest.mark.parametrize("domain", ["ai", "com"])
+def test_tripo_poll_returns_model_url_and_quotes_task_id(monkeypatch, domain):
+    addon, _bpy, _scene = _ready(monkeypatch, blendermcp_tripo_domain=domain)
     seen = {}
 
     def get(url, headers=None, **_kwargs):
@@ -346,7 +350,7 @@ def test_tripo_poll_returns_model_url_and_quotes_task_id(monkeypatch):
     result = addon.BlenderMCPServer().poll_tripo_job_status(task_id="task/abc")
     assert result["status"] == "success"
     assert result["model_url"] == "https://cdn.example/model.glb"
-    assert seen["url"].endswith("/tasks/task%2Fabc")
+    assert seen["url"] == f"https://openapi.tripo3d.{domain}/v3/tasks/task%2Fabc"
     assert KEY not in str(result)
     assert seen["headers"]["Authorization"] == f"Bearer {KEY}"
 
@@ -441,3 +445,36 @@ def test_tripo_status_is_always_answered(monkeypatch):
     reply = addon.BlenderMCPServer()._execute_command_internal({"type": "get_tripo_status", "params": {}})
     assert reply["status"] == "success"
     assert reply["result"]["enabled"] is False
+
+
+def test_tripo_old_configuration_defaults_to_ai(monkeypatch):
+    addon, _bpy, _scene = _ready(monkeypatch)
+    assert addon.tripo_endpoints() == {
+        "domain": "ai",
+        "api": "https://openapi.tripo3d.ai/v3",
+        "keys": "https://developers.tripo3d.ai/en/keys",
+        "docs": "https://developers.tripo3d.ai/en/docs",
+    }
+    posts = _capture_posts(addon)
+    addon.BlenderMCPServer().create_tripo_job(text_prompt="a teapot")
+    assert posts[0]["url"] == "https://openapi.tripo3d.ai/v3/generation/text-to-model"
+
+
+def test_tripo_preferences_control_links_and_requests(monkeypatch):
+    addon, bpy, _scene = _ready(monkeypatch, blendermcp_tripo_domain="ai")
+    prefs = types.SimpleNamespace(tripo_domain="com", tripo_api_key=KEY)
+    bpy.context.preferences.addons[addon.__name__] = types.SimpleNamespace(preferences=prefs)
+    assert addon.tripo_endpoints() == {
+        "domain": "com",
+        "api": "https://openapi.tripo3d.com/v3",
+        "keys": "https://developers.tripo3d.com/zh/keys",
+        "docs": "https://developers.tripo3d.com/zh/docs",
+    }
+    posts = _capture_posts(addon, {"code": 2010})
+    server = addon.BlenderMCPServer()
+    result = server.create_tripo_job(text_prompt="a teapot")
+    assert posts[-1]["url"] == "https://openapi.tripo3d.com/v3/generation/text-to-model"
+    assert result["error"] == "Out of Tripo credits. Top up at tripo3d.com"
+    prefs.tripo_domain = "ai"
+    server.create_tripo_job(text_prompt="a teapot")
+    assert posts[-1]["url"] == "https://openapi.tripo3d.ai/v3/generation/text-to-model"

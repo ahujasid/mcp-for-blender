@@ -675,7 +675,7 @@ The toggle sits under **Tencent Hunyuan 3D → Official API** in the sidebar.
 It runs through [Premium](#premium) with no key, or on your own Tripo API key.
 Through Premium, text uses your default quality and an image counts as one high-quality generation.
 [Get a Tripo API key](https://developers.tripo3d.ai/en/keys).
-Tick **Tripo** under **AI Model Generation** in the sidebar, choose a **Model**, and paste the key.
+Tick **Tripo** under **AI Model Generation** in the sidebar, choose a **Model** and **Domain**, and paste the key from that domain.
 
 #### Meshy
 
