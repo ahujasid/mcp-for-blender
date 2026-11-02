@@ -71,14 +71,34 @@ class TelemetryEvent:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass
+class _DisabledTelemetryConfig:
+    """Stand-in when config.py is absent (it is gitignored, so source checkouts lack it)."""
+
+    enabled: bool = False
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_bucket: str = ""
+    max_prompt_length: int = 500
+    timeout: float = 5.0
+
+
+def _load_telemetry_config():
+    try:
+        from .config import telemetry_config
+    except ImportError:
+        logger.debug("No telemetry config found; telemetry disabled")
+        return _DisabledTelemetryConfig()
+    return telemetry_config
+
+
 class TelemetryCollector:
     """Main telemetry collection class"""
 
     def __init__(self):
         """Initialize telemetry collector"""
         # Import config here to avoid circular imports
-        from .config import telemetry_config
-        self.config = telemetry_config
+        self.config = _load_telemetry_config()
 
         # Check if disabled via environment variables
         if self._is_disabled():
