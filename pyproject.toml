@@ -15,6 +15,7 @@ classifiers = [
 dependencies = [
     "mcp>=1.26.0,<2",
     "httpx>=0.27.0",
+    "playwright>=1.45",
 ]
 
 [project.scripts]

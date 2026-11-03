@@ -549,3 +549,54 @@ for name in ARGS["names"]:
                 "size": [round(hi[i] - lo[i], 3) for i in range(3)]})
 return out
 '''
+
+
+# A material from one generated texture image: box-projected in object space
+# (script-built meshes often have no UVs), repeated every tile_size metres,
+# with a light bump taken from the same image. The image is packed into the
+# .blend so the file still carries it on another machine.
+TEXTURE_MATERIAL = r'''
+import bpy
+img = bpy.data.images.load(ARGS["image_path"], check_existing=True)
+img.pack()
+mat = bpy.data.materials.new(ARGS["name"])
+mat.use_nodes = True
+mat.use_fake_user = not ARGS.get("apply_to")
+nt = mat.node_tree
+bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
+inp = {i.identifier: i for i in bsdf.inputs}
+inp["Roughness"].default_value = float(ARGS.get("roughness", 0.75))
+coord = nt.nodes.new("ShaderNodeTexCoord")
+mapping = nt.nodes.new("ShaderNodeMapping")
+tex = nt.nodes.new("ShaderNodeTexImage")
+tex.image = img
+tile = max(float(ARGS.get("tile_size") or 1.0), 0.001)
+mapping.inputs["Scale"].default_value = (1.0 / tile, 1.0 / tile, 1.0 / tile)
+if ARGS.get("projection") == "uv":
+    nt.links.new(coord.outputs["UV"], mapping.inputs["Vector"])
+else:
+    tex.projection = "BOX"
+    tex.projection_blend = 0.2
+    nt.links.new(coord.outputs["Object"], mapping.inputs["Vector"])
+nt.links.new(mapping.outputs["Vector"], tex.inputs["Vector"])
+nt.links.new(tex.outputs["Color"], inp["Base Color"])
+strength = float(ARGS.get("bump", 0.25))
+if strength > 0:
+    bump = nt.nodes.new("ShaderNodeBump")
+    bump.inputs["Strength"].default_value = strength
+    nt.links.new(tex.outputs["Color"], bump.inputs["Height"])
+    nt.links.new(bump.outputs["Normal"], inp["Normal"])
+x = bsdf.location.x
+for i, node in enumerate((coord, mapping, tex)):
+    node.location = (x - 900 + i * 280, bsdf.location.y)
+applied, missing = [], []
+for name in ARGS.get("apply_to") or []:
+    ob = bpy.data.objects.get(name)
+    if ob is None or not hasattr(ob.data, "materials"):
+        missing.append(name)
+        continue
+    ob.data.materials.clear()
+    ob.data.materials.append(mat)
+    applied.append(ob.name)
+return {"material": mat.name, "image": img.name, "size": list(img.size), "applied": applied, "missing": missing}
+'''

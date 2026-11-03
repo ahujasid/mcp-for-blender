@@ -27,7 +27,7 @@ from .addon_manager import (
 )
 from .consent_prompt import maybe_prompt_for_consent
 from .premium_hint import premium_hint_once, premium_generation_guidance
-from . import blender_scripts, context_log, generation
+from . import blender_scripts, chatgpt_textures, context_log, generation
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
 from .openai_apps import (
     APP_MIME_TYPE,
@@ -348,7 +348,11 @@ Objects can also come from existing libraries (search_assets, then import_asset:
 Sketchfab, Poly Pizza) or be made to order (generate_3d: one new textured model from text or an
 image, 1-3 minutes, may cost the user a credit). A generation is one object, never a whole
 scene, the ground or parts to assemble. Imported and generated models arrive at arbitrary
-scale: use the reported world_bounding_box to size them and put them on the ground."""
+scale: use the reported world_bounding_box to size them and put them on the ground.
+
+generate_texture makes a tileable texture with the user's own ChatGPT (in a browser window) and
+puts it on objects as a material. If it waits for the user, relay what it asks; never ask for
+passwords."""
 
 # Create the MCP server with lifespan support
 mcp = FastMCP(
@@ -1847,6 +1851,97 @@ async def generate_3d(
     except Exception as e:
         logger.error(f"Error generating model: {e}")
         return f"Error generating model: {e}"
+
+
+def _texture_material(job: "chatgpt_textures.Job", apply_to, tile_size, projection, bump) -> str:
+    result = get_blender_connection().send_command("execute_code", {"code": blender_scripts.build(
+        blender_scripts.TEXTURE_MATERIAL, {
+            "image_path": job.image_path, "name": job.name, "apply_to": apply_to or [],
+            "tile_size": tile_size, "projection": projection, "bump": bump})})
+    info = blender_scripts.parse_result(result.get("result", ""))
+    reply = f"Material '{info['material']}' made from a {info['size'][0]}x{info['size'][1]} image (packed into the .blend)."
+    if info["applied"]:
+        reply += f" Applied to {', '.join(info['applied'])} (their previous materials were replaced)."
+    else:
+        reply += " Not applied to any object yet; it is kept with a fake user."
+    if info["missing"]:
+        reply += f" Not found or can't hold materials: {', '.join(info['missing'])}."
+    return reply + " Check it with look(shading=\"material\")."
+
+
+@mcp.tool()
+@telemetry_tool("generate_texture")
+async def generate_texture(
+    ctx: Context,
+    prompt: str | None = None,
+    reference_image: str | None = None,
+    name: str | None = None,
+    apply_to: list[str] | None = None,
+    tileable: bool = True,
+    tile_size: float = 1.0,
+    projection: str = "box",
+    bump: float = 0.25,
+    job: str | None = None,
+    wait_seconds: int = 45,
+    user_prompt: str = "",
+) -> CallToolResult:
+    """
+    Make a texture image with the user's own ChatGPT subscription and turn it into a material.
+
+    Drives chatgpt.com in a Chrome window on the user's computer (no API key; it uses their
+    plan's image limits). The first time, or when ChatGPT signs them out or shows a captcha, the
+    reply says "waiting for the user": tell the user exactly what it asks (sign in, or complete
+    the check in that window), then call again with job=... to keep waiting. Never ask the user
+    for their password. Images take 30-90 seconds; past wait_seconds (at most 45) you get a job
+    handle to resume with.
+
+    Parameters:
+    - prompt: What the surface looks like ("mossy old cobblestones", "dark purple roof shingles").
+    - reference_image: Optional absolute file path or http(s) URL of an image to match.
+    - name: Material name. Defaults to one made from the prompt.
+    - apply_to: Object names to put the material on (replaces their materials).
+    - tileable: True (default) asks for a seamless repeating texture; False for a one-off image
+      such as a sign or a painting.
+    - tile_size: Metres one repeat of the texture covers (default 1.0; 0.3 for bricks up close).
+    - projection: "box" (default; works without UVs) or "uv" (use the objects' UV maps).
+    - bump: Bump strength from the image, 0 for none (default 0.25).
+    - job: Handle from an earlier call, to keep waiting.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    def reply(text: str, images: list[bytes] = ()) -> CallToolResult:
+        content = [TextContent(type="text", text=text)]
+        content += [ImageContent(type="image", data=base64.b64encode(b).decode("ascii"), mimeType="image/jpeg")
+                    for b in images if b]
+        return CallToolResult(content=content)
+
+    if projection not in ("box", "uv"):
+        return reply("Error: projection must be 'box' or 'uv'.")
+    browser = chatgpt_textures.get_browser()
+    wait_seconds = max(5, min(int(wait_seconds or 45), int(generation.MAX_CALL_S)))
+    if job:
+        current = browser.jobs.get(job)
+        if current is None:
+            return reply(f"Error: unknown job '{job}' (the server may have restarted). Start a new one with prompt=...")
+        await browser.wait(current, wait_seconds, stop_on_user_action=False)
+    else:
+        if not prompt:
+            return reply("Error: give a prompt describing the texture.")
+        current = browser.start(prompt, name, tileable, reference_image)
+        await browser.wait(current, wait_seconds)
+    if current.status != "done":
+        shot = [current.screenshot] if current.status == "failed" else []
+        if current.status == "failed" and current.screenshot:
+            current.screenshot = None  # Show it once.
+        return reply(chatgpt_textures.describe(current), shot)
+    if current.material_reply:
+        return reply(current.material_reply, [current.preview_jpeg])
+    try:
+        current.material_reply = _texture_material(current, apply_to, tile_size, projection, bump)
+    except Exception as e:
+        return reply(f"The image was made ({current.image_path}) but building the material failed: {e}. "
+                     f"Call generate_texture(job=\"{current.id}\", apply_to=[...]) to retry, or load the image "
+                     "with execute_blender_code.", [current.preview_jpeg])
+    return reply(f"{current.material_reply} Image file: {current.image_path}", [current.preview_jpeg])
 
 
 ASSET_SOURCES = ("polyhaven", "sketchfab", "polypizza")
