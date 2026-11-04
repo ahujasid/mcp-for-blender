@@ -7,6 +7,7 @@ refine tasks.
 """
 
 import asyncio
+import base64
 
 import pytest
 
@@ -185,6 +186,36 @@ def test_rodin_main_site_uses_subscription_key_then_task_uuid():
     assert _run(send, job) == (True, "Car")
     assert ("poll_rodin_job_status", {"subscription_key": "s1"}) in send.calls
     assert send.calls[-1] == ("import_generated_asset", {"task_uuid": "u1", "name": "Car"})
+
+
+def test_rodin_sends_every_image_in_a_folder(tmp_path):
+    front, side = b"\x89PNG\r\n\x1a\nfront", b"\xff\xd8\xffside"
+    for name, data in (("b_side.jpg", side), ("a_front.png", front), ("notes.txt", b"x")):
+        (tmp_path / name).write_bytes(data)
+    (tmp_path / "sub.png").mkdir()
+    send = FakeAddon({"create_rodin_job": {"request_id": "q1"}})
+    generation.submit(send, "hyper3d", "Car", None, str(tmp_path), None, None, True)
+    assert send.calls[0][1]["images"] == [(".png", base64.b64encode(front).decode("ascii")),
+                                          (".jpg", base64.b64encode(side).decode("ascii"))]
+
+
+def test_rodin_folder_needs_one_to_five_images(tmp_path):
+    send = FakeAddon({})
+    with pytest.raises(GenerationError, match="No PNG, JPEG or WebP"):
+        generation.submit(send, "hyper3d", "Car", None, str(tmp_path), None, None, True)
+    for i in range(generation.RODIN_MAX_IMAGES + 1):
+        (tmp_path / f"{i}.png").write_bytes(b"x")
+    with pytest.raises(GenerationError, match="up to 5 images"):
+        generation.submit(send, "hyper3d", "Car", None, str(tmp_path), None, None, True)
+    assert send.calls == []
+
+
+@pytest.mark.parametrize("provider", ["tripo", "meshy", "hunyuan3d"])
+def test_single_image_providers_refuse_a_folder(tmp_path, provider):
+    send = FakeAddon({})
+    with pytest.raises(GenerationError, match="not a folder"):
+        generation.submit(send, provider, "Car", None, str(tmp_path), None, None, True)
+    assert send.calls == []
 
 
 def test_rodin_fal_and_premium_use_request_id():

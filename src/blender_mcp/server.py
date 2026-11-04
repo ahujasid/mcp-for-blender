@@ -1785,6 +1785,7 @@ async def generate_3d(
     - prompt: Short English description of one object ("weathered wooden treasure chest").
     - image: Instead of a prompt: an absolute image file path or an http(s) URL. Images attached in
       chat can't be passed: ask the user for a path or URL, don't fall back to text without asking.
+      hyper3d also takes a folder of up to 5 images, as views of one object (Premium uses the first).
     - name: Object name in the scene. Defaults to one made from the prompt.
     - provider: auto (default), tripo, hunyuan3d, hyper3d or meshy. Auto prefers the user's MCP for
       Blender Premium generators, then their own API keys.
