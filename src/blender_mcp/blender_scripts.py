@@ -41,7 +41,9 @@ def parse_result(output: str) -> dict:
 # and parent scale included), and are only computed when asked for.
 # In the order they appear on a line.
 SCENE_FIELDS = ("location", "rotation", "scale", "size", "ground", "parent", "details", "materials",
-                "modifiers", "animation", "hidden", "children", "topology", "weights", "settings")
+                "modifiers", "animation", "hidden", "children", "topology", "weights", "settings", "cursor")
+# Fields that add a header line rather than a column on every object line.
+SCENE_HEADER_FIELDS = ("settings", "cursor")
 SCENE_DEFAULT_FIELDS = ("location", "size", "children", "hidden")
 
 SCENE_SUMMARY = r'''
@@ -548,4 +550,150 @@ for name in ARGS["names"]:
     out.append({"name": o.name, "world_bounding_box": [lo, hi],
                 "size": [round(hi[i] - lo[i], 3) for i in range(3)]})
 return out
+'''
+
+
+# The surface a user pointed at, down to the face and the connected piece of mesh
+# it belongs to. Imported models often merge many parts into one object (a whole
+# car interior as one mesh), so the object alone says little about what was
+# meant; the piece is usually the part itself.
+#
+# mode "ray": a click on a viewport capture (its view and window matrices, x and
+# y from 0..1 at the image's top-left). mode "cursor": the 3D cursor, which the
+# user places on a surface with Shift+right-click.
+#
+# Vertices at the same position count as joined: exporters split vertices along
+# UV seams and hard edges, and Blender's Select Linked stops there, which would
+# cut one part into strips.
+PICK = r'''
+import bpy
+import numpy as np
+from mathutils import Matrix, Vector
+
+scene = bpy.context.scene
+depsgraph = bpy.context.evaluated_depsgraph_get()
+
+def r(v):
+    return [round(float(c), 4) for c in v]
+
+hit = None
+if ARGS.get("mode") == "ray":
+    unproject = (Matrix(ARGS["window_matrix"]) @ Matrix(ARGS["view_matrix"])).inverted()
+    nx, ny = 2.0 * float(ARGS["x"]) - 1.0, 1.0 - 2.0 * float(ARGS["y"])
+    def at_depth(z):
+        p = unproject @ Vector((nx, ny, z, 1.0))
+        return p.xyz / p.w
+    origin = at_depth(-1.0)
+    ok, location, _normal, face, obj, _matrix = scene.ray_cast(depsgraph, origin, (at_depth(1.0) - origin).normalized())
+    if ok and obj is not None and obj.type == "MESH":
+        hit = (obj.original, face, location, None)
+else:
+    cursor = scene.cursor.location.copy()
+    best = None
+    for obj in scene.objects:
+        if obj.type != "MESH" or not obj.visible_get():
+            continue
+        ev = obj.evaluated_get(depsgraph)
+        corners = [ev.matrix_world @ Vector(c) for c in ev.bound_box]
+        lo = Vector([min(c[i] for c in corners) for i in range(3)])
+        hi = Vector([max(c[i] for c in corners) for i in range(3)])
+        pad = max((hi - lo).length * 0.01, 1e-4)
+        if any(cursor[i] < lo[i] - pad or cursor[i] > hi[i] + pad for i in range(3)):
+            continue
+        ok, loc, _normal, face = ev.closest_point_on_mesh(ev.matrix_world.inverted() @ cursor)
+        if not ok:
+            continue
+        world = ev.matrix_world @ loc
+        d = (world - cursor).length
+        if best is None or d < best[3]:
+            best = (obj, face, world, d)
+    hit = best
+    if hit is None:
+        return {"hit": None, "cursor": r(cursor)}
+
+if hit is None:
+    return {"hit": None}
+obj, face, location, distance = hit
+ev = obj.evaluated_get(depsgraph)
+mw = np.array(ev.matrix_world, dtype=np.float64)
+mesh = ev.to_mesh()
+try:
+    nv, nl, nf = len(mesh.vertices), len(mesh.loops), len(mesh.polygons)
+    co = np.empty(nv * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    loop_vert = np.empty(nl, dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vert)
+    loop_start = np.empty(nf, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+    loop_total = np.empty(nf, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    material_index = mesh.polygons[face].material_index
+finally:
+    ev.to_mesh_clear()
+
+slots = obj.material_slots
+material = slots[material_index].material if material_index < len(slots) else None
+
+loop_total = loop_total.astype(np.int64)
+offset = np.cumsum(loop_total) - loop_total  # each face's first slot in face order
+slot_vert = loop_vert[np.repeat(loop_start.astype(np.int64) - offset, loop_total) + np.arange(int(loop_total.sum()))]
+slot_face = np.repeat(np.arange(nf), loop_total)
+by_vert = np.argsort(slot_vert, kind="stable")
+vert_face = slot_face[by_vert]
+vert_start = np.searchsorted(slot_vert[by_vert], np.arange(nv))
+vert_end = np.searchsorted(slot_vert[by_vert], np.arange(nv), side="right")
+
+# Coincident vertices: copies of one point differ by float noise, so bucket
+# vertices into cells of `tol` and treat the same or an adjacent cell as joined.
+# That never misses a pair closer than `tol` and only joins pairs a few `tol`
+# apart, far below any real feature.
+span = float(np.linalg.norm(co.max(axis=0) - co.min(axis=0)))
+tol = max(span * 5e-6, min(float(np.abs(co).max()) * 2e-6, span * 1e-3), 1e-9)
+cell = np.floor(co / tol).astype(np.int64)
+cell -= cell.min(axis=0) - 1
+dims = cell.max(axis=0) + 2
+cell_key = (cell[:, 0] * dims[1] + cell[:, 1]) * dims[2] + cell[:, 2]
+by_cell = np.argsort(cell_key, kind="stable")
+sorted_keys = cell_key[by_cell]
+neighbours = np.array([(dx * dims[1] + dy) * dims[2] + dz
+                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)], dtype=np.int64)
+
+def gather(starts, ends, values):
+    lengths = ends - starts
+    total = int(lengths.sum())
+    if not total:
+        return values[:0]
+    return values[np.repeat(starts - (np.cumsum(lengths) - lengths), lengths) + np.arange(total)]
+
+in_piece = np.zeros(nf, dtype=bool)
+in_piece[face] = True
+seen = np.zeros(nv, dtype=bool)
+frontier = np.array([face], dtype=np.int64)
+while frontier.size:
+    verts = np.unique(gather(offset[frontier], offset[frontier] + loop_total[frontier], slot_vert))
+    verts = verts[~seen[verts]]
+    cells = np.unique((cell_key[verts][:, None] + neighbours).ravel())
+    verts = np.unique(gather(np.searchsorted(sorted_keys, cells),
+                             np.searchsorted(sorted_keys, cells, side="right"), by_cell))
+    verts = verts[~seen[verts]]
+    seen[verts] = True
+    faces = np.unique(gather(vert_start[verts], vert_end[verts], vert_face))
+    frontier = faces[~in_piece[faces]]
+    in_piece[frontier] = True
+
+pts = co[np.unique(slot_vert[np.repeat(in_piece, loop_total)])] @ mw[:3, :3].T + mw[:3, 3]
+lo, hi = pts.min(axis=0), pts.max(axis=0)
+return {"hit": {
+    "object": obj.name,
+    "face": int(face),
+    "location": r(location),
+    "distance": None if distance is None else round(float(distance), 5),
+    "material": material.name if material else None,
+    "object_faces": nf,
+    # False when modifiers change the topology: the face index is then one of
+    # the evaluated mesh, not of obj.data.
+    "face_index_is_in_object_data": nf == len(obj.data.polygons),
+    "piece": {"faces": int(in_piece.sum()), "min": r(lo), "max": r(hi), "size": r(hi - lo)},
+}}
 '''

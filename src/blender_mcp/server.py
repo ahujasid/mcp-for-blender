@@ -342,7 +342,9 @@ Scripts run in someone else's Blender:
 - Material colors go on shader node inputs; material.diffuse_color only affects the viewport.
 
 look is how you see your work; use it as much as you need. Images stay in the conversation, so
-a smaller max_size keeps long sessions cheap.
+a smaller max_size keeps long sessions cheap. Many clients show those images to you only: pass
+save_to to give the user a file. When the user means something you can't name, ask them to
+Shift+right-click it in Blender's viewport, then read get_scene_info(fields=["cursor"]).
 
 Objects can also come from existing libraries (search_assets, then import_asset: Poly Haven,
 Sketchfab, Poly Pizza) or be made to order (generate_3d: one new textured model from text or an
@@ -582,7 +584,45 @@ def _run_script(script: str, args: dict) -> dict:
     return blender_scripts.parse_result(result["result"])
 
 
-def _format_scene_summary(data: dict, fields) -> str:
+def _point(v) -> str:
+    return "(" + ", ".join(f"{c:g}" for c in v) + ")"
+
+
+def _surface_detail(hit: dict) -> str:
+    """'face 15709 (material 'Trim'), in a connected piece of 644 of its 28484 faces, 2.6 x 0.26 x 0.067 m'"""
+    piece = hit["piece"]
+    text = f"face {hit['face']}"
+    if not hit.get("face_index_is_in_object_data", True):
+        text += " of the mesh after modifiers"
+    if hit.get("material"):
+        text += f" (material '{hit['material']}')"
+    size = " x ".join(f"{v:g}" for v in piece["size"])
+    if piece["faces"] >= hit["object_faces"]:
+        return text + f", in one connected piece: the whole object ({hit['object_faces']} faces, {size} m)"
+    return (text + f", in a connected piece of {piece['faces']} of its {hit['object_faces']} faces, {size} m, "
+            f"from {_point(piece['min'])} to {_point(piece['max'])}")
+
+
+def _cursor_line(pick: dict) -> str:
+    """What the 3D cursor sits on: the way a user points at something in Blender itself."""
+    if pick.get("error"):
+        return f"3D cursor: couldn't tell what it is on ({pick['error']})."
+    hit = pick.get("hit")
+    if not hit:
+        return (f"3D cursor at {_point(pick.get('cursor', []))} isn't on any visible mesh. The user marks a "
+                "spot with Shift+right-click in the viewport.")
+    line = f"3D cursor at {_point(hit['location'])} is on '{hit['object']}', {_surface_detail(hit)}."
+    size = sum(v * v for v in hit["piece"]["size"]) ** 0.5
+    if (hit.get("distance") or 0) > max(size * 0.05, 1e-3):
+        line += (f" It is {hit['distance']:g} m from that surface, so it was probably not placed on it; the user "
+                 "marks a spot with Shift+right-click in the viewport.")
+    elif hit["piece"]["faces"] < hit["object_faces"]:
+        line += (" Vertices at the same position count as joined, so seams from export don't split it, though "
+                 "Select Linked stops there.")
+    return line
+
+
+def _format_scene_summary(data: dict, fields, cursor: dict | None = None) -> str:
     h = data["header"]
     counts = ", ".join(f"{n} {kind}" for kind, n in sorted(h["object_counts"].items())) or "empty"
     selected = ", ".join(h["selected"]) or "none"
@@ -597,7 +637,10 @@ def _format_scene_summary(data: dict, fields) -> str:
             f"(now {st['frames'][2]}) at {st['fps']} fps | {st['resolution'][0]}x{st['resolution'][1]} | "
             f"camera {st['camera'] or 'none'} | HDRI {st['world_hdri'] or 'none'} | unit scale {st['unit_scale']}"
         )
-    columns = " | ".join(["name", "type", *(f for f in blender_scripts.SCENE_FIELDS if f in fields and f != "settings")])
+    if cursor is not None:
+        lines.append(_cursor_line(cursor))
+    columns = " | ".join(["name", "type", *(f for f in blender_scripts.SCENE_FIELDS
+                                            if f in fields and f not in blender_scripts.SCENE_HEADER_FIELDS)])
     lines += ["", f"Showing {data['shown']} of {data['total']} ({columns}):", *data["lines"]]
     if data["shown"] < data["total"]:
         lines.append(f"... {data['total'] - data['shown']} more. Narrow with query= or root=, or raise limit.")
@@ -633,6 +676,10 @@ async def get_scene_info(
         poles), weights (vertices no deform bone moves, deform bones with no vertex group)
       settings: adds a line with the file, engine, frame range, resolution, camera, HDRI and
         unit scale
+      cursor: adds a line saying what the 3D cursor sits on: object, face, and the connected
+        piece of mesh around that face (often one part of a merged model). This is how the
+        user points at something without a clickable screenshot: ask them to Shift+right-click
+        it in Blender's viewport, then read this.
     - query: Name filter across all objects.
     - root: Object whose hierarchy to list.
     - limit: Maximum object lines (default 20).
@@ -660,8 +707,15 @@ async def get_scene_info(
         if data.get("error"):
             error_msg = data["error"]
             return f"Error: {data['error']}"
+        cursor = None
+        if "cursor" in fields:
+            try:
+                cursor = _run_script(blender_scripts.PICK, {"mode": "cursor"})
+            except Exception as e:
+                logger.debug(f"Cursor pick failed: {e}")
+                cursor = {"error": str(e)}
         success = True
-        return _format_scene_summary(data, fields)
+        return _format_scene_summary(data, fields, cursor)
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error getting scene info from Blender: {str(e)}")
@@ -1573,6 +1627,7 @@ async def look(
     view: str | list[float] | None = None,
     image: str | None = None,
     max_size: int = 768,
+    save_to: str | None = None,
     user_prompt: str = "",
 ) -> CallToolResult:
     """
@@ -1597,10 +1652,14 @@ async def look(
     - view: For frames: "camera", an angle name or an [x, y, z] direction; default the viewport.
     - max_size: Longest side in pixels (default 768). Images stay in the conversation, so go
       smaller for quick checks and larger only to read fine detail.
+    - save_to: Also write the image to this .png path on the machine running this server, to
+      show it to the user: many clients show tool images to the model only.
     - user_prompt: The user's own words describing what they want, quoted verbatim.
 
     Every setting changed to take the picture is restored afterwards.
     """
+    if save_to is not None and not save_to.lower().endswith(".png"):
+        return _app_error(f"save_to must be a .png path; got {save_to!r}.")
     if mode in LOOK_RETIRED:
         return _app_error(f"There is no {mode} mode. {LOOK_RETIRED[mode]}")
     if mode is not None and mode not in LOOK_MODES:
@@ -1631,11 +1690,13 @@ async def look(
     # Each falls back to the other, since old addons may have only one of them.
     first, second = (native, scripted) if mode == "viewport" and not shading else (scripted, native)
     try:
-        return first()
+        result = first()
     except _LookRefused as e:
         return _app_error(str(e))
     except Exception as e:
         reason = str(e)
+    else:
+        return _save_look(result, save_to)
     if mode == "image":
         # The viewport is no stand-in for the image that was asked for.
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
@@ -1648,6 +1709,25 @@ async def look(
     if second is native:
         note = f"look(mode=\"{mode}\") isn't available here ({reason}), so this is the plain viewport."
         result.content.append(TextContent(type="text", text=note))
+    return _save_look(result, save_to)
+
+
+def _save_look(result: CallToolResult, save_to: str | None) -> CallToolResult:
+    """Write the image of a look result to `save_to` and say where, or say why it couldn't be."""
+    if not save_to or result.isError:
+        return result
+    image = next((c for c in result.content if isinstance(c, ImageContent)), None)
+    if image is None:
+        return result
+    path = os.path.abspath(os.path.expanduser(save_to))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(image.data))
+        note = f"Saved this image to {path}."
+    except OSError as e:
+        note = f"Couldn't save the image to {path}: {e}"
+    result.content.append(TextContent(type="text", text=note))
     return result
 
 
@@ -2186,7 +2266,9 @@ def viewport_pick(seq: int, x: float, y: float) -> CallToolResult:
 
     `x` and `y` run 0..1 from the image's top-left corner. The ray uses the
     camera that capture was rendered with, so it works after the user has
-    orbited the view, against the scene as it is now.
+    orbited the view, against the scene as it is now. For a mesh it also says
+    which face was hit and the connected piece of mesh around it, since one
+    imported object often holds many parts.
     """
     view = viewport_store.view(seq)
     if view is None:
@@ -2207,6 +2289,11 @@ def viewport_pick(seq: int, x: float, y: float) -> CallToolResult:
     obj = hit.get("object")
     if not obj:
         return CallToolResult(content=[], structuredContent={"object": None})
+    if obj.get("type") == "MESH":
+        surface = _pick_surface(view, x, y, obj["name"])
+        if surface:
+            detail = f"{obj.get('detail') or 'Mesh object'}; {_surface_detail(surface)}"
+            obj = {**obj, "surface": surface, "detail": detail}
     link = ResourceLink(
         type="resource_link",
         uri=_scene_item_uri("object", obj["name"]),
@@ -2216,6 +2303,22 @@ def viewport_pick(seq: int, x: float, y: float) -> CallToolResult:
         mimeType="application/json",
     ).model_dump(by_alias=True, exclude_none=True, mode="json")
     return CallToolResult(content=[], structuredContent={"object": {**obj, "link": link}})
+
+
+def _pick_surface(view: dict, x: float, y: float, name: str) -> dict | None:
+    """The face and piece a click on a capture landed on, or None.
+
+    A script rather than an addon command, so every installed addon can do it;
+    a click still picks its object when this fails.
+    """
+    args = {"mode": "ray", "view_matrix": view["view_matrix"], "window_matrix": view["window_matrix"],
+            "x": x, "y": y}
+    try:
+        surface = _run_script(blender_scripts.PICK, args).get("hit")
+    except Exception as e:
+        logger.debug(f"Face pick failed: {e}")
+        return None
+    return surface if surface and surface.get("object") == name else None
 
 
 _client_features_logged = False
