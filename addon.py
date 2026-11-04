@@ -82,13 +82,15 @@ _meshy_refines = {}
 
 # Tripo, with the user's own key. Sidebar model id -> label; the id is what
 # the request sends. Text and image are each one task.
-TRIPO_API_BASE = "https://openapi.tripo3d.ai/v3"
+TRIPO_DOMAINS = [
+    ("ai", ".ai", "Use the international Tripo API and developer portal"),
+    ("com", ".com", "Use the CN Tripo API and developer portal"),
+]
 TRIPO_DEFAULT_MODEL = "v3.1-20260211"
 TRIPO_MODELS = {
     "v3.1-20260211": "H3.1",
     "P2-20260801": "P2.0",
 }
-TRIPO_KEY_URL = "https://developers.tripo3d.ai/en/keys"
 TRIPO_PROMPT_MAX = 1024
 TRIPO_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 TRIPO_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
@@ -1171,6 +1173,21 @@ def get_blendermcp_addon_preferences(context=None):
         context = bpy.context
     addon = context.preferences.addons.get(__name__)
     return addon.preferences if addon else None
+
+
+def tripo_endpoints(context=None, preferences=None):
+    """Resolve the same domain for the sidebar, developer links and API calls."""
+    context = context or bpy.context
+    prefs = preferences if preferences is not None else get_blendermcp_addon_preferences(context)
+    domain = (getattr(prefs, "tripo_domain", "ai") if prefs is not None else
+              getattr(context.scene, "blendermcp_tripo_domain", "ai"))
+    domain = domain if domain in ("ai", "com") else "ai"
+    portal = f"https://developers.tripo3d.{domain}/{'zh' if domain == 'com' else 'en'}"
+    return {
+        "domain": domain,
+        "api": f"https://openapi.tripo3d.{domain}/v3",
+        "keys": f"{portal}/keys",
+    }
 
 # Tencent Cloud exposes Hunyuan-to-3D through two different services depending on where the
 # account was created. Mainland accounts (cloud.tencent.com) use the AI3D 3.0 API. Tencent Cloud
@@ -5189,7 +5206,7 @@ class BlenderMCPServer:
         if response.status_code == 401 or code in (1000, 1001):
             return None, {"error": "Tripo rejected the API key"}
         if code == 2010:
-            return None, {"error": message or "Out of Tripo credits. Top up at tripo3d.ai"}
+            return None, {"error": message or f"Out of Tripo credits. Top up at tripo3d.{tripo_endpoints()['domain']}"}
         if code == 2000:
             return None, {"error": message or "Tripo concurrency limit hit, wait and retry"}
         if code == 1007 or response.status_code == 429:
@@ -5215,7 +5232,7 @@ class BlenderMCPServer:
             return None, error
         try:
             response = requests.post(
-                f"{TRIPO_API_BASE}{path}", headers=headers, json=body, files=files, timeout=TRIPO_TIMEOUT)
+                f"{tripo_endpoints()['api']}{path}", headers=headers, json=body, files=files, timeout=TRIPO_TIMEOUT)
         except Exception:
             return None, {"error": "Tripo request failed. Check the internet connection and try again"}
         return self._tripo_parse(response)
@@ -5231,7 +5248,7 @@ class BlenderMCPServer:
         try:
             with open(path, "rb") as handle:
                 response = requests.post(
-                    f"{TRIPO_API_BASE}/files",
+                    f"{tripo_endpoints()['api']}/files",
                     headers=headers,
                     files={"file": (os.path.basename(path), handle, mime)},
                     timeout=TRIPO_TIMEOUT,
@@ -5293,7 +5310,7 @@ class BlenderMCPServer:
             return error
         try:
             response = requests.get(
-                f"{TRIPO_API_BASE}/tasks/{quote(str(task_id), safe='')}",
+                f"{tripo_endpoints()['api']}/tasks/{quote(str(task_id), safe='')}",
                 headers=headers,
                 timeout=TRIPO_TIMEOUT,
             )
@@ -6365,6 +6382,12 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         ],
         default="standard",
     )
+    tripo_domain: bpy.props.EnumProperty(
+        name="Tripo Domain",
+        description="Tripo API region; use an API key from the selected domain",
+        items=TRIPO_DOMAINS,
+        default="ai",
+    )
     tripo_api_key: bpy.props.StringProperty(
         name="Tripo API Key",
         subtype="PASSWORD",
@@ -6425,8 +6448,10 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
                 "https://console.cloud.tencent.com/cam/capi"
             col.prop(self, "hunyuan3d_api_url", text="Hunyuan3D API URL")
             col.separator()
+            col.prop(self, "tripo_domain", text="Tripo Domain", translate=False)
             col.prop(self, "tripo_api_key", text="Tripo API Key")
-            col.operator("wm.url_open", text="Get Tripo API Key", icon='URL').url = TRIPO_KEY_URL
+            endpoints = tripo_endpoints(context, self)
+            col.operator("wm.url_open", text="Get Tripo API Key", icon='URL').url = endpoints["keys"]
             col.separator()
             col.prop(self, "meshy_api_key", text="Meshy API Key")
             col.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
@@ -6557,11 +6582,20 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         elif sub:
             col = sub.column(align=True)
             col.prop(scene, "blendermcp_tripo_model", text="Model")
+            endpoints = tripo_endpoints(context)
+            # The domain picker only matters for tripo3d.com (China) accounts, so
+            # the sidebar shows it for a Chinese UI or once it is set; it is
+            # always in the add-on preferences.
+            show_domain = endpoints["domain"] == "com" or bpy.app.translations.locale.startswith("zh")
             if prefs:
+                if show_domain:
+                    col.prop(prefs, "tripo_domain", text="Domain", translate=False)
                 col.prop(prefs, "tripo_api_key", text="API Key")
             else:
+                if show_domain:
+                    col.prop(scene, "blendermcp_tripo_domain", text="Domain", translate=False)
                 col.prop(scene, "blendermcp_tripo_api_key", text="API Key")
-            sub.operator("wm.url_open", text="Get Tripo API Key", icon='KEYINGSET').url = TRIPO_KEY_URL
+            sub.operator("wm.url_open", text="Get Tripo API Key", icon='KEYINGSET').url = endpoints["keys"]
 
         sub = self._integration_header(layout, scene, "blendermcp_use_meshy", "Meshy", 'OUTLINER_OB_MESH')
         if sub and premium:
@@ -6970,6 +7004,12 @@ def register():
         default=False,
     )
 
+    bpy.types.Scene.blendermcp_tripo_domain = bpy.props.EnumProperty(
+        name="Tripo Domain",
+        description="Tripo API region; use an API key from the selected domain",
+        items=TRIPO_DOMAINS,
+        default="ai",
+    )
     bpy.types.Scene.blendermcp_tripo_model = bpy.props.EnumProperty(
         name="Tripo Model",
         description="Tripo model used for each generation",
@@ -7073,6 +7113,7 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_sketchfab
     del bpy.types.Scene.blendermcp_sketchfab_api_key
     del bpy.types.Scene.blendermcp_use_tripo
+    del bpy.types.Scene.blendermcp_tripo_domain
     del bpy.types.Scene.blendermcp_tripo_model
     del bpy.types.Scene.blendermcp_tripo_api_key
     del bpy.types.Scene.blendermcp_use_meshy

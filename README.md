@@ -676,6 +676,7 @@ It runs through [Premium](#premium) with no key, or on your own Tripo API key.
 Through Premium, text uses your default quality and an image counts as one high-quality generation.
 [Get a Tripo API key](https://developers.tripo3d.ai/en/keys).
 Tick **Tripo** under **AI Model Generation** in the sidebar, choose a **Model**, and paste the key.
+For a [tripo3d.com](https://www.tripo3d.com/) (China) account, set **Tripo Domain** to `.com` in the add-on preferences.
 
 #### Meshy
 
