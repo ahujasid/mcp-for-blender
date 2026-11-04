@@ -47,6 +47,9 @@ MESHY_POSE_PROTOCOL = 15
 MESHY_POSES = ("a-pose", "t-pose")
 MESHY_PROMPT_MAX = 800
 TRIPO_PROMPT_MAX = 1024
+# Rodin takes several views of one object; a folder sends the images in it.
+RODIN_MAX_IMAGES = 5
+RODIN_FOLDER_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 POLL_INTERVAL_S = 5.0
 # A whole generate_3d call, submit included, stays under this. MCP clients on
@@ -259,15 +262,27 @@ def is_image_bytes(data: bytes) -> bool:
 def _rodin_images(image: str) -> list:
     if urlparse(image).scheme in ("http", "https"):
         return [image]
-    if not os.path.isfile(image):
+    if not os.path.exists(image):
         raise GenerationError(f"Image not found: {image}. Give an absolute file path or an http(s) URL.")
-    with open(image, "rb") as f:
-        data = f.read()
-    # The bytes go to a third-party service, so a path to anything but an
-    # image (a key file, a config) must not be sent.
-    if not is_image_bytes(data):
-        raise GenerationError(f"Not a PNG, JPEG or WebP image: {image}")
-    return [(Path(image).suffix, base64.b64encode(data).decode("ascii"))]
+    paths = [Path(image)]
+    if os.path.isdir(image):
+        # Sorted, so the first view (the one Premium uses) is predictable.
+        paths = sorted(p for p in Path(image).iterdir()
+                       if p.is_file() and p.suffix.lower() in RODIN_FOLDER_SUFFIXES)
+        if not paths:
+            raise GenerationError(f"No PNG, JPEG or WebP images in {image}.")
+        if len(paths) > RODIN_MAX_IMAGES:
+            raise GenerationError(f"Hyper3D takes up to {RODIN_MAX_IMAGES} images; {image} has {len(paths)}. "
+                                  "Put the views of one object in a folder of their own.")
+    images = []
+    for path in paths:
+        data = path.read_bytes()
+        # The bytes go to a third-party service, so a path to anything but an
+        # image (a key file, a config) must not be sent.
+        if not is_image_bytes(data):
+            raise GenerationError(f"Not a PNG, JPEG or WebP image: {path}")
+        images.append((path.suffix, base64.b64encode(data).decode("ascii")))
+    return images
 
 
 def process_bbox(bbox: list | None) -> list[int] | None:
@@ -285,6 +300,9 @@ def submit(send: Send, provider: str, name: str, prompt: str | None, image: str 
            pose_mode: str | None = None) -> Job | str:
     """Start a generation. Returns a Job, or a finished message for providers
     that generate synchronously (Hunyuan3D LOCAL_API)."""
+    if image and provider != "hyper3d" and os.path.isdir(image):
+        raise GenerationError(f"{provider} takes one image file, not a folder. Pass one image, "
+                              "or provider='hyper3d' to send the folder's images as views of one object.")
     if provider == "tripo":
         if prompt and len(prompt) > TRIPO_PROMPT_MAX:
             raise GenerationError(f"Tripo prompts are limited to {TRIPO_PROMPT_MAX} characters; "

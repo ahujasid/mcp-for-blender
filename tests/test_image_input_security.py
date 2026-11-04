@@ -37,9 +37,11 @@ def test_rodin_refuses_a_file_that_is_not_an_image(tmp_path):
         generation.submit(send, "hyper3d", "Car", None, str(secret), None, None, True)
 
 
-def test_rodin_refuses_a_directory(tmp_path):
+def test_rodin_refuses_a_folder_holding_a_non_image(tmp_path):
+    (tmp_path / "front.png").write_bytes(PNG)
+    (tmp_path / "side.png").write_bytes(SECRET)
     send = lambda *_: pytest.fail("nothing may be sent")
-    with pytest.raises(GenerationError, match="Image not found"):
+    with pytest.raises(GenerationError, match="Not a PNG, JPEG or WebP image: .*side.png"):
         generation.submit(send, "hyper3d", "Car", None, str(tmp_path), None, None, True)
 
 
