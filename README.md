@@ -832,6 +832,19 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - **Commands** are sent as JSON objects with a `type` and optional `params`
 - **Responses** are JSON objects with a `status` and `result` or `message`
 
+### Connecting from another machine
+
+The add-on listens on `localhost` by default. To accept connections from another
+trusted PC, Docker, or WSL, open **Edit > Preferences > Add-ons > MCP for Blender**,
+set **Bind Address** to the Blender machine's LAN IPv4 address (or `0.0.0.0` for all
+interfaces), enable **Allow Remote Connections**, then disconnect and reconnect. On
+the client side, set `BLENDER_HOST` to that address and `BLENDER_PORT` to the port
+shown in Blender.
+
+**Remote access has no authentication or encryption and lets clients run Python in
+Blender.** Use it only on a trusted network behind a firewall, never on the public
+internet. An SSH tunnel to the default `localhost` listener is a safer alternative.
+
 ## Limitations & Security Considerations
 
 > **Warning:** The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. **ALWAYS save your work before using it.**
