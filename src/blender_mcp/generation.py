@@ -250,13 +250,24 @@ def choose_provider(requested: str, premium: list[str], own_key_enabled: dict[st
     )
 
 
+def is_image_bytes(data: bytes) -> bool:
+    """PNG, JPEG or WebP, by their magic numbers rather than the file name."""
+    return (data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff")
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
+
+
 def _rodin_images(image: str) -> list:
     if urlparse(image).scheme in ("http", "https"):
         return [image]
-    if not os.path.exists(image):
+    if not os.path.isfile(image):
         raise GenerationError(f"Image not found: {image}. Give an absolute file path or an http(s) URL.")
     with open(image, "rb") as f:
-        return [(Path(image).suffix, base64.b64encode(f.read()).decode("ascii"))]
+        data = f.read()
+    # The bytes go to a third-party service, so a path to anything but an
+    # image (a key file, a config) must not be sent.
+    if not is_image_bytes(data):
+        raise GenerationError(f"Not a PNG, JPEG or WebP image: {image}")
+    return [(Path(image).suffix, base64.b64encode(data).decode("ascii"))]
 
 
 def process_bbox(bbox: list | None) -> list[int] | None:

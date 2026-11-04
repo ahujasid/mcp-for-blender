@@ -7,6 +7,7 @@ import mathutils
 import json
 import threading
 import socket
+import ipaddress
 import queue
 import time
 import requests
@@ -23,7 +24,7 @@ from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
 from collections import deque
-from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
@@ -4877,8 +4878,7 @@ class BlenderMCPServer:
                 else:
                     try:
                         # Convert to Base64 format
-                        with open(image, "rb") as f:
-                            image_base64 = base64.b64encode(f.read()).decode("ascii")
+                        image_base64 = base64.b64encode(_read_image_file(image)).decode("ascii")
                         data["ImageBase64"] = image_base64
                     except Exception as e:
                         return {"error": f"Image encoding failed: {str(e)}"}
@@ -4934,17 +4934,14 @@ class BlenderMCPServer:
             if image:
                 if re.match(r'^https?://', image, re.IGNORECASE) is not None:
                     try:
-                        resImg = requests.get(image, timeout=30)
-                        resImg.raise_for_status()
-                        image_base64 = base64.b64encode(resImg.content).decode("ascii")
+                        image_base64 = base64.b64encode(_fetch_public_image(image)).decode("ascii")
                         data["image"] = image_base64
                     except Exception as e:
-                        return {"error": f"Failed to download or encode image: {str(e)}"} 
+                        return {"error": f"Failed to download or encode image: {str(e)}"}
                 else:
                     try:
                         # Convert to Base64 format
-                        with open(image, "rb") as f:
-                            image_base64 = base64.b64encode(f.read()).decode("ascii")
+                        image_base64 = base64.b64encode(_read_image_file(image)).decode("ascii")
                         data["image"] = image_base64
                     except Exception as e:
                         return {"error": f"Image encoding failed: {str(e)}"}
@@ -5937,6 +5934,60 @@ def premium_integration_status(integration, enabled):
     return {"enabled": True, "mode": "PREMIUM", "message": f"{summary}. {flow}"}
 
 
+IMAGE_FETCH_MAX_REDIRECTS = 3
+
+
+def _is_image_bytes(data):
+    """PNG, JPEG or WebP, by their magic numbers rather than the file name."""
+    return (data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff")
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
+
+
+def _read_image_file(path):
+    """A local image's bytes. They go to a generation service, so a path to
+    anything but an image (a key file, a config) raises ValueError."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if not _is_image_bytes(data):
+        raise ValueError(f"Not a PNG, JPEG or WebP image: {path}")
+    return data
+
+
+def _check_public_url(url):
+    """Raise ValueError unless every address the URL's host resolves to is public."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"Not an http(s) URL: {url}")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, ValueError) as e:
+        raise ValueError(f"Can't resolve {parsed.hostname}: {e}")
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0].split("%")[0])
+        if address.version == 6 and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_global:
+            raise ValueError(f"{parsed.hostname} is a local or private address. "
+                             "Give a public image URL or a local file path instead.")
+
+
+def _fetch_public_image(url):
+    """Download an image named by URL. Local and private hosts are refused at
+    every redirect, so a URL can't reach into the user's own network."""
+    for _ in range(IMAGE_FETCH_MAX_REDIRECTS + 1):
+        _check_public_url(url)
+        response = requests.get(url, timeout=30, allow_redirects=False)
+        location = response.headers.get("Location")
+        if 300 <= response.status_code < 400 and location:
+            url = urljoin(url, location)
+            continue
+        response.raise_for_status()
+        if not _is_image_bytes(response.content):
+            raise ValueError(f"Not a PNG, JPEG or WebP image: {url}")
+        return response.content
+    raise ValueError("Too many redirects fetching the image")
+
+
 def _premium_image_payload(image):
     """URLs go to the server as-is; local files are read here, since the
     server cannot see the user's disk."""
@@ -5947,8 +5998,7 @@ def _premium_image_payload(image):
                 "image_mime": _premium_mime(suffix)}, len(raw)
     if re.match(r'^https?://', str(image), re.IGNORECASE):
         return {"image_url": image}, 0
-    with open(image, "rb") as f:
-        raw = f.read()
+    raw = _read_image_file(image)
     return {"image_base64": base64.b64encode(raw).decode("ascii"),
             "image_mime": _premium_mime(osp.splitext(image)[1])}, len(raw)
 
