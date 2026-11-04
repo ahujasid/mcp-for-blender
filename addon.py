@@ -1993,7 +1993,11 @@ class BlenderMCPServer:
                                 values.extend(round(float(v), 3) for v in dv)
                     parts.append(f"{node.bl_idname}{values}")
                 parts.sort()
-                parts.append(str(len(tree.links)))
+                parts.append(str(sorted(
+                    (link.from_node.name, link.from_socket.identifier,
+                     link.to_node.name, link.to_socket.identifier)
+                    for link in tree.links
+                )))
                 basis = "|".join(parts)
             return format(zlib.crc32(basis.encode("utf-8")), "08x")
         except Exception:
