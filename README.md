@@ -806,6 +806,10 @@ For headless setups or CI, credentials can also be injected by environment varia
 | `BLENDERMCP_MESHY_API_KEY` |
 | `BLENDERMCP_TRIPO_API_KEY` |
 
+Hyper3D with your own key uses the `Gen-2.5-Medium` tier on both the main-site
+and fal.ai paths. The free trial key is available only in main-site mode; fal.ai
+requires your own fal.ai API key. The trial key button is hidden in fal.ai mode.
+
 ---
 
 ## Troubleshooting
