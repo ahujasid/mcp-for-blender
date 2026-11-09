@@ -5275,13 +5275,20 @@ class BlenderMCPServer:
         if os.path.getsize(path) > TRIPO_IMAGE_MAX_BYTES:
             return None, {"error": "Tripo accepts images up to 20 MB"}
         try:
-            with open(path, "rb") as handle:
-                response = requests.post(
-                    f"{tripo_endpoints()['api']}/files",
-                    headers=headers,
-                    files={"file": (os.path.basename(path), handle, mime)},
-                    timeout=TRIPO_TIMEOUT,
-                )
+            data = _read_image_file(path)
+        except (OSError, ValueError) as e:
+            return None, {"error": str(e)}
+        # The bytes, not the file name, say what the image is.
+        mime = _image_mime(data)
+        if mime not in TRIPO_IMAGE_TYPES.values():
+            return None, {"error": "Tripo accepts JPEG or PNG images"}
+        try:
+            response = requests.post(
+                f"{tripo_endpoints()['api']}/files",
+                headers=headers,
+                files={"file": (os.path.basename(path), data, mime)},
+                timeout=TRIPO_TIMEOUT,
+            )
         except Exception:
             return None, {"error": "Tripo request failed. Check the internet connection and try again"}
         data, error = self._tripo_parse(response)
@@ -5489,9 +5496,13 @@ class BlenderMCPServer:
             return None, {"error": "Meshy accepts JPG, PNG or WebP images"}
         if os.path.getsize(image) > MESHY_IMAGE_MAX_BYTES:
             return None, {"error": "Meshy accepts images up to 20 MB"}
-        with open(image, "rb") as handle:
-            encoded = base64.b64encode(handle.read()).decode("ascii")
-        return f"data:{mime};base64,{encoded}", None
+        try:
+            data = _read_image_file(image)
+        except (OSError, ValueError) as e:
+            return None, {"error": str(e)}
+        # The bytes, not the file name, say what the image is.
+        encoded = base64.b64encode(data).decode("ascii")
+        return f"data:{_image_mime(data)};base64,{encoded}", None
 
     def create_meshy_job(self, text_prompt=None, image=None, pose_mode=None):
         """Start a Meshy text preview task ("t2p") or image-to-3D task ("i2m")."""
@@ -5969,10 +5980,20 @@ def premium_integration_status(integration, enabled):
 IMAGE_FETCH_MAX_REDIRECTS = 3
 
 
+def _image_mime(data):
+    """image/png, image/jpeg or image/webp by the magic number, else None."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _is_image_bytes(data):
     """PNG, JPEG or WebP, by their magic numbers rather than the file name."""
-    return (data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff")
-            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
+    return _image_mime(data) is not None
 
 
 def _read_image_file(path):
