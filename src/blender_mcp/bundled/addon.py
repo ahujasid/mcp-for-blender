@@ -1281,6 +1281,10 @@ class BlenderMCPServer:
         # approach) could silently drop the callback - on Windows especially -
         # leaving the client blocked in recv() until its socket timeout.
         self.command_queue = queue.Queue()
+        # bpy.app.timers keys a timer by the identity of the callable, and
+        # every self._drain_command_queue lookup makes a new bound method, so
+        # is_registered() and unregister() must be handed this one object.
+        self._drain_timer = self._drain_command_queue
         # Live client sockets, so stop() can unblock threads parked in recv().
         self._clients = set()
         self._clients_lock = threading.Lock()
@@ -1411,8 +1415,8 @@ class BlenderMCPServer:
 
             # start() is called from the operator, i.e. the main thread, so
             # this is the only safe place to touch bpy.app.timers.
-            if not bpy.app.timers.is_registered(self._drain_command_queue):
-                bpy.app.timers.register(self._drain_command_queue, persistent=True)
+            if not bpy.app.timers.is_registered(self._drain_timer):
+                bpy.app.timers.register(self._drain_timer, persistent=True)
 
             print(f"BlenderMCP server started on {self.host}:{self.port}")
         except Exception as e:
@@ -1426,8 +1430,8 @@ class BlenderMCPServer:
         get_edit_recorder().drain()
 
         try:
-            if bpy.app.timers.is_registered(self._drain_command_queue):
-                bpy.app.timers.unregister(self._drain_command_queue)
+            if bpy.app.timers.is_registered(self._drain_timer):
+                bpy.app.timers.unregister(self._drain_timer)
         except Exception:
             pass
 
