@@ -180,3 +180,91 @@ def test_scene_without_the_toggle_behaves_like_mainland(monkeypatch):
     server.poll_hunyuan_job_status_ai("job_abc")
 
     assert calls[0]["url"] == "https://ai3d.tencentcloudapi.com"
+
+
+# SecretId and SecretKey are one credential (#340). Read each on its own, the id
+# could come from the preferences and the key from a scene saved with another
+# account's, and Tencent answers that pair with AuthFailure.SignatureFailure.
+
+def _credential_places(monkeypatch, addon, scene, prefs=None, env=None):
+    monkeypatch.setattr(addon, "get_blendermcp_addon_preferences", lambda context=None: prefs)
+    for name in ("BLENDERMCP_HUNYUAN3D_SECRET_ID", "BLENDERMCP_HUNYUAN3D_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
+    return addon.BlenderMCPServer()
+
+
+def _prefs(secret_id="", secret_key=""):
+    return types.SimpleNamespace(hunyuan3d_secret_id=secret_id, hunyuan3d_secret_key=secret_key)
+
+
+def test_credentials_never_pair_an_id_with_another_places_key(monkeypatch):
+    scene = _scene(False)
+    scene.blendermcp_hunyuan3d_secret_id = "AKIDscene"
+    scene.blendermcp_hunyuan3d_secret_key = "scenekey"
+    addon = _load_addon(monkeypatch, scene)
+    server = _credential_places(monkeypatch, addon, scene, prefs=_prefs(secret_id="AKIDprefs"))
+
+    assert server._get_hunyuan3d_credentials() == ("AKIDscene", "scenekey")
+
+
+def test_preferences_win_when_they_hold_both(monkeypatch):
+    scene = _scene(False)
+    scene.blendermcp_hunyuan3d_secret_id = "AKIDold"
+    scene.blendermcp_hunyuan3d_secret_key = "oldkey"
+    addon = _load_addon(monkeypatch, scene)
+    server = _credential_places(monkeypatch, addon, scene, prefs=_prefs("AKIDprefs", "prefskey"))
+
+    assert server._get_hunyuan3d_credentials() == ("AKIDprefs", "prefskey")
+
+
+def test_environment_pair_is_used_when_nothing_else_is_set(monkeypatch):
+    scene = _scene(False)
+    addon = _load_addon(monkeypatch, scene)
+    server = _credential_places(monkeypatch, addon, scene, prefs=_prefs(), env={
+        "BLENDERMCP_HUNYUAN3D_SECRET_ID": "AKIDenv", "BLENDERMCP_HUNYUAN3D_SECRET_KEY": "envkey"})
+
+    assert server._get_hunyuan3d_credentials() == ("AKIDenv", "envkey")
+
+
+def test_pasted_whitespace_is_dropped(monkeypatch):
+    scene = _scene(False)
+    addon = _load_addon(monkeypatch, scene)
+    server = _credential_places(monkeypatch, addon, scene, prefs=_prefs(" AKIDprefs\n", "prefskey \r\n"))
+
+    assert server._get_hunyuan3d_credentials() == ("AKIDprefs", "prefskey")
+
+
+def test_a_lone_half_is_reported_missing_not_signed(monkeypatch):
+    scene = _scene(False)
+    addon = _load_addon(monkeypatch, scene)
+    server = _credential_places(monkeypatch, addon, scene, prefs=_prefs(secret_id="AKIDprefs"))
+    calls = _capture_post(monkeypatch, addon)
+
+    assert server._get_hunyuan3d_credentials() == ("AKIDprefs", "")
+    assert server.create_hunyuan_job_main_site(text_prompt="a stool") == {"error": "SecretId or SecretKey is not given"}
+    assert calls == []
+
+
+def test_the_request_is_signed_with_the_pair_from_one_place(monkeypatch):
+    scene = _scene(False)
+    scene.blendermcp_hunyuan3d_secret_id = "AKIDscene"
+    scene.blendermcp_hunyuan3d_secret_key = "scenekey"
+    addon = _load_addon(monkeypatch, scene)
+    server = _credential_places(monkeypatch, addon, scene, prefs=_prefs(secret_id=" AKIDprefs "), env={
+        "BLENDERMCP_HUNYUAN3D_SECRET_KEY": "envkey"})
+    signed = []
+    real_sign = addon.BlenderMCPServer.get_tencent_cloud_sign_headers
+
+    def sign(method, path, head, data, service, region, secret_id, secret_key, host=None):
+        signed.append((secret_id, secret_key))
+        return real_sign(method, path, head, data, service, region, secret_id, secret_key, host)
+
+    monkeypatch.setattr(server, "get_tencent_cloud_sign_headers", sign)
+    calls = _capture_post(monkeypatch, addon)
+
+    server.create_hunyuan_job_main_site(text_prompt="a stool")
+
+    assert signed == [("AKIDscene", "scenekey")]
+    assert "Credential=AKIDscene/" in calls[0]["headers"]["Authorization"]
