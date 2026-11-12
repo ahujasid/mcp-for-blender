@@ -35,9 +35,9 @@ class _NullEditRecorder:
         yield
 
 
-def _load_server_class():
+def _load_server_class(addon_path=ROOT_ADDON):
     """Compile BlenderMCPServer from addon.py against stub modules."""
-    source = ROOT_ADDON.read_text(encoding="utf-8")
+    source = addon_path.read_text(encoding="utf-8")
     tree = ast.parse(source)
 
     body = [
