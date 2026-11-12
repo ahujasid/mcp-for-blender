@@ -17,7 +17,7 @@ import re
 
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, EventType
-from .telemetry_decorator import telemetry_tool, trajectory_tool
+from .telemetry_decorator import observe_tool, telemetry_tool, trajectory_tool
 from .addon_manager import (
     handshake_addon,
     format_handshake_log,
@@ -721,71 +721,18 @@ def _store_capture(max_size: int, source: str) -> None:
 # In MCP Apps hosts the result also shows in the fullscreen Viewport app.
 def _viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> CallToolResult:
     """look(mode="viewport"): the user's viewport, also shown in the Viewport app."""
-    start_time = __import__('time').time()
-    screenshot_url = None
-    success = False
-    error_msg = None
-    
     try:
         _store_capture(max_size, "model")
         state, image_bytes = _viewport_snapshot()
-
-        # Upload to storage for telemetry
-        try:
-            telemetry = get_telemetry()
-            if telemetry._check_user_consent():
-                screenshot_url = telemetry.upload_screenshot(image_bytes, "screenshot")
-        except Exception:
-            pass  # Silently fail - don't break screenshot for telemetry issues
-        
-        success = True
         # The state rides in _meta, which only the Viewport app reads, so the
         # model sees exactly the image it always did.
         return CallToolResult(
             content=[_png_content(image_bytes)],
             _meta={VIEWPORT_STATE_META: state},
         )
-        
     except Exception as e:
-        error_msg = str(e)
         logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
-    finally:
-        duration_ms = (__import__('time').time() - start_time) * 1000
-        # Record telemetry with screenshot URL in metadata
-        try:
-            telemetry = get_telemetry()
-            
-            metadata = None
-            if screenshot_url:
-                metadata = {"screenshot_url": screenshot_url}
-                
-            telemetry.record_event(
-                event_type=EventType.TOOL_EXECUTION,
-                tool_name="get_viewport_screenshot",
-                prompt_text=user_prompt,
-                success=success,
-                duration_ms=duration_ms,
-                error_message=error_msg,
-                metadata=metadata,
-            )
-        except Exception:
-            pass
-
-        try:
-            from .telemetry_decorator import _record_observe_step
-            _record_observe_step(
-                "get_viewport_screenshot",
-                modality="screenshot",
-                goal_text=user_prompt,
-                summary={"max_size": max_size},
-                screenshot_ref=screenshot_url,
-                success=success,
-                error=error_msg,
-                duration_ms=duration_ms,
-            )
-        except Exception:
-            pass
 
 
 @mcp.tool()
@@ -1559,8 +1506,17 @@ def _look_caption(info: dict) -> str:
     return " ".join(parts)
 
 
+def _look_params(kwargs: dict) -> dict:
+    """What a look call recorded, with the mode it resolved to, not None."""
+    params = {key: kwargs.get(key) for key in (
+        "mode", "target", "views", "distance", "shading", "frames", "frame_count", "view", "image", "max_size")
+        if kwargs.get(key) is not None}
+    params["mode"] = kwargs.get("mode") or ("image" if kwargs.get("image") is not None else "viewport")
+    return params
+
+
 @mcp.tool(meta={"ui": {"resourceUri": VIEWPORT_URI}})
-@telemetry_tool("look")
+@observe_tool("look", params=_look_params)
 async def look(
     ctx: Context,
     mode: str | None = None,
