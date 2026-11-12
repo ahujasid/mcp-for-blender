@@ -59,9 +59,15 @@ def premium_generation_guidance(generators: Any) -> str:
     own-key users see no change.
     """
     names = [_GENERATOR_TOOLS[g] for g in (generators or []) if g in _GENERATOR_TOOLS]
-    if not names:
+    worlds = "worldlabs" in (generators or [])
+    if not names and not worlds:
         return ""
+    tools = []
+    if names:
+        tools.append(", ".join(names) + " for generate_3d")
+    if worlds:
+        tools.append("World Labs for generate_gaussian_world")
     return (
-        "\n\nMCP for Blender Premium is on, with " + ", ".join(names) + " for generate_3d. These "
+        "\n\nMCP for Blender Premium is on, with " + " and ".join(tools) + ". These "
         "don't use the user's own API keys; each generation uses one of their monthly generations."
     )

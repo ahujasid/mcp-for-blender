@@ -1,4 +1,5 @@
-"""One generate/poll/import flow across Tripo, Hunyuan3D, Hyper3D Rodin and Meshy.
+"""One generate/poll/import flow across Tripo, Hunyuan3D, Hyper3D Rodin and Meshy,
+and for World Labs worlds (generate_gaussian_world).
 
 Each provider used to be three or four tools with different id shapes. Here a
 generation is a single call: submit, poll until done or out of time, import.
@@ -30,6 +31,8 @@ from .premium_hint import PREMIUM_URL
 logger = logging.getLogger("BlenderMCPServer")
 
 PROVIDERS = ("tripo", "hunyuan3d", "hyper3d", "meshy")
+# World generators: whole environments for generate_gaussian_world, never generate_3d.
+WORLD_PROVIDERS = ("worldlabs",)
 
 # Auto-pick order. Premium generators come first because the user is paying
 PREMIUM_ORDER = ("tripo", "meshy", "hyper3d", "hunyuan3d")
@@ -43,6 +46,12 @@ MESHY_KINDS = ("t2p", "t2r", "i2m", "prm")
 MESHY_PREMIUM_PROTOCOL = 14
 # Addons from this protocol on pass pose_mode to Meshy.
 MESHY_POSE_PROTOCOL = 15
+# World Labs job kinds: an operation on the user's own key, or a Premium job.
+WORLDLABS_KINDS = ("op", "prm")
+# Addons from this protocol on have World Labs.
+WORLDLABS_PROTOCOL = 16
+# Splat files a finished world offers, smallest first.
+WORLD_RESOLUTIONS = ("100k", "500k", "full_res")
 # Meshy's pose_mode values; the model comes out in that pose, ready to rig.
 MESHY_POSES = ("a-pose", "t-pose")
 MESHY_PROMPT_MAX = 800
@@ -90,7 +99,8 @@ class Unsupported(GenerationError):
 @dataclass
 class Job:
     provider: str
-    kind: str   # tripo: "rid" | "task"; hyper3d: "fal" | "main"; hunyuan3d: "job"; meshy: one of MESHY_KINDS
+    kind: str   # tripo: "rid" | "task"; hyper3d: "fal" | "main"; hunyuan3d: "job"; meshy: one of MESHY_KINDS;
+                # worldlabs: one of WORLDLABS_KINDS
     ident: str  # request id, job id, task id, or "<task_uuid>|<subscription_key>"
     name: str
 
@@ -101,14 +111,21 @@ class Job:
     @classmethod
     def parse(cls, handle: str, name: str) -> "Job":
         provider, kind, ident = (handle.split(":", 2) + ["", ""])[:3]
-        if provider not in PROVIDERS or not kind or not ident or (provider == "meshy" and kind not in MESHY_KINDS):
+        if (provider not in PROVIDERS + WORLD_PROVIDERS or not kind or not ident
+                or (provider == "meshy" and kind not in MESHY_KINDS)
+                or (provider == "worldlabs" and kind not in WORLDLABS_KINDS)):
             raise GenerationError(f"Not a generation job handle: {handle!r}")
         return cls(provider, kind, ident, name)
 
     @property
+    def is_world(self) -> bool:
+        return self.provider in WORLD_PROVIDERS
+
+    @property
     def resume_hint(self) -> str:
-        return (f'Call generate_3d(job="{self.handle}", name="{self.name}") to keep waiting; it imports the '
-                "model when it's ready. Don't start a new generation.")
+        tool, thing = ("generate_gaussian_world", "world") if self.is_world else ("generate_3d", "model")
+        return (f'Call {tool}(job="{self.handle}", name="{self.name}") to keep waiting; it imports the '
+                f"{thing} when it's ready. Don't start a new generation.")
 
 
 def request_key(provider: str, prompt: str | None, image: str | None,
@@ -285,6 +302,16 @@ def _rodin_images(image: str) -> list:
     return images
 
 
+def submit_world(send: Send, name: str, prompt: str | None, image: str | None) -> Job:
+    """Start a World Labs world. The addon reads image files and folders itself
+    and picks the model: the sidebar's on the user's key, Marble 1.1 through Premium."""
+    result = send("create_worldlabs_job", {"text_prompt": prompt, "image": image, "name": name})
+    _relay(result)
+    if not isinstance(result, dict) or not result.get("job_id") or result.get("kind") not in WORLDLABS_KINDS:
+        raise GenerationError(f"World Labs returned no job: {result}")
+    return Job("worldlabs", result["kind"], result["job_id"], name)
+
+
 def process_bbox(bbox: list | None) -> list[int] | None:
     if bbox is None:
         return None
@@ -365,6 +392,19 @@ def submit(send: Send, provider: str, name: str, prompt: str | None, image: str 
 def poll(send: Send, job: Job) -> tuple[str, Any]:
     """("running" | "done" | "failed", detail) for one status check, or
     ("refine", None) when a Meshy preview is ready for its refine."""
+    if job.provider == "worldlabs":
+        result = send("poll_worldlabs_job", {"job_id": job.ident, "kind": job.kind})
+        status = str(result.get("status", "")).upper() if isinstance(result, dict) else ""
+        # A failed world also carries "error"; read the status first so it
+        # counts as World Labs' verdict, not as a lost connection.
+        if status == "FAILED":
+            return "failed", result.get("error") or status
+        _relay(result)
+        if status == "SUCCEEDED":
+            return "done", None
+        progress = result.get("progress") if isinstance(result, dict) else None
+        return "running", str(progress or status or "IN_PROGRESS")
+
     if job.provider == "meshy":
         result = send("poll_meshy_job_status", {"task_id": job.ident, "kind": job.kind})
         status = str(result.get("status", "")).upper() if isinstance(result, dict) else ""
@@ -446,8 +486,11 @@ def poll(send: Send, job: Job) -> tuple[str, Any]:
     return "running", status or "WAIT"
 
 
-def import_result(send: Send, job: Job, detail: Any) -> Any:
-    if job.provider == "meshy" and job.kind == "prm":
+def import_result(send: Send, job: Job, detail: Any, options: dict | None = None) -> Any:
+    if job.provider == "worldlabs":
+        result = send("import_worldlabs_world", {"name": job.name, "job_id": job.ident, "kind": job.kind,
+                                                 **(options or {})})
+    elif job.provider == "meshy" and job.kind == "prm":
         result = send("import_generated_asset_meshy", {"name": job.name, "task_id": job.ident})
     elif job.provider == "meshy":
         result = send("import_generated_asset_meshy", {"name": job.name, "model_url": detail})
@@ -494,8 +537,10 @@ async def wait_and_import(send: Send, job: Job, wait_seconds: float,
                           progress: Progress | None = None,
                           sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
                           clock: Callable[[], float] = time.monotonic,
-                          pending: Pending | None = None) -> tuple[bool, str]:
-    """Poll until done or `wait_seconds` pass. (imported, message).
+                          pending: Pending | None = None,
+                          import_options: dict | None = None) -> tuple[bool, Any]:
+    """Poll until done or `wait_seconds` pass. (imported, the import's reply
+    or the latest status). `import_options` go to the import command.
 
     Once a job is submitted, any error short of the provider saying it failed
     carries the job handle, since the generation may still finish and is paid.
@@ -508,7 +553,7 @@ async def wait_and_import(send: Send, job: Job, wait_seconds: float,
                 _start_refine(send, job, pending)
                 continue
             if state == "done":
-                import_result(send, job, detail)
+                imported = import_result(send, job, detail, import_options)
         except Unsupported:
             raise
         except Exception as e:
@@ -516,7 +561,7 @@ async def wait_and_import(send: Send, job: Job, wait_seconds: float,
         if state == "done":
             if pending:
                 pending.remove(job)
-            return True, job.name
+            return True, imported if job.is_world else job.name
         if state == "failed":
             if pending:
                 pending.remove(job)

@@ -1,5 +1,6 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
 
+import math
 import re
 import textwrap
 import bpy
@@ -31,7 +32,7 @@ from bpy.app.handlers import persistent
 bl_info = {
     "name": "MCP for Blender",
     "author": "Siddharth Ahuja",
-    "version": (1, 8),
+    "version": (2, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > MCP for Blender",
     "description": "Connect Blender to Claude via MCP",
@@ -40,7 +41,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 15
+ADDON_PROTOCOL_VERSION = 16
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -97,6 +98,25 @@ TRIPO_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 TRIPO_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 TRIPO_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
 TRIPO_TIMEOUT = (10, 60)
+
+# World Labs Marble: whole worlds as Gaussian splats, which Blender imports
+# from 5.3 on. Sidebar model id -> label; the id is what the request sends.
+WORLDLABS_API_BASE = "https://api.worldlabs.ai/marble/v1"
+WORLDLABS_DEFAULT_MODEL = "marble-1.1-plus"
+WORLDLABS_MODELS = {
+    "marble-1.1-plus": "Marble 1.1 Plus",
+    "marble-1.1": "Marble 1.1",
+}
+# Premium's model; the Premium server decides, this only names it in replies.
+WORLDLABS_PREMIUM_MODEL = "marble-1.1"
+WORLDLABS_KEY_URL = "https://platform.worldlabs.ai/api-keys"
+WORLDLABS_MIN_BLENDER = (5, 3, 0)
+WORLDLABS_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # World Labs' limit for inline images
+WORLDLABS_MAX_IMAGES = 4
+WORLDLABS_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+WORLDLABS_RESOLUTIONS = ("100k", "500k", "full_res")
+WORLDLABS_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
+WORLDLABS_TIMEOUT = (10, 60)
 
 # Set when the user disconnects so opening another blend file does not restart
 # the server behind their back. A manual connect or add-on reload clears it.
@@ -1367,6 +1387,19 @@ class BlenderMCPServer:
             return None, {"error": f"Unknown Meshy model. Choose one of: {', '.join(MESHY_MODELS)}"}
         return model, None
 
+    def _get_worldlabs_api_key(self):
+        return self._get_config_value(
+            "blendermcp_worldlabs_api_key",
+            "worldlabs_api_key",
+            "BLENDERMCP_WORLDLABS_API_KEY",
+        )
+
+    def _resolve_worldlabs_model(self):
+        """The sidebar's model. One no longer offered (the draft model, saved
+        in an older file) falls back to the default."""
+        model = getattr(bpy.context.scene, "blendermcp_worldlabs_model", WORLDLABS_DEFAULT_MODEL)
+        return (model if model in WORLDLABS_MODELS else WORLDLABS_DEFAULT_MODEL), None
+
     def _get_tripo_api_key(self):
         return self._get_config_value(
             "blendermcp_tripo_api_key",
@@ -1637,6 +1670,7 @@ class BlenderMCPServer:
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
             "get_tripo_status": self.get_tripo_status,
             "get_meshy_status": self.get_meshy_status,
+            "get_worldlabs_status": self.get_worldlabs_status,
             "export_scene": self.export_scene,
         }
 
@@ -1707,6 +1741,16 @@ class BlenderMCPServer:
                 "refine_meshy_job": self.refine_meshy_job,
                 "poll_meshy_job_status": self.poll_meshy_job_status,
                 "import_generated_asset_meshy": self.import_generated_asset_meshy,
+            })
+
+        # World Labs likewise, through Premium or on the user's own key.
+        if getattr(bpy.context.scene, "blendermcp_use_worldlabs", False) and premium_active():
+            handlers.update(premium_worldlabs_handlers())
+        elif getattr(bpy.context.scene, "blendermcp_use_worldlabs", False):
+            handlers.update({
+                "create_worldlabs_job": self.create_worldlabs_job,
+                "poll_worldlabs_job": self.poll_worldlabs_job,
+                "import_worldlabs_world": self.import_worldlabs_world,
             })
 
         handler = handlers.get(cmd_type)
@@ -5607,6 +5651,142 @@ class BlenderMCPServer:
                 shutil.rmtree(temp_dir)
     #endregion
 
+    #region World Labs
+    def get_worldlabs_status(self):
+        """Get the current status of World Labs integration."""
+        enabled = getattr(bpy.context.scene, "blendermcp_use_worldlabs", False)
+        if not worldlabs_supported():
+            return {"enabled": False, "message": worldlabs_needs_blender()}
+        if premium_active():
+            return premium_integration_status("worldlabs", enabled)
+        if not enabled:
+            return {
+                "enabled": False,
+                "message": """World Labs integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under Gaussian Worlds, check World Labs
+                            3. Choose a model and fill in the API Key (from platform.worldlabs.ai)""",
+            }
+        if not self._get_worldlabs_api_key():
+            return {
+                "enabled": False,
+                "message": """World Labs integration is currently enabled, but the API key is not given. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under Gaussian Worlds, keep World Labs checked
+                            3. Fill in the API Key (from platform.worldlabs.ai)""",
+            }
+        model, error = self._resolve_worldlabs_model()
+        if error:
+            return {"enabled": False, "message": error["error"]}
+        choices = ", ".join(f"{label} ({ident})" for ident, label in WORLDLABS_MODELS.items())
+        return {
+            "enabled": True,
+            "model": model,
+            "message": (
+                f"World Labs integration is enabled and ready to use. Model: {WORLDLABS_MODELS[model]}. "
+                f"Sidebar choices: {choices}."
+            ),
+        }
+
+    def _worldlabs_request(self, method, path, body=None):
+        """(payload, None) on success, else (None, {"error": readable message}).
+        Messages come from fixed text or World Labs' reply, never the request,
+        so the key can't leak into them."""
+        api_key = self._get_worldlabs_api_key()
+        if not api_key:
+            return None, {"error": "World Labs API key is not given"}
+        headers = {**WORLDLABS_HEADERS, "WLT-Api-Key": api_key}
+        try:
+            response = requests.request(method, f"{WORLDLABS_API_BASE}{path}", headers=headers, json=body,
+                                        timeout=WORLDLABS_TIMEOUT)
+        except Exception:
+            return None, {"error": "World Labs request failed. Check the internet connection and try again"}
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if response.ok and isinstance(payload, dict):
+            return payload, None
+        if response.status_code == 401:
+            return None, {"error": "World Labs rejected the API key"}
+        if response.status_code == 404:
+            return None, {"error": "World Labs has no such generation; it may have expired"}
+        fallback = {
+            402: ("Out of World Labs API credits. Add some at platform.worldlabs.ai/billing "
+                  "(Marble app credits don't count)"),
+            429: "World Labs rate limit hit, wait a minute and retry",
+        }.get(response.status_code, f"World Labs request failed with status {response.status_code}")
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        return None, {"error": detail if isinstance(detail, str) and detail else fallback}
+
+    def create_worldlabs_job(self, text_prompt=None, image=None, name=None, **_unused):
+        """Start a World Labs world from text, an image or a folder of images,
+        with the sidebar's model."""
+        if not worldlabs_supported():
+            return {"error": worldlabs_needs_blender()}
+        text_prompt = (text_prompt or "").strip()
+        image = (image or "").strip()
+        if bool(text_prompt) == bool(image):
+            return {"error": "Provide either a text prompt or an image, not both"}
+        model, _error = self._resolve_worldlabs_model()
+        try:
+            world_prompt = worldlabs_world_prompt(text_prompt, image)
+        except (OSError, ValueError) as e:
+            return {"error": str(e)}
+        body = {"model": model, "world_prompt": world_prompt}
+        if name:
+            body["display_name"] = str(name)[:64]
+        data, error = self._worldlabs_request("POST", "/worlds:generate", body)
+        if error:
+            return error
+        if not data.get("operation_id"):
+            return {"error": "World Labs response did not include an operation id"}
+        return {"job_id": data["operation_id"], "kind": "op", "model": model}
+
+    def _worldlabs_operation(self, job_id):
+        return self._worldlabs_request("GET", f"/operations/{quote(str(job_id), safe='')}")
+
+    def poll_worldlabs_job(self, job_id=None, kind=None):
+        """Query one World Labs generation. Does not wait; the MCP client polls again."""
+        if not job_id:
+            return {"error": "job_id is required"}
+        if kind == "prm":
+            return {"error": "This World Labs generation was started through Premium. Switch Generation Source "
+                             "back to Premium in the add-on preferences to finish it."}
+        data, error = self._worldlabs_operation(job_id)
+        if error:
+            return error
+        return worldlabs_operation_status(data)
+
+    def import_worldlabs_world(self, name, job_id=None, kind=None, resolution="500k"):
+        """Download a finished World Labs world and build it in the scene."""
+        if not job_id:
+            return {"succeed": False, "error": "job_id is required"}
+        data, error = self._worldlabs_operation(job_id)
+        if error:
+            return {"succeed": False, **error}
+        world = data.get("response") if data.get("done") and not data.get("error") else None
+        if not isinstance(world, dict):
+            return {"succeed": False, "error": "The world isn't finished yet. Poll until SUCCEEDED, then import."}
+        assets = world.get("assets") or {}
+        splats = assets.get("splats") or {}
+        urls = splats.get("spz_urls") or {}
+        resolution = resolution if resolution in WORLDLABS_RESOLUTIONS else "500k"
+        url = urls.get(resolution) or urls.get("500k") or next((u for u in urls.values() if u), None)
+        if not url:
+            return {"succeed": False, "error": "World Labs returned no splat file for this world"}
+        if not urls.get(resolution):
+            resolution = next(res for res, u in urls.items() if u == url)
+        result = import_world_assets(
+            name, url, resolution, splats.get("semantics_metadata"),
+            (assets.get("mesh") or {}).get("collider_mesh_url"),
+            (assets.get("imagery") or {}).get("pano_url"),
+        )
+        if result.get("succeed") and world.get("model"):
+            result["model"] = WORLDLABS_MODELS.get(world["model"], world["model"])
+        return result
+    #endregion
+
 #region Premium
 # Premium is a different key, not a different set of tools. With the Premium
 # toggle on, the Hyper3D, Hunyuan3D and Meshy commands send the same request through
@@ -5730,6 +5910,217 @@ def import_model_files(files, name):
             shutil.rmtree(temp_dir)
 
 
+# --- World Labs worlds, on either key
+
+def worldlabs_supported():
+    """Blender imports Gaussian splats from SPZ files from 5.3 on."""
+    return (bpy.app.version >= WORLDLABS_MIN_BLENDER
+            and bool(getattr(bpy.app.build_options, "io_spz", False)))
+
+
+def worldlabs_needs_blender():
+    return ("World Labs worlds need Blender 5.3 or newer, which imports Gaussian splats; this is Blender "
+            f"{bpy.app.version_string}.")
+
+
+def _image_extension(data):
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data[:4] == b"RIFF":
+        return "webp"
+    return "jpg"
+
+
+def _worldlabs_content(image):
+    """One image as World Labs content: a URL as given, since World Labs
+    fetches it itself, or a local file inline."""
+    if re.match(r"^https?://", image, re.IGNORECASE):
+        return {"source": "uri", "uri": image}
+    if not osp.isfile(image):
+        raise ValueError(f"Image file not found: {image}")
+    if osp.getsize(image) > WORLDLABS_IMAGE_MAX_BYTES:
+        raise ValueError(f"World Labs takes local images up to 10 MB; {image} is larger. "
+                         "Use a smaller image or an image URL.")
+    data = _read_image_file(image)
+    return {"source": "data_base64", "data_base64": base64.b64encode(data).decode("ascii"),
+            "extension": _image_extension(data)}
+
+
+def worldlabs_world_prompt(text_prompt, image):
+    """The world_prompt for text, one image (a panorama is detected), or a
+    folder of up to 4 views spread evenly around the place, first at the front."""
+    if text_prompt:
+        return {"type": "text", "text_prompt": text_prompt}
+    if not osp.isdir(image):
+        return {"type": "image", "image_prompt": _worldlabs_content(image)}
+    paths = sorted(osp.join(image, name) for name in os.listdir(image)
+                   if osp.isfile(osp.join(image, name)) and name.lower().endswith(WORLDLABS_IMAGE_SUFFIXES))
+    if not paths:
+        raise ValueError(f"No PNG, JPEG or WebP images in {image}.")
+    if len(paths) > WORLDLABS_MAX_IMAGES:
+        raise ValueError(f"World Labs takes up to {WORLDLABS_MAX_IMAGES} images; {image} has {len(paths)}.")
+    return {"type": "multi-image", "multi_image_prompt": [
+        {"azimuth": round(index * 360 / len(paths)), "content": _worldlabs_content(path)}
+        for index, path in enumerate(paths)
+    ]}
+
+
+def worldlabs_operation_status(operation):
+    """A World Labs operation as {status, progress | error}."""
+    if operation.get("done"):
+        error = operation.get("error")
+        if error:
+            message = error.get("message") if isinstance(error, dict) else error
+            return {"status": "FAILED", "error": str(message or "World generation failed")}
+        return {"status": "SUCCEEDED"}
+    progress = (operation.get("metadata") or {}).get("progress") or {}
+    return {"status": "IN_PROGRESS", "progress": progress.get("description") or progress.get("status")}
+
+
+def _download_world_file(url, directory, file_name):
+    if not re.match(r"^https?://", str(url or ""), re.IGNORECASE):
+        raise ValueError("Invalid world file URL.")
+    path = osp.join(directory, file_name)
+    response = requests.get(url, headers=WORLDLABS_HEADERS, stream=True, timeout=MODEL_DOWNLOAD_TIMEOUT)
+    response.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=65536):
+            f.write(chunk)
+    return path
+
+
+def _set_world_panorama(path, name):
+    """Make the panorama the background of a new world, leaving the scene's
+    old world in the file. Marble's panorama is centred on the generation
+    viewpoint's forward direction, which is +Y once the world is upright; an
+    environment image's centre faces +X, hence the turn about Z."""
+    image = bpy.data.images.load(path)
+    image.pack()
+    world = bpy.data.worlds.new(f"{name} Sky")
+    with suppress(Exception):
+        world.use_nodes = True
+    tree = world.node_tree
+    if tree is None:
+        raise ValueError("this Blender gave the new world no node tree")
+    nodes = tree.nodes
+    background = next((n for n in nodes if n.type == "BACKGROUND"), None) or nodes.new("ShaderNodeBackground")
+    output = next((n for n in nodes if n.type == "OUTPUT_WORLD"), None) or nodes.new("ShaderNodeOutputWorld")
+    coords = nodes.new("ShaderNodeTexCoord")
+    mapping = nodes.new("ShaderNodeMapping")
+    environment = nodes.new("ShaderNodeTexEnvironment")
+    environment.image = image
+    mapping.inputs["Rotation"].default_value = (0.0, 0.0, -math.pi / 2)
+    tree.links.new(coords.outputs["Generated"], mapping.inputs["Vector"])
+    tree.links.new(mapping.outputs["Vector"], environment.inputs["Vector"])
+    tree.links.new(environment.outputs["Color"], background.inputs["Color"])
+    tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+    bpy.context.scene.world = world
+    return world.name
+
+
+def _world_float(value, default):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def import_world_assets(name, splats_url, resolution, semantics=None, collider_url=None, pano_url=None):
+    """Build a World Labs world in the scene: an empty named `name` parenting
+    the splats and a hidden collision mesh, with the panorama as a new world
+    background.
+
+    Marble files are in raw OpenCV axes (x right, y down, z forward), and
+    Blender's SPZ and glTF importers both read them as Y-up, so each part
+    turns 180 degrees about X as well. World Labs' scale factor and ground
+    offset then put it in metres with the ground at z=0 and the generation
+    viewpoint at (0, 0, offset)."""
+    if not worldlabs_supported():
+        return {"succeed": False, "error": worldlabs_needs_blender()}
+    semantics = semantics if isinstance(semantics, dict) else {}
+    scale = _world_float(semantics.get("metric_scale_factor"), 1.0)
+    scale = scale if scale > 0 else 1.0
+    ground = _world_float(semantics.get("ground_plane_offset"), 0.0)
+    upright = (mathutils.Matrix.Translation((0.0, 0.0, ground))
+               @ mathutils.Matrix.Rotation(math.pi, 4, "X")
+               @ mathutils.Matrix.Scale(scale, 4))
+    notes = []
+    temp_dir = tempfile.mkdtemp(prefix="blendermcp_world_")
+    try:
+        splats_path = _download_world_file(splats_url, temp_dir, "splats.spz")
+        existing = set(bpy.data.objects)
+        try:
+            bpy.ops.wm.spz_import(filepath=splats_path)
+        except RuntimeError:
+            # The importer needs an active window, which a timer may not have.
+            windows = bpy.context.window_manager.windows
+            if not windows:
+                raise
+            with bpy.context.temp_override(window=windows[0]):
+                bpy.ops.wm.spz_import(filepath=splats_path)
+        imported = [obj for obj in set(bpy.data.objects) - existing if obj.type == "POINTCLOUD"]
+        if not imported:
+            raise ValueError("Blender imported no splats from the SPZ file")
+        splats = imported[0]
+        splats.name = f"{name} Splats"
+        with suppress(Exception):
+            splats.data.name = splats.name
+
+        root = bpy.data.objects.new(name, None)
+        root.empty_display_type = "PLAIN_AXES"
+        for collection in splats.users_collection:
+            collection.objects.link(root)
+            break
+        else:
+            bpy.context.scene.collection.objects.link(root)
+
+        def place(obj):
+            basis = obj.matrix_basis.copy()
+            obj.parent = root
+            obj.matrix_parent_inverse.identity()
+            obj.matrix_basis = upright @ basis
+
+        place(splats)
+        collider = None
+        if collider_url:
+            try:
+                collider = _import_mesh_file(_download_world_file(collider_url, temp_dir, "collider.glb"), "glb",
+                                             f"{name} Collider")
+                place(collider)
+                collider.display_type = "WIRE"
+                collider.hide_render = True
+                collider.hide_set(True)
+            except Exception as e:
+                notes.append(f"The collision mesh couldn't be imported ({e}).")
+        background = None
+        if pano_url:
+            try:
+                background = _set_world_panorama(_download_world_file(pano_url, temp_dir, "panorama"), name)
+            except Exception as e:
+                notes.append(f"The panorama couldn't be set as the background ({e}).")
+        bpy.context.view_layer.update()
+        result = {
+            "succeed": True,
+            "name": root.name,
+            "splats": splats.name,
+            "collider": collider.name if collider else None,
+            "background": background,
+            "resolution": resolution,
+            "metric": abs(scale - 1.0) > 1e-6,
+            "viewpoint": [0.0, 0.0, round(ground, 3)],
+            "notes": notes,
+        }
+        if collider:
+            result["world_bounding_box"] = BlenderMCPServer._get_aabb(collider)
+        return result
+    except Exception as e:
+        return {"succeed": False, "error": f"Failed to import the World Labs world: {e}"}
+    finally:
+        with suppress(Exception):
+            shutil.rmtree(temp_dir)
+
+
 # Overridden by BLENDERMCP_PREMIUM_API_URL, so forks can point at their own
 # Supabase project without editing code.
 PREMIUM_API_URL_DEFAULT = "https://dbunjhuejdwwcafedslw.supabase.co/functions/v1/premium"
@@ -5762,6 +6153,7 @@ PREMIUM_INTEGRATIONS = {
     "hyper3d": ("Hyper3D Rodin", "blendermcp_use_hyper3d"),
     "hunyuan3d": ("Hunyuan3D", "blendermcp_use_hunyuan3d"),
     "tripo": ("Tripo", "blendermcp_use_tripo"),
+    "worldlabs": ("World Labs", "blendermcp_use_worldlabs"),
 }
 
 # Last usage summary the server sent. draw() reads only this, never the network.
@@ -5813,7 +6205,7 @@ def premium_enabled_generators():
             return []
         scene = bpy.context.scene
         return [name for name, (_label, prop) in PREMIUM_INTEGRATIONS.items()
-                if getattr(scene, prop, False)]
+                if getattr(scene, prop, False) and (name != "worldlabs" or worldlabs_supported())]
     except Exception:
         return []
 
@@ -5938,7 +6330,8 @@ def _premium_quality(model, quality, from_image):
 
 
 def premium_integration_status(integration, enabled):
-    """Reply for get_hyper3d_status / get_hunyuan3d_status / get_tripo_status / get_meshy_status."""
+    """Reply for get_hyper3d_status / get_hunyuan3d_status / get_tripo_status / get_meshy_status /
+    get_worldlabs_status."""
     label, prop = PREMIUM_INTEGRATIONS[integration]
     if not enabled:
         return {"enabled": False, "mode": "PREMIUM", "message": (
@@ -5962,6 +6355,8 @@ def premium_integration_status(integration, enabled):
         "tripo": "Mode: PREMIUM. From an image, Tripo is high-quality only. " + quality,
         "meshy": ("Mode: PREMIUM. Meshy uses its latest model and every generation counts as standard "
                   "quality. Models arrive at real-world size with their origin at the bottom."),
+        "worldlabs": ("Mode: PREMIUM. Every world is Marble 1.1 and uses a high-quality generation (Pro and "
+                      "up). One image or a text prompt per world."),
     }[integration]
     return {"enabled": True, "mode": "PREMIUM", "message": f"{summary}. {flow}"}
 
@@ -6189,6 +6584,78 @@ def premium_meshy_handlers():
         "create_meshy_job": premium_create_meshy_job,
         "poll_meshy_job_status": premium_poll_meshy_job,
         "import_generated_asset_meshy": premium_import_meshy,
+    }
+
+
+# World Labs: the same {status, progress | error} replies as on the user's own
+# key. The Premium server lists the world's files, each splat file with the
+# world's scale metadata, and "prm" tells these jobs apart.
+
+_PREMIUM_WORLD_STATUS = {"succeeded": "SUCCEEDED", "failed": "FAILED"}
+
+
+def premium_create_worldlabs_job(text_prompt=None, image=None, name=None, **_unused):
+    if not worldlabs_supported():
+        return {"error": worldlabs_needs_blender()}
+    if _premium_high_locked():
+        return premium_error("NOT_IN_PLAN", "Gaussian worlds use high-quality generations, which are included in "
+                                            "Premium Pro and up. Upgrade, or use your own World Labs API key.")
+    if image and osp.isdir(str(image)):
+        return {"error": "Through Premium, World Labs takes one image, not a folder. Pass one image, or use "
+                         "your own World Labs API key for several views."}
+    result = premium_create_job("worldlabs", "high", text_prompt=text_prompt, image=image)
+    if not result.get("job_id"):
+        return result
+    return {"job_id": result["job_id"], "kind": "prm", "message": premium_summary()}
+
+
+def premium_poll_worldlabs_job(job_id=None, kind=None):
+    if not job_id:
+        return {"error": "job_id is required"}
+    if kind != "prm":
+        return {"error": "This World Labs generation was started with your own World Labs API key. Switch "
+                         "Generation Source back to Your own API keys in the add-on preferences to finish it."}
+    job = _premium_job(job_id)
+    if job.get("code") or "status" not in job:
+        return job
+    reply = {"status": _PREMIUM_WORLD_STATUS.get(job["status"], "IN_PROGRESS")}
+    if job["status"] == "failed":
+        reply["error"] = (job.get("error") or "Generation failed") + ". This attempt wasn't counted."
+    elif job.get("provider_status"):
+        reply["progress"] = job["provider_status"]
+    return reply
+
+
+def premium_import_worldlabs(name, job_id=None, kind=None, resolution="500k"):
+    if not job_id:
+        return {"succeed": False, "error": "job_id is required"}
+    job = _premium_job(job_id)
+    if job.get("code"):
+        return {"succeed": False, **job}
+    files = job.get("files") or []
+    if job.get("status") != "succeeded" or not files:
+        return {"succeed": False, "error": "The world isn't finished yet. Poll until SUCCEEDED, then import."}
+    splats = [f for f in files if isinstance(f, dict) and f.get("role") == "splats" and f.get("url")]
+    chosen = (next((f for f in splats if f.get("resolution") == resolution), None)
+              or next((f for f in splats if f.get("resolution") == "500k"), None)
+              or (splats[0] if splats else None))
+    if not chosen:
+        return {"succeed": False, "error": "The Premium server returned no splat file for this world"}
+    collider = next((f.get("url") for f in files if isinstance(f, dict) and f.get("role") == "collider"), None)
+    pano = next((f.get("url") for f in files if isinstance(f, dict) and f.get("role") == "panorama"), None)
+    result = import_world_assets(name, chosen["url"], chosen.get("resolution") or resolution,
+                                 chosen.get("metadata"), collider, pano)
+    if result.get("succeed"):
+        result["model"] = WORLDLABS_MODELS[WORLDLABS_PREMIUM_MODEL]
+    return result
+
+
+def premium_worldlabs_handlers():
+    """World Labs commands in Premium mode; the caller checks the checkbox."""
+    return {
+        "create_worldlabs_job": premium_create_worldlabs_job,
+        "poll_worldlabs_job": premium_poll_worldlabs_job,
+        "import_worldlabs_world": premium_import_worldlabs,
     }
 
 
@@ -6453,7 +6920,8 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         name="Generation Source",
         description="Where 3D model generation runs",
         items=[
-            ("BYOK", "Your own API keys", "Use your own Hyper3D, fal.ai, Tripo, Meshy or Tencent Cloud keys"),
+            ("BYOK", "Your own API keys",
+             "Use your own Hyper3D, fal.ai, Tripo, Meshy, World Labs or Tencent Cloud keys"),
             ("PREMIUM", "Premium", "Generate through MCP for Blender Premium with one license key"),
         ],
         default="BYOK",
@@ -6495,6 +6963,12 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         name="Meshy API Key",
         subtype="PASSWORD",
         description="Persistent Meshy API Key",
+        default=""
+    )
+    worldlabs_api_key: bpy.props.StringProperty(
+        name="World Labs API Key",
+        subtype="PASSWORD",
+        description="Persistent World Labs API Key",
         default=""
     )
 
@@ -6565,6 +7039,9 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
             col.separator()
             col.prop(self, "meshy_api_key", text="Meshy API Key")
             col.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
+            col.separator()
+            col.prop(self, "worldlabs_api_key", text="World Labs API Key")
+            col.operator("wm.url_open", text="World Labs keys", icon='URL').url = WORLDLABS_KEY_URL
 
         layout.separator()
         layout.label(text="Persistent API Credentials:", icon='LOCKED')
@@ -6719,6 +7196,30 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             else:
                 col.prop(scene, "blendermcp_meshy_api_key", text="API Key")
             sub.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
+
+        # Gaussian worlds
+        layout.separator()
+        layout.label(text="Gaussian Worlds", icon='WORLD')
+        if not worldlabs_supported():
+            # Splats need Blender 5.3, so show the option but don't offer it.
+            box = layout.box()
+            row = box.row()
+            row.enabled = False
+            row.prop(scene, "blendermcp_use_worldlabs", text="")
+            row.label(text="World Labs", icon='WORLD')
+            box.label(text="Needs Blender 5.3 or newer", icon='INFO')
+        else:
+            sub = self._integration_header(layout, scene, "blendermcp_use_worldlabs", "World Labs", 'WORLD')
+            if sub and premium:
+                sub.label(text="Runs through Premium")
+            elif sub:
+                col = sub.column(align=True)
+                col.prop(scene, "blendermcp_worldlabs_model", text="Model")
+                if prefs:
+                    col.prop(prefs, "worldlabs_api_key", text="API Key")
+                else:
+                    col.prop(scene, "blendermcp_worldlabs_api_key", text="API Key")
+                sub.operator("wm.url_open", text="World Labs keys", icon='URL').url = WORLDLABS_KEY_URL
 
         # Community section
         layout.separator()
@@ -7170,6 +7671,26 @@ def register():
         default="",
     )
 
+    bpy.types.Scene.blendermcp_use_worldlabs = bpy.props.BoolProperty(
+        name="Use World Labs",
+        description="Enable World Labs world generation (needs Blender 5.3 or newer)",
+        default=False,
+    )
+
+    bpy.types.Scene.blendermcp_worldlabs_model = bpy.props.EnumProperty(
+        name="World Labs Model",
+        description="World Labs model used for each world",
+        items=[(ident, label, f"{label} model") for ident, label in WORLDLABS_MODELS.items()],
+        default=WORLDLABS_DEFAULT_MODEL,
+    )
+
+    bpy.types.Scene.blendermcp_worldlabs_api_key = bpy.props.StringProperty(
+        name="World Labs API Key",
+        subtype="PASSWORD",
+        description="API Key provided by World Labs",
+        default="",
+    )
+
     bpy.types.Scene.blendermcp_use_polypizza = bpy.props.BoolProperty(
         name="Use Poly Pizza",
         description="Enable Poly Pizza asset integration",
@@ -7245,6 +7766,9 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_meshy
     del bpy.types.Scene.blendermcp_meshy_model
     del bpy.types.Scene.blendermcp_meshy_api_key
+    del bpy.types.Scene.blendermcp_use_worldlabs
+    del bpy.types.Scene.blendermcp_worldlabs_model
+    del bpy.types.Scene.blendermcp_worldlabs_api_key
     del bpy.types.Scene.blendermcp_use_polypizza
     del bpy.types.Scene.blendermcp_polypizza_api_key
     del bpy.types.Scene.blendermcp_use_hunyuan3d
