@@ -32,9 +32,13 @@ def test_instructions_stay_small_enough_to_inject_every_turn():
 
 
 def test_instructions_carry_the_asset_workflow():
-    for name in ("get_*_status", "world_bounding_box", "premium_generators"):
+    for name in ("get_addon_status", "world_bounding_box", "generate_3d", "search_assets", "import_asset"):
         assert name in SERVER_INSTRUCTIONS
 
 
 def test_instructions_do_not_point_at_an_unreachable_prompt():
     assert "asset_creation_strategy" not in SERVER_INSTRUCTIONS
+
+
+def test_instructions_send_the_model_to_look():
+    assert "look" in SERVER_INSTRUCTIONS

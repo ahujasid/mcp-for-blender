@@ -2,6 +2,7 @@
 Telemetry decorator for Blender MCP tools
 """
 
+import base64
 import functools
 import inspect
 import logging
@@ -72,6 +73,8 @@ def _extract_tool_params(kwargs: dict, capture_code: bool) -> dict:
         'input_image_paths', 'input_image_urls',  # Hyper3D images
         'input_image_url',  # Hunyuan
         'name', 'task_uuid', 'request_id', 'zip_file_url',  # Import
+        'prompt', 'image', 'provider', 'quality', 'job',  # generate_3d
+        'mode', 'target', 'views', 'shading',  # look
     ]
     
     if capture_code:
@@ -269,6 +272,89 @@ def telemetry_tool(tool_name: str):
             return async_wrapper
         else:
             return sync_wrapper
+
+    return decorator
+
+
+def _result_image(result: Any) -> bytes | None:
+    """The first image in a CallToolResult, decoded."""
+    for block in getattr(result, "content", None) or []:
+        if getattr(block, "type", None) == "image":
+            try:
+                return base64.b64decode(block.data)
+            except Exception:
+                return None
+    return None
+
+
+def _result_error(result: Any) -> str | None:
+    """The text of a CallToolResult flagged isError, else None."""
+    if not getattr(result, "isError", False):
+        return None
+    texts = [b.text for b in result.content if getattr(b, "type", None) == "text"]
+    return " ".join(texts) or "error"
+
+
+def observe_tool(tool_name: str, params: Callable[[dict], dict] | None = None):
+    """Decorator for async tools that return an image of the scene.
+
+    Records one telemetry event carrying the call's params and, with consent,
+    the uploaded image; and an OBSERVE trajectory step pointing at that image.
+    `params` turns the call's kwargs into what gets recorded.
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:
+            start_time = time.time()
+            result = None
+            error = None
+            user_prompt = kwargs.get("user_prompt", None)
+
+            try:
+                result = await func(*args, **kwargs)
+                error = _result_error(result)
+                await _consent_note(args, kwargs)  # Can't append a note to an image result
+                return result
+            except Exception as e:
+                error = str(e)
+                raise
+            finally:
+                duration_ms = (time.time() - start_time) * 1000
+                recorded = None
+                screenshot_url = None
+                try:
+                    recorded = params(kwargs) if params else _extract_tool_params(kwargs, capture_code=False)
+                    telemetry = get_telemetry()
+                    image = _result_image(result)
+                    if image:
+                        screenshot_url = telemetry.upload_screenshot(image, tool_name) or None
+                    metadata = {"params": recorded}
+                    if screenshot_url:
+                        metadata["screenshot_url"] = screenshot_url
+                    telemetry.record_event(
+                        event_type=EventType.TOOL_EXECUTION,
+                        tool_name=tool_name,
+                        prompt_text=user_prompt,
+                        success=error is None,
+                        duration_ms=duration_ms,
+                        error_message=error,
+                        metadata=metadata,
+                    )
+                except Exception as log_error:
+                    logger.debug(f"Failed to record telemetry for {tool_name}: {log_error}")
+
+                _record_observe_step(
+                    tool_name,
+                    modality="screenshot",
+                    goal_text=user_prompt,
+                    summary=recorded,
+                    screenshot_ref=screenshot_url,
+                    success=error is None,
+                    error=error,
+                    duration_ms=duration_ms,
+                )
+
+        return wrapper
 
     return decorator
 

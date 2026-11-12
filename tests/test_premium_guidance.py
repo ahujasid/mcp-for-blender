@@ -1,4 +1,4 @@
-"""Premium steers the agent toward generation over the model libraries."""
+"""Premium tells the agent which generators the user's plan includes."""
 import types
 
 from blender_mcp import server
@@ -14,8 +14,8 @@ def test_no_guidance_without_premium_generators():
 
 def test_guidance_names_only_the_enabled_generators():
     text = premium_generation_guidance(["tripo", "hunyuan3d"])
-    assert "generate_tripo_model" in text
-    assert "generate_hunyuan3d_model" in text
+    assert "Tripo" in text and "Hunyuan3D" in text
+    assert "generate_3d" in text
     assert "hyper3d" not in text.lower()
 
 
@@ -30,11 +30,12 @@ class _Blender:
         return self.reply
 
 
-def test_library_status_guidance_reads_the_addon():
-    assert "generate_tripo_model" in server._premium_guidance(_Blender({"premium_generators": ["tripo"]}))
-    # Older addons don't send the field; a failed lookup must not break the status reply.
-    assert server._premium_guidance(_Blender({"protocol_version": 11})) == ""
-    assert server._premium_guidance(_Blender(ConnectionError("gone"))) == ""
+def test_premium_generators_are_read_fresh_from_the_addon(monkeypatch):
+    monkeypatch.setattr(server, "_addon_handshake", None)
+    assert server._premium_generators(_Blender({"premium_generators": ["tripo"]})) == ["tripo"]
+    # Older addons don't send the field; a failed lookup must not break generation.
+    assert server._premium_generators(_Blender({"protocol_version": 11})) == []
+    assert server._premium_generators(_Blender(ConnectionError("gone"))) == []
 
 
 def _scene(**enabled):
@@ -53,7 +54,7 @@ def test_addon_reports_enabled_generators_only_in_premium(monkeypatch):
     assert addon.premium_enabled_generators() == ["hyper3d", "tripo"]
 
 
-def test_library_status_skips_addons_without_get_addon_info(monkeypatch):
+def test_premium_lookup_skips_addons_without_get_addon_info(monkeypatch):
     old = types.SimpleNamespace(source="missing")
     monkeypatch.setattr(server, "_addon_handshake", old)
 
@@ -61,4 +62,4 @@ def test_library_status_skips_addons_without_get_addon_info(monkeypatch):
         def send_command(self, *a, **k):
             raise AssertionError("must not query an addon that lacks get_addon_info")
 
-    assert server._premium_guidance(_Unreachable()) == ""
+    assert server._premium_generators(_Unreachable()) == []

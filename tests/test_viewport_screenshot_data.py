@@ -4,7 +4,7 @@ The server used to pick a temp path, have Blender save the PNG there and read
 it back. That only works when both share a filesystem: with the server in
 Docker and Blender on Windows, Blender writes C:\\tmp\\blender_screenshot_1.png,
 answers success, and the server finds nothing at /tmp/blender_screenshot_1.png.
-Protocol 14 addons send the bytes back instead; older ones keep the path.
+Protocol 17 addons send the bytes back instead; older ones keep the path.
 """
 import base64
 import importlib.util
@@ -37,7 +37,7 @@ def _connect(monkeypatch, protocol, reply):
 
 def test_image_comes_back_over_the_socket(monkeypatch):
     encoded = base64.b64encode(PNG).decode("ascii")
-    sent = _connect(monkeypatch, 14, lambda _params: {"success": True, "width": 4, "image_data": encoded})
+    sent = _connect(monkeypatch, 17, lambda _params: {"success": True, "width": 4, "image_data": encoded})
 
     png, info = server._capture_viewport(800)
 
@@ -47,20 +47,20 @@ def test_image_comes_back_over_the_socket(monkeypatch):
 
 
 def test_missing_image_data_is_an_error(monkeypatch):
-    _connect(monkeypatch, 14, lambda _params: {"success": True})
+    _connect(monkeypatch, 17, lambda _params: {"success": True})
 
     with pytest.raises(Exception, match="Screenshot data was not returned"):
         server._capture_viewport(800)
 
 
 def test_addon_error_is_raised(monkeypatch):
-    _connect(monkeypatch, 14, lambda _params: {"error": "No 3D viewport found"})
+    _connect(monkeypatch, 17, lambda _params: {"error": "No 3D viewport found"})
 
     with pytest.raises(Exception, match="No 3D viewport found"):
         server._capture_viewport(800)
 
 
-@pytest.mark.parametrize("protocol", [None, 13])
+@pytest.mark.parametrize("protocol", [None, 16])
 def test_older_addons_still_write_to_a_path(monkeypatch, protocol):
     def reply(params):
         with open(params["filepath"], "wb") as fh:

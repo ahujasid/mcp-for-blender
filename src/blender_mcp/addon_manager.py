@@ -20,11 +20,12 @@ from pathlib import Path
 logger = logging.getLogger("BlenderMCPServer")
 
 # Must match ADDON_PROTOCOL_VERSION in addon.py / bundled/addon.py
-EXPECTED_ADDON_PROTOCOL_VERSION = 14
+EXPECTED_ADDON_PROTOCOL_VERSION = 17
 
 _ADDON_MARKER = 'bl_info = {\n    "name": "MCP for Blender"'
 _INSTALLED_FILENAME = "blender_mcp.py"
 _PROTOCOL_RE = re.compile(r"ADDON_PROTOCOL_VERSION\s*=\s*(\d+)")
+_BL_INFO_VERSION_RE = re.compile(r'"version":\s*\((\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)')
 # Matches the current name and the pre-rename "Blender MCP" so install-addon
 # still replaces installs from older releases.
 _BL_INFO_NAME_RE = re.compile(
@@ -364,6 +365,84 @@ def install_addon(
     )
 
 
+def addon_release_key(text: str) -> tuple[int, int, int, int] | None:
+    """(major, minor, patch, protocol) of an addon file's text; mirrors addon.py's own."""
+    bl_info_at = text.find("bl_info = {")
+    if bl_info_at < 0:
+        return None
+    version = _BL_INFO_VERSION_RE.search(text, bl_info_at)
+    protocol = _PROTOCOL_RE.search(text)
+    if not version or not protocol:
+        return None
+    return (
+        int(version.group(1)),
+        int(version.group(2)),
+        int(version.group(3) or 0),
+        int(protocol.group(1)),
+    )
+
+
+def addon_version_label(key: tuple[int, int, int, int] | None) -> str:
+    if key is None:
+        return "an older release"
+    major, minor, patch, _protocol = key
+    return f"{major}.{minor}.{patch}" if patch else f"{major}.{minor}"
+
+
+@dataclass
+class AddonUpdate:
+    path: Path
+    # updated | current | newer | failed (dry runs report updated without writing)
+    action: str
+    installed: tuple[int, int, int, int] | None
+    detail: str = ""
+
+
+def update_installed_addons(
+    addons_dirs: list[Path] | None = None,
+    *,
+    dry_run: bool = False,
+) -> list[AddonUpdate]:
+    """Bring every installed copy of the addon up to the bundled release, in place.
+
+    Unlike install_addon, this writes only over files that already exist, and
+    never downgrades: the addon's own updater pulls from the main branch, so an
+    installed copy can be ahead of the release this package bundles. A copy at
+    the same release but with different bytes is left alone too, since the
+    difference is someone's local edit.
+    """
+    source = get_bundled_addon_path()
+    source_bytes = source.read_bytes()
+    bundled = addon_release_key(source_bytes.decode("utf-8", errors="ignore"))
+
+    results: list[AddonUpdate] = []
+    for path in find_existing_addon_installs(addons_dirs):
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            results.append(AddonUpdate(path, "failed", None, str(e)))
+            continue
+        installed = addon_release_key(data.decode("utf-8", errors="ignore"))
+        if data == source_bytes:
+            results.append(AddonUpdate(path, "current", installed))
+            continue
+        # A file without a readable key passed the bl_info name check, so it is
+        # the addon from before versions were stamped (or the old "Blender MCP").
+        if installed is not None and bundled is not None and installed >= bundled:
+            action = "newer" if installed > bundled else "current"
+            results.append(AddonUpdate(path, action, installed))
+            continue
+        if not dry_run:
+            try:
+                _backup_addon_file(path, source)
+                shutil.copy2(source, path)
+            except OSError as e:
+                results.append(AddonUpdate(path, "failed", installed, str(e)))
+                continue
+        results.append(AddonUpdate(path, "updated", installed))
+    return results
+
+
 def handshake_addon(blender_connection) -> AddonHandshake:
     """
     Query a connected Blender addon for protocol version.
@@ -452,7 +531,7 @@ def format_handshake_log(result: AddonHandshake) -> str:
 
 
 def run_cli(argv: list[str] | None = None) -> int:
-    """CLI entry for install-addon / addon-paths / setup. Returns process exit code."""
+    """CLI entry for install-addon / addon-paths / setup / update. Returns process exit code."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -501,7 +580,18 @@ def run_cli(argv: list[str] | None = None) -> int:
     setup_p.add_argument("--yes", "-y", action="store_true", help="Configure every client found without asking")
     setup_p.add_argument("--skip-addon", action="store_true", help="Configure clients only; leave Blender alone")
 
+    update_p = sub.add_parser(
+        "update",
+        help="Update the MCP server and the installed Blender addon to the latest release",
+    )
+    update_p.add_argument("--dry-run", action="store_true", help="Show what would change without changing anything")
+
     args = parser.parse_args(argv)
+
+    if args.command == "update":
+        from .update_cli import run_update
+
+        return run_update(dry_run=args.dry_run)
 
     if args.command == "setup":
         from .setup_cli import run_setup

@@ -1,5 +1,6 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
 
+import math
 import re
 import textwrap
 import bpy
@@ -7,6 +8,7 @@ import mathutils
 import json
 import threading
 import socket
+import ipaddress
 import queue
 import time
 import requests
@@ -23,14 +25,14 @@ from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
 from collections import deque
-from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
 bl_info = {
     "name": "MCP for Blender",
     "author": "Siddharth Ahuja",
-    "version": (1, 8),
+    "version": (2, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > MCP for Blender",
     "description": "Connect Blender to Claude via MCP",
@@ -39,7 +41,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 14
+ADDON_PROTOCOL_VERSION = 17
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -57,9 +59,85 @@ DISCORD_URL = "https://discord.gg/SNqPn4TcKQ"
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
 
+# Meshy, with the user's own key. Sidebar model id -> label; the id is what
+# the request sends. Text runs as a preview task, then one refine task.
+MESHY_API_BASE = "https://api.meshy.ai/openapi"
+MESHY_DEFAULT_MODEL = "latest"
+MESHY_MODELS = {
+    "latest": "Meshy 7.1",
+    "meshy-6": "Meshy 6",
+}
+MESHY_KEY_URL = ("https://www.meshy.ai/developers/keys"
+                 "?utm_source=mcp-for-blender&utm_medium=integration&utm_campaign=blender-addon")
+MESHY_PROMPT_MAX = 800
+MESHY_POSES = ("a-pose", "t-pose")
+MESHY_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+MESHY_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+# Every task: GLB only, sized to real-world height, origin at the bottom.
+MESHY_OUTPUT = {"target_formats": ["glb"], "auto_size": True, "origin_at": "bottom"}
+MESHY_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
+MESHY_TIMEOUT = (10, 60)
+# Preview task id -> refine task id. Blender runs commands one at a time, so
+# this is where a repeated refine request (after the MCP side lost the reply to
+# a socket timeout, or from a second MCP server) gets the refine already paid for.
+_meshy_refines = {}
+
+# Tripo, with the user's own key. Sidebar model id -> label; the id is what
+# the request sends. Text and image are each one task.
+TRIPO_DOMAINS = [
+    ("ai", ".ai", "Use the international Tripo API and developer portal"),
+    ("com", ".com", "Use the CN Tripo API and developer portal"),
+]
+TRIPO_DEFAULT_MODEL = "v3.1-20260211"
+TRIPO_MODELS = {
+    "v3.1-20260211": "H3.1",
+    "P2-20260801": "P2.0",
+}
+TRIPO_PROMPT_MAX = 1024
+TRIPO_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+TRIPO_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+TRIPO_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
+TRIPO_TIMEOUT = (10, 60)
+
+# World Labs Marble: whole worlds as Gaussian splats, which Blender imports
+# from 5.3 on. Sidebar model id -> label; the id is what the request sends.
+WORLDLABS_API_BASE = "https://api.worldlabs.ai/marble/v1"
+WORLDLABS_DEFAULT_MODEL = "marble-1.1-plus"
+WORLDLABS_MODELS = {
+    "marble-1.1-plus": "Marble 1.1 Plus",
+    "marble-1.1": "Marble 1.1",
+}
+# Premium's model; the Premium server decides, this only names it in replies.
+WORLDLABS_PREMIUM_MODEL = "marble-1.1"
+WORLDLABS_KEY_URL = "https://platform.worldlabs.ai/api-keys"
+WORLDLABS_MIN_BLENDER = (5, 3, 0)
+WORLDLABS_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # World Labs' limit for inline images
+WORLDLABS_MAX_IMAGES = 4
+WORLDLABS_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+WORLDLABS_RESOLUTIONS = ("100k", "500k", "full_res")
+WORLDLABS_HEADERS = {"User-Agent": "mcp-for-blender/" + ".".join(str(part) for part in bl_info["version"])}
+WORLDLABS_TIMEOUT = (10, 60)
+
 # Set when the user disconnects so opening another blend file does not restart
 # the server behind their back. A manual connect or add-on reload clears it.
 _user_stopped_server = False
+
+
+def _blendermcp_bind_address(context=None):
+    """Read persistent listener settings, requiring opt-in beyond loopback."""
+    prefs = get_blendermcp_addon_preferences(context)
+    host = getattr(prefs, "bind_address", "localhost").strip()
+    if host.lower() == "localhost":
+        return "localhost"
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("Bind Address must be localhost or an IPv4 address") from exc
+    if not address.is_loopback and not getattr(prefs, "allow_remote_connections", False):
+        raise ValueError(
+            "Non-loopback binding requires Allow Remote Connections in add-on preferences"
+        )
+    return str(address)
 
 
 def _blendermcp_port_has_listener(host, port):
@@ -67,7 +145,9 @@ def _blendermcp_port_has_listener(host, port):
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.settimeout(0.15)
     try:
-        return probe.connect_ex((host, port)) == 0
+        # A wildcard is a listening address, not a portable connect target.
+        probe_host = "127.0.0.1" if host == "0.0.0.0" else host
+        return probe.connect_ex((probe_host, port)) == 0
     finally:
         probe.close()
 
@@ -90,18 +170,31 @@ def _blendermcp_ensure_server_running():
         scene.blendermcp_server_running = bool(server is not None and server.running)
         return None
 
+    if server is not None and server.running:
+        scene.blendermcp_server_running = True
+        return None
+
+    try:
+        host = _blendermcp_bind_address()
+    except ValueError as exc:
+        scene.blendermcp_server_running = False
+        print(f"BlenderMCP: auto-start skipped: {exc}")
+        return None
+
     port = scene.blendermcp_port
     if server is None:
-        if _blendermcp_port_has_listener("localhost", port):
+        if _blendermcp_port_has_listener(host, port):
             scene.blendermcp_server_running = False
-            print(f"BlenderMCP: port {port} is already in use; auto-start skipped.")
+            print(f"BlenderMCP: {host}:{port} is already in use; auto-start skipped.")
             return None
-        server = BlenderMCPServer(port=port)
+        server = BlenderMCPServer(host=host, port=port)
         bpy.types.blendermcp_server = server
 
     if not server.running:
         # Safe while stopped and necessary when a newly loaded scene selects a
-        # different port. Never retarget an active connection.
+        # different port or the preferences select a different bind address.
+        # Never retarget an active connection.
+        server.host = host
         server.port = port
         server.start()
 
@@ -1134,6 +1227,21 @@ def get_blendermcp_addon_preferences(context=None):
     addon = context.preferences.addons.get(__name__)
     return addon.preferences if addon else None
 
+
+def tripo_endpoints(context=None, preferences=None):
+    """Resolve the same domain for the sidebar, developer links and API calls."""
+    context = context or bpy.context
+    prefs = preferences if preferences is not None else get_blendermcp_addon_preferences(context)
+    domain = (getattr(prefs, "tripo_domain", "ai") if prefs is not None else
+              getattr(context.scene, "blendermcp_tripo_domain", "ai"))
+    domain = domain if domain in ("ai", "com") else "ai"
+    portal = f"https://developers.tripo3d.{domain}/{'zh' if domain == 'com' else 'en'}"
+    return {
+        "domain": domain,
+        "api": f"https://openapi.tripo3d.{domain}/v3",
+        "keys": f"{portal}/keys",
+    }
+
 # Tencent Cloud exposes Hunyuan-to-3D through two different services depending on where the
 # account was created. Mainland accounts (cloud.tencent.com) use the AI3D 3.0 API. Tencent Cloud
 # International accounts (tencentcloud.com) use the "Hunyuan-to-3D (Professional)" service on the
@@ -1216,16 +1324,20 @@ class BlenderMCPServer:
         return ""
 
     def _get_hyper3d_api_key(self):
-        # Let the free-trial button temporarily override persistent keys
-        # without overwriting user-saved private keys.
+        # The trial key is only valid on the main site. Keep a session trial
+        # override from masking a saved private fal.ai key after switching modes.
+        main_site = bpy.context.scene.blendermcp_hyper3d_mode == 'MAIN_SITE'
         scene_value = getattr(bpy.context.scene, "blendermcp_hyper3d_api_key", "")
-        if scene_value == RODIN_FREE_TRIAL_KEY:
+        if main_site and scene_value == RODIN_FREE_TRIAL_KEY:
             return scene_value
-        return self._get_config_value(
+        api_key = self._get_config_value(
             "blendermcp_hyper3d_api_key",
             "hyper3d_api_key",
             "BLENDERMCP_HYPER3D_API_KEY",
         )
+        if not main_site and api_key == RODIN_FREE_TRIAL_KEY:
+            return ""
+        return api_key
 
     def _get_sketchfab_api_key(self):
         return self._get_config_value(
@@ -1261,6 +1373,45 @@ class BlenderMCPServer:
             "hunyuan3d_api_url",
             "BLENDERMCP_HUNYUAN3D_API_URL",
         ) or "http://localhost:8081"
+
+    def _get_meshy_api_key(self):
+        return self._get_config_value(
+            "blendermcp_meshy_api_key",
+            "meshy_api_key",
+            "BLENDERMCP_MESHY_API_KEY",
+        )
+
+    def _resolve_meshy_model(self):
+        model = getattr(bpy.context.scene, "blendermcp_meshy_model", MESHY_DEFAULT_MODEL) or MESHY_DEFAULT_MODEL
+        if model not in MESHY_MODELS:
+            return None, {"error": f"Unknown Meshy model. Choose one of: {', '.join(MESHY_MODELS)}"}
+        return model, None
+
+    def _get_worldlabs_api_key(self):
+        return self._get_config_value(
+            "blendermcp_worldlabs_api_key",
+            "worldlabs_api_key",
+            "BLENDERMCP_WORLDLABS_API_KEY",
+        )
+
+    def _resolve_worldlabs_model(self):
+        """The sidebar's model. One no longer offered (the draft model, saved
+        in an older file) falls back to the default."""
+        model = getattr(bpy.context.scene, "blendermcp_worldlabs_model", WORLDLABS_DEFAULT_MODEL)
+        return (model if model in WORLDLABS_MODELS else WORLDLABS_DEFAULT_MODEL), None
+
+    def _get_tripo_api_key(self):
+        return self._get_config_value(
+            "blendermcp_tripo_api_key",
+            "tripo_api_key",
+            "BLENDERMCP_TRIPO_API_KEY",
+        )
+
+    def _resolve_tripo_model(self):
+        model = getattr(bpy.context.scene, "blendermcp_tripo_model", TRIPO_DEFAULT_MODEL) or TRIPO_DEFAULT_MODEL
+        if model not in TRIPO_MODELS:
+            return None, {"error": f"Unknown Tripo model. Choose one of: {', '.join(TRIPO_MODELS)}"}
+        return model, None
 
     def start(self):
         if bpy.app.background:
@@ -1517,7 +1668,9 @@ class BlenderMCPServer:
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_polypizza_status": self.get_polypizza_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
-            "get_tripo_status": premium_tripo_status,
+            "get_tripo_status": self.get_tripo_status,
+            "get_meshy_status": self.get_meshy_status,
+            "get_worldlabs_status": self.get_worldlabs_status,
             "export_scene": self.export_scene,
         }
 
@@ -1567,8 +1720,38 @@ class BlenderMCPServer:
             }
             handlers.update(hunyuan_handlers)
 
-        # Tripo is only offered through Premium
-        handlers.update(premium_tripo_handlers())
+        # Tripo runs through Premium when it's the generation source, else on
+        # the user's own key. getattr so scenes from before Tripo still dispatch.
+        if getattr(bpy.context.scene, "blendermcp_use_tripo", False) and premium_active():
+            handlers.update(premium_tripo_handlers())
+        elif getattr(bpy.context.scene, "blendermcp_use_tripo", False):
+            handlers.update({
+                "create_tripo_job": self.create_tripo_job,
+                "poll_tripo_job_status": self.poll_tripo_job_status,
+                "import_generated_asset_tripo": self.import_generated_asset_tripo,
+            })
+
+        # Meshy runs through Premium when it's the generation source, else on
+        # the user's own key. getattr so scenes from before Meshy still dispatch.
+        if getattr(bpy.context.scene, "blendermcp_use_meshy", False) and premium_active():
+            handlers.update(premium_meshy_handlers())
+        elif getattr(bpy.context.scene, "blendermcp_use_meshy", False):
+            handlers.update({
+                "create_meshy_job": self.create_meshy_job,
+                "refine_meshy_job": self.refine_meshy_job,
+                "poll_meshy_job_status": self.poll_meshy_job_status,
+                "import_generated_asset_meshy": self.import_generated_asset_meshy,
+            })
+
+        # World Labs likewise, through Premium or on the user's own key.
+        if getattr(bpy.context.scene, "blendermcp_use_worldlabs", False) and premium_active():
+            handlers.update(premium_worldlabs_handlers())
+        elif getattr(bpy.context.scene, "blendermcp_use_worldlabs", False):
+            handlers.update({
+                "create_worldlabs_job": self.create_worldlabs_job,
+                "poll_worldlabs_job": self.poll_worldlabs_job,
+                "import_worldlabs_world": self.import_worldlabs_world,
+            })
 
         handler = handlers.get(cmd_type)
         if handler:
@@ -3521,7 +3704,7 @@ class BlenderMCPServer:
             """Call Rodin API, get the job uuid and subscription key"""
             files = [
                 *[("images", (f"{i:04d}{img_suffix}", base64.b64decode(img) if isinstance(img, str) else img)) for i, (img_suffix, img) in enumerate(images)],
-                ("tier", (None, "Sketch")),
+                ("tier", (None, "Gen-2.5-Medium")),
                 ("mesh_mode", (None, "Raw")),
                 ("texture_mode", (None, "high")),
             ]
@@ -3553,16 +3736,23 @@ class BlenderMCPServer:
             if not api_key:
                 return {"error": "Hyper3D API key is not given"}
             req_data = {
-                "tier": "Sketch",
+                "tier": "Gen-2.5-Medium",
             }
             if images:
-                req_data["input_image_urls"] = images
+                req_data["image_urls"] = [
+                    image if isinstance(image, str) else
+                    f"data:image/{image[0].lstrip('.').lower().replace('jpg', 'jpeg')};base64,{image[1]}"
+                    for image in images
+                ]
             if text_prompt:
                 req_data["prompt"] = text_prompt
             if bbox_condition:
-                req_data["bbox_condition"] = bbox_condition
+                # v2.5 takes an object, not the [length, width, height] list.
+                length, width, height = bbox_condition
+                req_data["bbox_condition"] = {"length": length, "width": width, "height": height}
             response = requests.post(
-                "https://queue.fal.run/fal-ai/hyper3d/rodin",
+                ("https://queue.fal.run/fal-ai/hyper3d/rodin/v2.5"
+                 if images else "https://queue.fal.run/fal-ai/hyper3d/rodin/v2.5/text-to-3d"),
                 headers={
                     "Authorization": f"Key {api_key}",
                     "Content-Type": "application/json",
@@ -4781,8 +4971,7 @@ class BlenderMCPServer:
                 else:
                     try:
                         # Convert to Base64 format
-                        with open(image, "rb") as f:
-                            image_base64 = base64.b64encode(f.read()).decode("ascii")
+                        image_base64 = base64.b64encode(_read_image_file(image)).decode("ascii")
                         data["ImageBase64"] = image_base64
                     except Exception as e:
                         return {"error": f"Image encoding failed: {str(e)}"}
@@ -4838,17 +5027,14 @@ class BlenderMCPServer:
             if image:
                 if re.match(r'^https?://', image, re.IGNORECASE) is not None:
                     try:
-                        resImg = requests.get(image, timeout=30)
-                        resImg.raise_for_status()
-                        image_base64 = base64.b64encode(resImg.content).decode("ascii")
+                        image_base64 = base64.b64encode(_fetch_public_image(image)).decode("ascii")
                         data["image"] = image_base64
                     except Exception as e:
-                        return {"error": f"Failed to download or encode image: {str(e)}"} 
+                        return {"error": f"Failed to download or encode image: {str(e)}"}
                 else:
                     try:
                         # Convert to Base64 format
-                        with open(image, "rb") as f:
-                            image_base64 = base64.b64encode(f.read()).decode("ascii")
+                        image_base64 = base64.b64encode(_read_image_file(image)).decode("ascii")
                         data["image"] = image_base64
                     except Exception as e:
                         return {"error": f"Image encoding failed: {str(e)}"}
@@ -5047,12 +5233,583 @@ class BlenderMCPServer:
                 shutil.rmtree(temp_dir)
     #endregion
 
+    #region Tripo
+    def get_tripo_status(self):
+        """Get the current status of Tripo integration."""
+        if premium_active():
+            return premium_integration_status("tripo", getattr(bpy.context.scene, "blendermcp_use_tripo", False))
+        if not getattr(bpy.context.scene, "blendermcp_use_tripo", False):
+            return {
+                "enabled": False,
+                "message": """Tripo integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, check Tripo
+                            3. Choose a model and fill in the API Key""",
+            }
+        if not self._get_tripo_api_key():
+            return {
+                "enabled": False,
+                "message": """Tripo integration is currently enabled, but the API key is not given. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, keep Tripo checked
+                            3. Choose a model and fill in the API Key""",
+            }
+        model, error = self._resolve_tripo_model()
+        if error:
+            return {"enabled": False, "message": error["error"]}
+        choices = ", ".join(f"{label} ({ident})" for ident, label in TRIPO_MODELS.items())
+        return {
+            "enabled": True,
+            "model": model,
+            "message": (
+                f"Tripo integration is enabled and ready to use. Model: {TRIPO_MODELS[model]}. "
+                f"Sidebar choices: {choices}."
+            ),
+        }
+
+    def _tripo_headers(self):
+        api_key = self._get_tripo_api_key()
+        if not api_key:
+            return None, {"error": "Tripo API key is not given"}
+        return {**TRIPO_HEADERS, "Authorization": f"Bearer {api_key}"}, None
+
+    @staticmethod
+    def _tripo_parse(response):
+        """(data, None) on success, else (None, {"error": readable message}).
+        Messages come from fixed text or Tripo's reply, never the request, so
+        the key can't leak into them."""
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            payload = None
+        code = payload.get("code") if payload else None
+        message = payload.get("message") if payload else None
+        message = message.strip() if isinstance(message, str) and message.strip() else None
+        suggestion = payload.get("suggestion") if payload else None
+        suggestion = suggestion.strip() if isinstance(suggestion, str) and suggestion.strip() else None
+        if message and suggestion and suggestion not in message:
+            joiner = "" if message[-1] in ".!?" else ". "
+            message = f"{message}{joiner}{suggestion}"
+        # 401, 1000 and 1001 can echo the key, so ignore the body.
+        if response.status_code == 401 or code in (1000, 1001):
+            return None, {"error": "Tripo rejected the API key"}
+        if code == 2010:
+            return None, {"error": message or f"Out of Tripo credits. Top up at tripo3d.{tripo_endpoints()['domain']}"}
+        if code == 2000:
+            return None, {"error": message or "Tripo concurrency limit hit, wait and retry"}
+        if code == 1007 or response.status_code == 429:
+            return None, {"error": message or "Tripo rate limit hit, wait and retry"}
+        if response.status_code == 403:
+            return None, {"error": message or "Tripo refused the request: no permission, or not enough credits"}
+        if response.status_code == 404:
+            return None, {"error": message or "Tripo could not find that resource"}
+        if response.status_code == 500:
+            return None, {"error": message or "Tripo request failed. Try again later"}
+        if not response.ok or payload is None:
+            return None, {"error": message or f"Tripo request failed with status {response.status_code}"}
+        if code not in (0, None):
+            return None, {"error": message or "Tripo request failed"}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None, {"error": "Tripo response did not include data"}
+        return data, None
+
+    def _tripo_post(self, path, body, files=None):
+        headers, error = self._tripo_headers()
+        if error:
+            return None, error
+        try:
+            response = requests.post(
+                f"{tripo_endpoints()['api']}{path}", headers=headers, json=body, files=files, timeout=TRIPO_TIMEOUT)
+        except Exception:
+            return None, {"error": "Tripo request failed. Check the internet connection and try again"}
+        return self._tripo_parse(response)
+
+    def _tripo_upload_image(self, path, headers):
+        if not os.path.isfile(path):
+            return None, {"error": f"Image file not found: {path}"}
+        mime = TRIPO_IMAGE_TYPES.get(os.path.splitext(path)[1].lower())
+        if not mime:
+            return None, {"error": "Tripo accepts JPEG or PNG images"}
+        if os.path.getsize(path) > TRIPO_IMAGE_MAX_BYTES:
+            return None, {"error": "Tripo accepts images up to 20 MB"}
+        try:
+            with open(path, "rb") as handle:
+                response = requests.post(
+                    f"{tripo_endpoints()['api']}/files",
+                    headers=headers,
+                    files={"file": (os.path.basename(path), handle, mime)},
+                    timeout=TRIPO_TIMEOUT,
+                )
+        except Exception:
+            return None, {"error": "Tripo request failed. Check the internet connection and try again"}
+        data, error = self._tripo_parse(response)
+        if error:
+            return None, error
+        file_token = data.get("file_token")
+        if not file_token:
+            return None, {"error": "Tripo upload did not return a file_token"}
+        return file_token, None
+
+    def create_tripo_job(self, text_prompt=None, image=None, quality=None):
+        """Start one Tripo text-to-model or image-to-model task. quality is Premium-only."""
+        text_prompt = (text_prompt or "").strip()
+        image = (image or "").strip()
+        if bool(text_prompt) == bool(image):
+            return {"error": "Provide either a text prompt or an image, not both"}
+        if len(text_prompt) > TRIPO_PROMPT_MAX:
+            return {"error": f"Tripo prompts are limited to {TRIPO_PROMPT_MAX} characters"}
+        model, error = self._resolve_tripo_model()
+        if error:
+            return error
+        headers, error = self._tripo_headers()
+        if error:
+            return error
+
+        if text_prompt:
+            data, error = self._tripo_post(
+                "/generation/text-to-model",
+                {"model": model, "prompt": text_prompt, "texture": True, "pbr": True},
+            )
+        else:
+            if re.match(r"^https?://", image, re.IGNORECASE):
+                tripo_input = image
+            else:
+                tripo_input, error = self._tripo_upload_image(image, headers)
+                if error:
+                    return error
+            data, error = self._tripo_post(
+                "/generation/image-to-model",
+                {"model": model, "input": tripo_input, "texture": True, "pbr": True},
+            )
+        if error:
+            return error
+        task_id = data.get("task_id")
+        if not task_id:
+            return {"error": "Tripo response did not include a task id"}
+        return {"task_id": task_id, "model": model}
+
+    def poll_tripo_job_status(self, task_id=None, request_id=None):
+        """Query one Tripo task. Does not wait; the MCP client polls again."""
+        if not task_id:
+            return {"error": "task_id is required"}
+        headers, error = self._tripo_headers()
+        if error:
+            return error
+        try:
+            response = requests.get(
+                f"{tripo_endpoints()['api']}/tasks/{quote(str(task_id), safe='')}",
+                headers=headers,
+                timeout=TRIPO_TIMEOUT,
+            )
+        except Exception:
+            return {"error": "Tripo request failed. Check the internet connection and try again"}
+        data, error = self._tripo_parse(response)
+        if error:
+            return error
+        result = {
+            "task_id": data.get("task_id", task_id),
+            "status": data.get("status"),
+            "progress": data.get("progress"),
+        }
+        status = data.get("status")
+        if status == "success":
+            output = data.get("output") or {}
+            model_url = output.get("model_url") or output.get("pbr_model") or output.get("model")
+            if not model_url:
+                return {**result, "error": "Tripo task succeeded but returned no model URL"}
+            result["model_url"] = model_url
+        elif status in ("failed", "cancelled", "banned", "expired"):
+            result["error"] = data.get("error_message") or data.get("message") or data.get("error") or status
+        return result
+
+    def import_generated_asset_tripo(self, name, model_url=None, request_id=None):
+        """Download a Tripo GLB and import it into the current scene."""
+        if not model_url:
+            return {"succeed": False, "error": "No file URL provided"}
+        if not re.match(r"^https?://", model_url, re.IGNORECASE):
+            return {"succeed": False, "error": "Invalid URL format. Must start with http:// or https://"}
+
+        temp_dir = tempfile.mkdtemp(prefix="tripo_glb_")
+        glb_path = osp.join(temp_dir, "model.glb")
+        try:
+            response = requests.get(model_url, headers=TRIPO_HEADERS, stream=True, timeout=TRIPO_TIMEOUT)
+            response.raise_for_status()
+            with open(glb_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    handle.write(chunk)
+            obj = self._clean_imported_glb(filepath=glb_path, mesh_name=name)
+            if obj is None:
+                return {"succeed": False, "error": "No mesh objects imported from GLB"}
+            result = {
+                "name": obj.name,
+                "type": obj.type,
+                "location": [obj.location.x, obj.location.y, obj.location.z],
+                "rotation": [obj.rotation_euler.x, obj.rotation_euler.y, obj.rotation_euler.z],
+                "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
+            }
+            if obj.type == "MESH":
+                result["world_bounding_box"] = self._get_aabb(obj)
+            return {"succeed": True, **result}
+        except Exception:
+            return {"succeed": False, "error": "Failed to import Tripo model"}
+        finally:
+            with suppress(Exception):
+                shutil.rmtree(temp_dir)
+    #endregion
+
+    #region Meshy
+    def get_meshy_status(self):
+        """Get the current status of Meshy integration."""
+        if premium_active():
+            return premium_integration_status("meshy", getattr(bpy.context.scene, "blendermcp_use_meshy", False))
+        if not getattr(bpy.context.scene, "blendermcp_use_meshy", False):
+            return {
+                "enabled": False,
+                "message": """Meshy integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, check Meshy
+                            3. Choose a model and fill in the API Key (needs a paid Meshy plan)""",
+            }
+        if not self._get_meshy_api_key():
+            return {
+                "enabled": False,
+                "message": """Meshy integration is currently enabled, but the API key is not given. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under AI Model Generation, keep Meshy checked
+                            3. Fill in the API Key (needs a paid Meshy plan)""",
+            }
+        model, error = self._resolve_meshy_model()
+        if error:
+            return {"enabled": False, "message": error["error"]}
+        choices = ", ".join(f"{label} ({ident})" for ident, label in MESHY_MODELS.items())
+        return {
+            "enabled": True,
+            "model": model,
+            "message": (
+                f"Meshy integration is enabled and ready to use. Model: {MESHY_MODELS[model]}. "
+                f"Sidebar choices: {choices}."
+            ),
+        }
+
+    def _meshy_headers(self):
+        api_key = self._get_meshy_api_key()
+        if not api_key:
+            return None, {"error": "Meshy API key is not given"}
+        return {**MESHY_HEADERS, "Authorization": f"Bearer {api_key}"}, None
+
+    @staticmethod
+    def _meshy_parse(response):
+        """(payload, None) on success, else (None, {"error": readable message}).
+        Messages come from fixed text or Meshy's reply, never the request, so
+        the key can't leak into them."""
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if response.ok and isinstance(payload, dict):
+            return payload, None
+        if response.status_code == 401:
+            return None, {"error": "Meshy rejected the API key"}
+        # 402 also means a key credit limit, a workspace limit or a free plan,
+        # so Meshy's own message wins; the fixed text is only a fallback.
+        fallback = {
+            402: "Out of Meshy credits. Top up at meshy.ai",
+            429: "Meshy rate limit hit, wait and retry",
+        }.get(response.status_code, f"Meshy request failed with status {response.status_code}")
+        message = payload.get("message") if isinstance(payload, dict) else None
+        return None, {"error": message or fallback}
+
+    def _meshy_post(self, path, body):
+        headers, error = self._meshy_headers()
+        if error:
+            return None, error
+        try:
+            response = requests.post(f"{MESHY_API_BASE}{path}", headers=headers, json=body, timeout=MESHY_TIMEOUT)
+        except Exception:
+            return None, {"error": "Meshy request failed. Check the internet connection and try again"}
+        data, error = self._meshy_parse(response)
+        if error:
+            return None, error
+        task_id = data.get("result")
+        if not task_id:
+            return None, {"error": "Meshy response did not include a task id"}
+        return task_id, None
+
+    @staticmethod
+    def _meshy_image_url(image):
+        """A URL or data URI as given; a local file as a base64 data URI."""
+        if re.match(r"^(https?://|data:image/)", image, re.IGNORECASE):
+            return image, None
+        if not os.path.isfile(image):
+            return None, {"error": f"Image file not found: {image}"}
+        mime = MESHY_IMAGE_TYPES.get(os.path.splitext(image)[1].lower())
+        if not mime:
+            return None, {"error": "Meshy accepts JPG, PNG or WebP images"}
+        if os.path.getsize(image) > MESHY_IMAGE_MAX_BYTES:
+            return None, {"error": "Meshy accepts images up to 20 MB"}
+        with open(image, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+        return f"data:{mime};base64,{encoded}", None
+
+    def create_meshy_job(self, text_prompt=None, image=None, pose_mode=None):
+        """Start a Meshy text preview task ("t2p") or image-to-3D task ("i2m")."""
+        text_prompt = (text_prompt or "").strip()
+        image = (image or "").strip()
+        if bool(text_prompt) == bool(image):
+            return {"error": "Provide either a text prompt or an image, not both"}
+        if len(text_prompt) > MESHY_PROMPT_MAX:
+            return {"error": f"Meshy prompts are limited to {MESHY_PROMPT_MAX} characters"}
+        if pose_mode and pose_mode not in MESHY_POSES:
+            return {"error": "pose_mode must be 'a-pose' or 't-pose'"}
+        model, error = self._resolve_meshy_model()
+        if error:
+            return error
+
+        if text_prompt:
+            body = {"mode": "preview", "prompt": text_prompt, "ai_model": model, **MESHY_OUTPUT}
+            if pose_mode:
+                body["pose_mode"] = pose_mode
+            task_id, error = self._meshy_post("/v2/text-to-3d", body)
+            kind = "t2p"
+        else:
+            image_url, error = self._meshy_image_url(image)
+            if error:
+                return error
+            body = {"image_url": image_url, "ai_model": model, "should_texture": True, "enable_pbr": True,
+                    **MESHY_OUTPUT}
+            if pose_mode:
+                body["pose_mode"] = pose_mode
+            task_id, error = self._meshy_post("/v1/image-to-3d", body)
+            kind = "i2m"
+        if error:
+            return error
+        return {"task_id": task_id, "kind": kind, "model": model}
+
+    def refine_meshy_job(self, preview_task_id=None):
+        """Texture a finished preview. At most one refine per preview: asking
+        again returns the refine already started."""
+        if not preview_task_id:
+            return {"error": "preview_task_id is required"}
+        if preview_task_id in _meshy_refines:
+            return {"task_id": _meshy_refines[preview_task_id], "kind": "t2r"}
+        body = {"mode": "refine", "preview_task_id": preview_task_id, "enable_pbr": True, **MESHY_OUTPUT}
+        task_id, error = self._meshy_post("/v2/text-to-3d", body)
+        if error:
+            return error
+        _meshy_refines[preview_task_id] = task_id
+        return {"task_id": task_id, "kind": "t2r"}
+
+    def poll_meshy_job_status(self, task_id=None, kind=None):
+        """Query one Meshy task. Does not wait; the MCP client polls again."""
+        if not task_id:
+            return {"error": "task_id is required"}
+        if kind == "prm":
+            return {"error": "This Meshy generation was started through Premium. Switch Generation Source "
+                             "back to Premium in the add-on preferences to finish it."}
+        path = {"t2p": "/v2/text-to-3d", "t2r": "/v2/text-to-3d", "i2m": "/v1/image-to-3d"}.get(kind)
+        if not path:
+            return {"error": f"Unknown Meshy task kind: {kind}"}
+        headers, error = self._meshy_headers()
+        if error:
+            return error
+        try:
+            response = requests.get(f"{MESHY_API_BASE}{path}/{quote(str(task_id), safe='')}",
+                                    headers=headers, timeout=MESHY_TIMEOUT)
+        except Exception:
+            return {"error": "Meshy request failed. Check the internet connection and try again"}
+        data, error = self._meshy_parse(response)
+        if error:
+            return error
+        result = {"status": data.get("status"), "progress": data.get("progress")}
+        if data.get("status") == "SUCCEEDED":
+            model_url = (data.get("model_urls") or {}).get("glb")
+            if not model_url:
+                return {**result, "error": "Meshy task succeeded but returned no GLB URL"}
+            result["model_url"] = model_url
+        elif data.get("status") in ("FAILED", "CANCELED"):
+            result["error"] = (data.get("task_error") or {}).get("message") or data.get("status")
+        return result
+
+    def import_generated_asset_meshy(self, name, model_url=None):
+        """Download a Meshy GLB and import it into the current scene."""
+        if not model_url:
+            return {"succeed": False, "error": "No file URL provided"}
+        if not re.match(r"^https?://", model_url, re.IGNORECASE):
+            return {"succeed": False, "error": "Invalid URL format. Must start with http:// or https://"}
+
+        temp_dir = tempfile.mkdtemp(prefix="meshy_glb_")
+        glb_path = osp.join(temp_dir, "model.glb")
+        try:
+            response = requests.get(model_url, headers=MESHY_HEADERS, stream=True, timeout=MESHY_TIMEOUT)
+            response.raise_for_status()
+            with open(glb_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    handle.write(chunk)
+            obj = self._clean_imported_glb(filepath=glb_path, mesh_name=name)
+            if obj is None:
+                return {"succeed": False, "error": "No mesh objects imported from GLB"}
+            result = {
+                "name": obj.name,
+                "type": obj.type,
+                "location": [obj.location.x, obj.location.y, obj.location.z],
+                "rotation": [obj.rotation_euler.x, obj.rotation_euler.y, obj.rotation_euler.z],
+                "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
+            }
+            if obj.type == "MESH":
+                result["world_bounding_box"] = self._get_aabb(obj)
+            return {"succeed": True, **result}
+        except Exception:
+            return {"succeed": False, "error": "Failed to import Meshy model"}
+        finally:
+            with suppress(Exception):
+                shutil.rmtree(temp_dir)
+    #endregion
+
+    #region World Labs
+    def get_worldlabs_status(self):
+        """Get the current status of World Labs integration."""
+        enabled = getattr(bpy.context.scene, "blendermcp_use_worldlabs", False)
+        if not worldlabs_supported():
+            return {"enabled": False, "message": worldlabs_needs_blender()}
+        if premium_active():
+            return premium_integration_status("worldlabs", enabled)
+        if not enabled:
+            return {
+                "enabled": False,
+                "message": """World Labs integration is currently disabled. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under Gaussian Worlds, check World Labs
+                            3. Choose a model and fill in the API Key (from platform.worldlabs.ai)""",
+            }
+        if not self._get_worldlabs_api_key():
+            return {
+                "enabled": False,
+                "message": """World Labs integration is currently enabled, but the API key is not given. To enable it:
+                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. Under Gaussian Worlds, keep World Labs checked
+                            3. Fill in the API Key (from platform.worldlabs.ai)""",
+            }
+        model, error = self._resolve_worldlabs_model()
+        if error:
+            return {"enabled": False, "message": error["error"]}
+        choices = ", ".join(f"{label} ({ident})" for ident, label in WORLDLABS_MODELS.items())
+        return {
+            "enabled": True,
+            "model": model,
+            "message": (
+                f"World Labs integration is enabled and ready to use. Model: {WORLDLABS_MODELS[model]}. "
+                f"Sidebar choices: {choices}."
+            ),
+        }
+
+    def _worldlabs_request(self, method, path, body=None):
+        """(payload, None) on success, else (None, {"error": readable message}).
+        Messages come from fixed text or World Labs' reply, never the request,
+        so the key can't leak into them."""
+        api_key = self._get_worldlabs_api_key()
+        if not api_key:
+            return None, {"error": "World Labs API key is not given"}
+        headers = {**WORLDLABS_HEADERS, "WLT-Api-Key": api_key}
+        try:
+            response = requests.request(method, f"{WORLDLABS_API_BASE}{path}", headers=headers, json=body,
+                                        timeout=WORLDLABS_TIMEOUT)
+        except Exception:
+            return None, {"error": "World Labs request failed. Check the internet connection and try again"}
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if response.ok and isinstance(payload, dict):
+            return payload, None
+        if response.status_code == 401:
+            return None, {"error": "World Labs rejected the API key"}
+        if response.status_code == 404:
+            return None, {"error": "World Labs has no such generation; it may have expired"}
+        fallback = {
+            402: ("Out of World Labs API credits. Add some at platform.worldlabs.ai/billing "
+                  "(Marble app credits don't count)"),
+            429: "World Labs rate limit hit, wait a minute and retry",
+        }.get(response.status_code, f"World Labs request failed with status {response.status_code}")
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        return None, {"error": detail if isinstance(detail, str) and detail else fallback}
+
+    def create_worldlabs_job(self, text_prompt=None, image=None, name=None, **_unused):
+        """Start a World Labs world from text, an image or a folder of images,
+        with the sidebar's model."""
+        if not worldlabs_supported():
+            return {"error": worldlabs_needs_blender()}
+        text_prompt = (text_prompt or "").strip()
+        image = (image or "").strip()
+        if bool(text_prompt) == bool(image):
+            return {"error": "Provide either a text prompt or an image, not both"}
+        model, _error = self._resolve_worldlabs_model()
+        try:
+            world_prompt = worldlabs_world_prompt(text_prompt, image)
+        except (OSError, ValueError) as e:
+            return {"error": str(e)}
+        body = {"model": model, "world_prompt": world_prompt}
+        if name:
+            body["display_name"] = str(name)[:64]
+        data, error = self._worldlabs_request("POST", "/worlds:generate", body)
+        if error:
+            return error
+        if not data.get("operation_id"):
+            return {"error": "World Labs response did not include an operation id"}
+        return {"job_id": data["operation_id"], "kind": "op", "model": model}
+
+    def _worldlabs_operation(self, job_id):
+        return self._worldlabs_request("GET", f"/operations/{quote(str(job_id), safe='')}")
+
+    def poll_worldlabs_job(self, job_id=None, kind=None):
+        """Query one World Labs generation. Does not wait; the MCP client polls again."""
+        if not job_id:
+            return {"error": "job_id is required"}
+        if kind == "prm":
+            return {"error": "This World Labs generation was started through Premium. Switch Generation Source "
+                             "back to Premium in the add-on preferences to finish it."}
+        data, error = self._worldlabs_operation(job_id)
+        if error:
+            return error
+        return worldlabs_operation_status(data)
+
+    def import_worldlabs_world(self, name, job_id=None, kind=None, resolution="500k"):
+        """Download a finished World Labs world and build it in the scene."""
+        if not job_id:
+            return {"succeed": False, "error": "job_id is required"}
+        data, error = self._worldlabs_operation(job_id)
+        if error:
+            return {"succeed": False, **error}
+        world = data.get("response") if data.get("done") and not data.get("error") else None
+        if not isinstance(world, dict):
+            return {"succeed": False, "error": "The world isn't finished yet. Poll until SUCCEEDED, then import."}
+        assets = world.get("assets") or {}
+        splats = assets.get("splats") or {}
+        urls = splats.get("spz_urls") or {}
+        resolution = resolution if resolution in WORLDLABS_RESOLUTIONS else "500k"
+        url = urls.get(resolution) or urls.get("500k") or next((u for u in urls.values() if u), None)
+        if not url:
+            return {"succeed": False, "error": "World Labs returned no splat file for this world"}
+        if not urls.get(resolution):
+            resolution = next(res for res, u in urls.items() if u == url)
+        result = import_world_assets(
+            name, url, resolution, splats.get("semantics_metadata"),
+            (assets.get("mesh") or {}).get("collider_mesh_url"),
+            (assets.get("imagery") or {}).get("pano_url"),
+        )
+        if result.get("succeed") and world.get("model"):
+            result["model"] = WORLDLABS_MODELS.get(world["model"], world["model"])
+        return result
+    #endregion
+
 #region Premium
 # Premium is a different key, not a different set of tools. With the Premium
-# toggle on, the Hyper3D and Hunyuan3D commands send the same request through
-# the MCP for Blender server, which holds the fal key and decides quotas, and
-# replies are reshaped into the fal/Tencent shapes the MCP tools already
-# parse. Tripo is only offered through Premium. With generation_source left at
+# toggle on, the Hyper3D, Hunyuan3D and Meshy commands send the same request through
+# the MCP for Blender server, which holds the fal and Meshy keys and decides quotas, and
+# replies are reshaped into the fal/Tencent/Meshy shapes the MCP tools already
+# parse. With generation_source left at
 # BYOK nothing here runs, and nothing here touches the network until the user
 # activates a key.
 
@@ -5170,9 +5927,221 @@ def import_model_files(files, name):
             shutil.rmtree(temp_dir)
 
 
+# --- World Labs worlds, on either key
+
+def worldlabs_supported():
+    """Blender imports Gaussian splats from SPZ files from 5.3 on."""
+    return (bpy.app.version >= WORLDLABS_MIN_BLENDER
+            and bool(getattr(bpy.app.build_options, "io_spz", False)))
+
+
+def worldlabs_needs_blender():
+    return ("World Labs worlds need Blender 5.3 or newer, which imports Gaussian splats; this is Blender "
+            f"{bpy.app.version_string}.")
+
+
+def _image_extension(data):
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data[:4] == b"RIFF":
+        return "webp"
+    return "jpg"
+
+
+def _worldlabs_content(image):
+    """One image as World Labs content: a URL as given, since World Labs
+    fetches it itself, or a local file inline."""
+    if re.match(r"^https?://", image, re.IGNORECASE):
+        return {"source": "uri", "uri": image}
+    if not osp.isfile(image):
+        raise ValueError(f"Image file not found: {image}")
+    if osp.getsize(image) > WORLDLABS_IMAGE_MAX_BYTES:
+        raise ValueError(f"World Labs takes local images up to 10 MB; {image} is larger. "
+                         "Use a smaller image or an image URL.")
+    data = _read_image_file(image)
+    return {"source": "data_base64", "data_base64": base64.b64encode(data).decode("ascii"),
+            "extension": _image_extension(data)}
+
+
+def worldlabs_world_prompt(text_prompt, image):
+    """The world_prompt for text, one image (a panorama is detected), or a
+    folder of up to 4 views spread evenly around the place, first at the front."""
+    if text_prompt:
+        return {"type": "text", "text_prompt": text_prompt}
+    if not osp.isdir(image):
+        return {"type": "image", "image_prompt": _worldlabs_content(image)}
+    paths = sorted(osp.join(image, name) for name in os.listdir(image)
+                   if osp.isfile(osp.join(image, name)) and name.lower().endswith(WORLDLABS_IMAGE_SUFFIXES))
+    if not paths:
+        raise ValueError(f"No PNG, JPEG or WebP images in {image}.")
+    if len(paths) > WORLDLABS_MAX_IMAGES:
+        raise ValueError(f"World Labs takes up to {WORLDLABS_MAX_IMAGES} images; {image} has {len(paths)}.")
+    return {"type": "multi-image", "multi_image_prompt": [
+        {"azimuth": round(index * 360 / len(paths)), "content": _worldlabs_content(path)}
+        for index, path in enumerate(paths)
+    ]}
+
+
+def worldlabs_operation_status(operation):
+    """A World Labs operation as {status, progress | error}."""
+    if operation.get("done"):
+        error = operation.get("error")
+        if error:
+            message = error.get("message") if isinstance(error, dict) else error
+            return {"status": "FAILED", "error": str(message or "World generation failed")}
+        return {"status": "SUCCEEDED"}
+    progress = (operation.get("metadata") or {}).get("progress") or {}
+    return {"status": "IN_PROGRESS", "progress": progress.get("description") or progress.get("status")}
+
+
+def _download_world_file(url, directory, file_name):
+    if not re.match(r"^https?://", str(url or ""), re.IGNORECASE):
+        raise ValueError("Invalid world file URL.")
+    path = osp.join(directory, file_name)
+    response = requests.get(url, headers=WORLDLABS_HEADERS, stream=True, timeout=MODEL_DOWNLOAD_TIMEOUT)
+    response.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=65536):
+            f.write(chunk)
+    return path
+
+
+def _set_world_panorama(path, name):
+    """Make the panorama the background of a new world, leaving the scene's
+    old world in the file. Marble's panorama is centred on the generation
+    viewpoint's forward direction, which is +Y once the world is upright; an
+    environment image's centre faces +X, hence the turn about Z."""
+    image = bpy.data.images.load(path)
+    image.pack()
+    world = bpy.data.worlds.new(f"{name} Sky")
+    with suppress(Exception):
+        world.use_nodes = True
+    tree = world.node_tree
+    if tree is None:
+        raise ValueError("this Blender gave the new world no node tree")
+    nodes = tree.nodes
+    background = next((n for n in nodes if n.type == "BACKGROUND"), None) or nodes.new("ShaderNodeBackground")
+    output = next((n for n in nodes if n.type == "OUTPUT_WORLD"), None) or nodes.new("ShaderNodeOutputWorld")
+    coords = nodes.new("ShaderNodeTexCoord")
+    mapping = nodes.new("ShaderNodeMapping")
+    environment = nodes.new("ShaderNodeTexEnvironment")
+    environment.image = image
+    mapping.inputs["Rotation"].default_value = (0.0, 0.0, -math.pi / 2)
+    tree.links.new(coords.outputs["Generated"], mapping.inputs["Vector"])
+    tree.links.new(mapping.outputs["Vector"], environment.inputs["Vector"])
+    tree.links.new(environment.outputs["Color"], background.inputs["Color"])
+    tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+    bpy.context.scene.world = world
+    return world.name
+
+
+def _world_float(value, default):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def import_world_assets(name, splats_url, resolution, semantics=None, collider_url=None, pano_url=None):
+    """Build a World Labs world in the scene: an empty named `name` parenting
+    the splats and a hidden collision mesh, with the panorama as a new world
+    background.
+
+    Marble files are in raw OpenCV axes (x right, y down, z forward), and
+    Blender's SPZ and glTF importers both read them as Y-up, so each part
+    turns 180 degrees about X as well. World Labs' scale factor and ground
+    offset then put it in metres with the ground at z=0 and the generation
+    viewpoint at (0, 0, offset)."""
+    if not worldlabs_supported():
+        return {"succeed": False, "error": worldlabs_needs_blender()}
+    semantics = semantics if isinstance(semantics, dict) else {}
+    scale = _world_float(semantics.get("metric_scale_factor"), 1.0)
+    scale = scale if scale > 0 else 1.0
+    ground = _world_float(semantics.get("ground_plane_offset"), 0.0)
+    upright = (mathutils.Matrix.Translation((0.0, 0.0, ground))
+               @ mathutils.Matrix.Rotation(math.pi, 4, "X")
+               @ mathutils.Matrix.Scale(scale, 4))
+    notes = []
+    temp_dir = tempfile.mkdtemp(prefix="blendermcp_world_")
+    try:
+        splats_path = _download_world_file(splats_url, temp_dir, "splats.spz")
+        existing = set(bpy.data.objects)
+        try:
+            bpy.ops.wm.spz_import(filepath=splats_path)
+        except RuntimeError:
+            # The importer needs an active window, which a timer may not have.
+            windows = bpy.context.window_manager.windows
+            if not windows:
+                raise
+            with bpy.context.temp_override(window=windows[0]):
+                bpy.ops.wm.spz_import(filepath=splats_path)
+        imported = [obj for obj in set(bpy.data.objects) - existing if obj.type == "POINTCLOUD"]
+        if not imported:
+            raise ValueError("Blender imported no splats from the SPZ file")
+        splats = imported[0]
+        splats.name = f"{name} Splats"
+        with suppress(Exception):
+            splats.data.name = splats.name
+
+        root = bpy.data.objects.new(name, None)
+        root.empty_display_type = "PLAIN_AXES"
+        for collection in splats.users_collection:
+            collection.objects.link(root)
+            break
+        else:
+            bpy.context.scene.collection.objects.link(root)
+
+        def place(obj):
+            basis = obj.matrix_basis.copy()
+            obj.parent = root
+            obj.matrix_parent_inverse.identity()
+            obj.matrix_basis = upright @ basis
+
+        place(splats)
+        collider = None
+        if collider_url:
+            try:
+                collider = _import_mesh_file(_download_world_file(collider_url, temp_dir, "collider.glb"), "glb",
+                                             f"{name} Collider")
+                place(collider)
+                collider.display_type = "WIRE"
+                collider.hide_render = True
+                collider.hide_set(True)
+            except Exception as e:
+                notes.append(f"The collision mesh couldn't be imported ({e}).")
+        background = None
+        if pano_url:
+            try:
+                background = _set_world_panorama(_download_world_file(pano_url, temp_dir, "panorama"), name)
+            except Exception as e:
+                notes.append(f"The panorama couldn't be set as the background ({e}).")
+        bpy.context.view_layer.update()
+        result = {
+            "succeed": True,
+            "name": root.name,
+            "splats": splats.name,
+            "collider": collider.name if collider else None,
+            "background": background,
+            "resolution": resolution,
+            "metric": abs(scale - 1.0) > 1e-6,
+            "viewpoint": [0.0, 0.0, round(ground, 3)],
+            "notes": notes,
+        }
+        if collider:
+            result["world_bounding_box"] = BlenderMCPServer._get_aabb(collider)
+        return result
+    except Exception as e:
+        return {"succeed": False, "error": f"Failed to import the World Labs world: {e}"}
+    finally:
+        with suppress(Exception):
+            shutil.rmtree(temp_dir)
+
+
 # Overridden by BLENDERMCP_PREMIUM_API_URL, so forks can point at their own
 # Supabase project without editing code.
 PREMIUM_API_URL_DEFAULT = "https://dbunjhuejdwwcafedslw.supabase.co/functions/v1/premium"
+# Links to it add ?ref= saying where the user clicked, for the site's analytics.
 PREMIUM_PRICING_URL = "https://mcp-for-blender.com/premium"
 PREMIUM_MANAGE_URL_DEFAULT = "https://mcp-for-blender.com/account"
 PREMIUM_TIMEOUT = 30
@@ -5197,9 +6166,11 @@ PREMIUM_ERROR_MESSAGES = {
 
 # The scene checkboxes that turn each generator on, in both modes.
 PREMIUM_INTEGRATIONS = {
+    "meshy": ("Meshy", "blendermcp_use_meshy"),
     "hyper3d": ("Hyper3D Rodin", "blendermcp_use_hyper3d"),
     "hunyuan3d": ("Hunyuan3D", "blendermcp_use_hunyuan3d"),
     "tripo": ("Tripo", "blendermcp_use_tripo"),
+    "worldlabs": ("World Labs", "blendermcp_use_worldlabs"),
 }
 
 # Last usage summary the server sent. draw() reads only this, never the network.
@@ -5251,7 +6222,7 @@ def premium_enabled_generators():
             return []
         scene = bpy.context.scene
         return [name for name, (_label, prop) in PREMIUM_INTEGRATIONS.items()
-                if getattr(scene, prop, False)]
+                if getattr(scene, prop, False) and (name != "worldlabs" or worldlabs_supported())]
     except Exception:
         return []
 
@@ -5376,7 +6347,8 @@ def _premium_quality(model, quality, from_image):
 
 
 def premium_integration_status(integration, enabled):
-    """Reply for get_hyper3d_status / get_hunyuan3d_status / get_tripo_status."""
+    """Reply for get_hyper3d_status / get_hunyuan3d_status / get_tripo_status / get_meshy_status /
+    get_worldlabs_status."""
     label, prop = PREMIUM_INTEGRATIONS[integration]
     if not enabled:
         return {"enabled": False, "mode": "PREMIUM", "message": (
@@ -5398,8 +6370,66 @@ def premium_integration_status(integration, enabled):
                       "poll_hunyuan_job_status, then import_generated_asset_hunyuan with the ResultFile3Ds URL. "
                       + quality),
         "tripo": "Mode: PREMIUM. From an image, Tripo is high-quality only. " + quality,
+        "meshy": ("Mode: PREMIUM. Meshy uses its latest model and every generation counts as standard "
+                  "quality. Models arrive at real-world size with their origin at the bottom."),
+        "worldlabs": ("Mode: PREMIUM. Every world is Marble 1.1 and uses a high-quality generation (Pro and "
+                      "up). One image or a text prompt per world."),
     }[integration]
     return {"enabled": True, "mode": "PREMIUM", "message": f"{summary}. {flow}"}
+
+
+IMAGE_FETCH_MAX_REDIRECTS = 3
+
+
+def _is_image_bytes(data):
+    """PNG, JPEG or WebP, by their magic numbers rather than the file name."""
+    return (data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff")
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
+
+
+def _read_image_file(path):
+    """A local image's bytes. They go to a generation service, so a path to
+    anything but an image (a key file, a config) raises ValueError."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if not _is_image_bytes(data):
+        raise ValueError(f"Not a PNG, JPEG or WebP image: {path}")
+    return data
+
+
+def _check_public_url(url):
+    """Raise ValueError unless every address the URL's host resolves to is public."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"Not an http(s) URL: {url}")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, ValueError) as e:
+        raise ValueError(f"Can't resolve {parsed.hostname}: {e}")
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0].split("%")[0])
+        if address.version == 6 and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_global:
+            raise ValueError(f"{parsed.hostname} is a local or private address. "
+                             "Give a public image URL or a local file path instead.")
+
+
+def _fetch_public_image(url):
+    """Download an image named by URL. Local and private hosts are refused at
+    every redirect, so a URL can't reach into the user's own network."""
+    for _ in range(IMAGE_FETCH_MAX_REDIRECTS + 1):
+        _check_public_url(url)
+        response = requests.get(url, timeout=30, allow_redirects=False)
+        location = response.headers.get("Location")
+        if 300 <= response.status_code < 400 and location:
+            url = urljoin(url, location)
+            continue
+        response.raise_for_status()
+        if not _is_image_bytes(response.content):
+            raise ValueError(f"Not a PNG, JPEG or WebP image: {url}")
+        return response.content
+    raise ValueError("Too many redirects fetching the image")
 
 
 def _premium_image_payload(image):
@@ -5412,8 +6442,7 @@ def _premium_image_payload(image):
                 "image_mime": _premium_mime(suffix)}, len(raw)
     if re.match(r'^https?://', str(image), re.IGNORECASE):
         return {"image_url": image}, 0
-    with open(image, "rb") as f:
-        raw = f.read()
+    raw = _read_image_file(image)
     return {"image_base64": base64.b64encode(raw).decode("ascii"),
             "image_mime": _premium_mime(osp.splitext(image)[1])}, len(raw)
 
@@ -5517,13 +6546,6 @@ def premium_create_tripo_job(text_prompt=None, image=None, quality=None):
     return _premium_fal_reply(premium_create_job("tripo", quality, text_prompt=text_prompt, image=image))
 
 
-def premium_tripo_status():
-    enabled = bool(getattr(bpy.context.scene, "blendermcp_use_tripo", False))
-    if premium_active():
-        return premium_integration_status("tripo", enabled)
-    return {"enabled": False, "message": "Tripo is only available with MCP for Blender Premium."}
-
-
 def premium_tripo_handlers():
     """Tripo commands, registered in Premium mode when its checkbox is on."""
     if not (premium_active() and getattr(bpy.context.scene, "blendermcp_use_tripo", False)):
@@ -5532,6 +6554,125 @@ def premium_tripo_handlers():
         "create_tripo_job": premium_create_tripo_job,
         "poll_tripo_job_status": premium_poll_fal_job,
         "import_generated_asset_tripo": premium_import_job,
+    }
+
+
+# Meshy: Meshy-style shapes. The Premium server runs a text job's preview and
+# refine as one job, so there's no refine step here, and "prm" tells these
+# jobs apart from tasks started on the user's own key.
+
+_PREMIUM_MESHY_STATUS = {"reserved": "PENDING", "running": "IN_PROGRESS", "succeeded": "SUCCEEDED",
+                         "failed": "FAILED"}
+
+
+def premium_create_meshy_job(text_prompt=None, image=None, pose_mode=None):
+    if pose_mode:
+        return {"error": "pose_mode isn't available through Premium yet, only on your own Meshy API key"}
+    result = premium_create_job("meshy", "standard", text_prompt=text_prompt, image=image)
+    if not result.get("job_id"):
+        return result
+    return {"task_id": result["job_id"], "kind": "prm", "message": premium_summary()}
+
+
+def premium_poll_meshy_job(task_id=None, kind=None):
+    if not task_id:
+        return {"error": "task_id is required"}
+    if kind != "prm":
+        return {"error": "This Meshy generation was started with your own Meshy API key. Switch Generation "
+                         "Source back to Your own API keys in the add-on preferences to finish it."}
+    job = _premium_job(task_id)
+    if job.get("code") or "status" not in job:
+        return job
+    reply = {"status": _PREMIUM_MESHY_STATUS.get(job["status"], "IN_PROGRESS")}
+    if job.get("progress") is not None:
+        reply["progress"] = job["progress"]
+    if job["status"] == "failed":
+        reply["error"] = (job.get("error") or "Generation failed") + ". This attempt wasn't counted."
+    return reply
+
+
+def premium_import_meshy(name, task_id=None, model_url=None):
+    return premium_import_job(task_id, name)
+
+
+def premium_meshy_handlers():
+    """Meshy commands in Premium mode; the caller checks the checkbox."""
+    return {
+        "create_meshy_job": premium_create_meshy_job,
+        "poll_meshy_job_status": premium_poll_meshy_job,
+        "import_generated_asset_meshy": premium_import_meshy,
+    }
+
+
+# World Labs: the same {status, progress | error} replies as on the user's own
+# key. The Premium server lists the world's files, each splat file with the
+# world's scale metadata, and "prm" tells these jobs apart.
+
+_PREMIUM_WORLD_STATUS = {"succeeded": "SUCCEEDED", "failed": "FAILED"}
+
+
+def premium_create_worldlabs_job(text_prompt=None, image=None, name=None, **_unused):
+    if not worldlabs_supported():
+        return {"error": worldlabs_needs_blender()}
+    if _premium_high_locked():
+        return premium_error("NOT_IN_PLAN", "Gaussian worlds use high-quality generations, which are included in "
+                                            "Premium Pro and up. Upgrade, or use your own World Labs API key.")
+    if image and osp.isdir(str(image)):
+        return {"error": "Through Premium, World Labs takes one image, not a folder. Pass one image, or use "
+                         "your own World Labs API key for several views."}
+    result = premium_create_job("worldlabs", "high", text_prompt=text_prompt, image=image)
+    if not result.get("job_id"):
+        return result
+    return {"job_id": result["job_id"], "kind": "prm", "message": premium_summary()}
+
+
+def premium_poll_worldlabs_job(job_id=None, kind=None):
+    if not job_id:
+        return {"error": "job_id is required"}
+    if kind != "prm":
+        return {"error": "This World Labs generation was started with your own World Labs API key. Switch "
+                         "Generation Source back to Your own API keys in the add-on preferences to finish it."}
+    job = _premium_job(job_id)
+    if job.get("code") or "status" not in job:
+        return job
+    reply = {"status": _PREMIUM_WORLD_STATUS.get(job["status"], "IN_PROGRESS")}
+    if job["status"] == "failed":
+        reply["error"] = (job.get("error") or "Generation failed") + ". This attempt wasn't counted."
+    elif job.get("provider_status"):
+        reply["progress"] = job["provider_status"]
+    return reply
+
+
+def premium_import_worldlabs(name, job_id=None, kind=None, resolution="500k"):
+    if not job_id:
+        return {"succeed": False, "error": "job_id is required"}
+    job = _premium_job(job_id)
+    if job.get("code"):
+        return {"succeed": False, **job}
+    files = job.get("files") or []
+    if job.get("status") != "succeeded" or not files:
+        return {"succeed": False, "error": "The world isn't finished yet. Poll until SUCCEEDED, then import."}
+    splats = [f for f in files if isinstance(f, dict) and f.get("role") == "splats" and f.get("url")]
+    chosen = (next((f for f in splats if f.get("resolution") == resolution), None)
+              or next((f for f in splats if f.get("resolution") == "500k"), None)
+              or (splats[0] if splats else None))
+    if not chosen:
+        return {"succeed": False, "error": "The Premium server returned no splat file for this world"}
+    collider = next((f.get("url") for f in files if isinstance(f, dict) and f.get("role") == "collider"), None)
+    pano = next((f.get("url") for f in files if isinstance(f, dict) and f.get("role") == "panorama"), None)
+    result = import_world_assets(name, chosen["url"], chosen.get("resolution") or resolution,
+                                 chosen.get("metadata"), collider, pano)
+    if result.get("succeed"):
+        result["model"] = WORLDLABS_MODELS[WORLDLABS_PREMIUM_MODEL]
+    return result
+
+
+def premium_worldlabs_handlers():
+    """World Labs commands in Premium mode; the caller checks the checkbox."""
+    return {
+        "create_worldlabs_job": premium_create_worldlabs_job,
+        "poll_worldlabs_job": premium_poll_worldlabs_job,
+        "import_worldlabs_world": premium_import_worldlabs,
     }
 
 
@@ -5605,14 +6746,14 @@ def premium_draw_preferences(prefs, box):
     _premium_draw_quality(prefs, col)
     row = col.row(align=True)
     row.operator("blendermcp.premium_open_account", text="Manage account", icon='URL')
-    row.operator("wm.url_open", text="Get Premium", icon='FUND').url = PREMIUM_PRICING_URL
+    row.operator("wm.url_open", text="Get Premium", icon='FUND').url = PREMIUM_PRICING_URL + "?ref=addon-prefs"
 
 
 def premium_draw_upsell(layout):
     """For own-key users: a single line saying Premium exists and where to get it."""
     row = layout.row(align=True)
     row.label(text="No API keys? Use Premium", icon='FUND')
-    row.operator("wm.url_open", text="Get Premium").url = PREMIUM_PRICING_URL
+    row.operator("wm.url_open", text="Get Premium").url = PREMIUM_PRICING_URL + "?ref=addon-upsell"
 
 
 def premium_draw_panel(layout, prefs):
@@ -5624,14 +6765,14 @@ def premium_draw_panel(layout, prefs):
         col.label(text="Activate your license key in Preferences.")
         row = col.row(align=True)
         row.operator("screen.userpref_show", text="Open Preferences", icon='PREFERENCES').section = 'ADDONS'
-        row.operator("wm.url_open", text="Get Premium", icon='FUND').url = PREMIUM_PRICING_URL
+        row.operator("wm.url_open", text="Get Premium", icon='FUND').url = PREMIUM_PRICING_URL + "?ref=addon-sidebar"
     elif not _premium_status:
         col.operator("blendermcp.premium_refresh", text="Load plan", icon='FILE_REFRESH')
     elif not _premium_status.get("tier"):
         col.label(text="Your subscription isn't active.")
         row = col.row(align=True)
         row.operator("blendermcp.premium_open_account", text="Manage account", icon='URL')
-        row.operator("wm.url_open", text="Get Premium", icon='FUND').url = PREMIUM_PRICING_URL
+        row.operator("wm.url_open", text="Get Premium", icon='FUND').url = PREMIUM_PRICING_URL + "?ref=addon-sidebar"
     elif prefs is not None:
         # Quality only means something once there's a plan to spend.
         col.separator()
@@ -5730,6 +6871,21 @@ PREMIUM_CLASSES = (
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
+
+    bind_address: bpy.props.StringProperty(
+        name="Bind Address",
+        description="Listener address: localhost or an IPv4 address. Applied on next connection",
+        default="localhost",
+    )
+    allow_remote_connections: BoolProperty(
+        name="Allow Remote Connections",
+        description=(
+            "Allow non-loopback binding on the next connection. Remote clients can execute "
+            "Python without authentication or encryption. Use only on a trusted network "
+            "with firewall restrictions"
+        ),
+        default=False,
+    )
     
     def _on_telemetry_consent_changed(self, context):
         try:
@@ -5781,7 +6937,8 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         name="Generation Source",
         description="Where 3D model generation runs",
         items=[
-            ("BYOK", "Your own API keys", "Use your own Hyper3D, fal.ai or Tencent Cloud keys"),
+            ("BYOK", "Your own API keys",
+             "Use your own Hyper3D, fal.ai, Tripo, Meshy, World Labs or Tencent Cloud keys"),
             ("PREMIUM", "Premium", "Generate through MCP for Blender Premium with one license key"),
         ],
         default="BYOK",
@@ -5807,10 +6964,47 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         ],
         default="standard",
     )
+    tripo_domain: bpy.props.EnumProperty(
+        name="Tripo Domain",
+        description="Tripo API region; use an API key from the selected domain",
+        items=TRIPO_DOMAINS,
+        default="ai",
+    )
+    tripo_api_key: bpy.props.StringProperty(
+        name="Tripo API Key",
+        subtype="PASSWORD",
+        description="Persistent Tripo API Key",
+        default=""
+    )
+    meshy_api_key: bpy.props.StringProperty(
+        name="Meshy API Key",
+        subtype="PASSWORD",
+        description="Persistent Meshy API Key",
+        default=""
+    )
+    worldlabs_api_key: bpy.props.StringProperty(
+        name="World Labs API Key",
+        subtype="PASSWORD",
+        description="Persistent World Labs API Key",
+        default=""
+    )
 
     def draw(self, context):
         layout = self.layout
-        
+
+        layout.label(text="Server Connection:", icon='NETWORK_DRIVE')
+        connection_box = layout.box()
+        connection_box.prop(self, "bind_address")
+        connection_box.prop(self, "allow_remote_connections")
+        if self.allow_remote_connections:
+            warning = connection_box.column()
+            warning.alert = True
+            warning.label(text="Remote clients can run Python.", icon='ERROR')
+            warning.label(text="No authentication or encryption.")
+            warning.label(text="Use a trusted LAN and a firewall.")
+        connection_box.label(text="Disconnect and reconnect to apply changes.", icon='INFO')
+        layout.separator()
+
         # Telemetry section
         layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
         
@@ -5854,6 +7048,17 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
             col.operator("wm.url_open", text="Tencent Cloud keys", icon='URL').url = \
                 "https://console.cloud.tencent.com/cam/capi"
             col.prop(self, "hunyuan3d_api_url", text="Hunyuan3D API URL")
+            col.separator()
+            col.prop(self, "tripo_domain", text="Tripo Domain", translate=False)
+            col.prop(self, "tripo_api_key", text="Tripo API Key")
+            endpoints = tripo_endpoints(context, self)
+            col.operator("wm.url_open", text="Get Tripo API Key", icon='URL').url = endpoints["keys"]
+            col.separator()
+            col.prop(self, "meshy_api_key", text="Meshy API Key")
+            col.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
+            col.separator()
+            col.prop(self, "worldlabs_api_key", text="World Labs API Key")
+            col.operator("wm.url_open", text="World Labs keys", icon='URL').url = WORLDLABS_KEY_URL
 
         layout.separator()
         layout.label(text="Persistent API Credentials:", icon='LOCKED')
@@ -5888,8 +7093,9 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         col = box.column()
         if scene.blendermcp_server_running:
             server = getattr(bpy.types, "blendermcp_server", None)
+            running_host = getattr(server, "host", "localhost")
             running_port = getattr(server, "port", scene.blendermcp_port)
-            col.label(text=f"Connected on port {running_port}", icon='CHECKMARK')
+            col.label(text=f"Connected on {running_host}:{running_port}", icon='CHECKMARK')
             col.operator("blendermcp.stop_server", text="Disconnect", icon='X')
         else:
             col.label(text="Not connected", icon='RADIOBUT_OFF')
@@ -5945,8 +7151,9 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 col.prop(prefs, "hyper3d_api_key", text="API Key")
             else:
                 col.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
-            sub.operator("blendermcp.set_hyper3d_free_trial_api_key",
-                         text="Set Free Trial API Key", icon='KEYINGSET')
+            if scene.blendermcp_hyper3d_mode == 'MAIN_SITE':
+                sub.operator("blendermcp.set_hyper3d_free_trial_api_key",
+                             text="Set Free Trial API Key", icon='KEYINGSET')
 
         sub = self._integration_header(
             layout, scene, "blendermcp_use_hunyuan3d", "Tencent Hunyuan 3D", 'MESH_CUBE')
@@ -5974,10 +7181,62 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 col.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
                 col.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
 
-        if premium:
-            sub = self._integration_header(layout, scene, "blendermcp_use_tripo", "Tripo", 'MESH_TORUS')
-            if sub:
+        sub = self._integration_header(layout, scene, "blendermcp_use_tripo", "Tripo", 'OUTLINER_OB_MESH')
+        if sub and premium:
+            sub.label(text="Runs through Premium")
+        elif sub:
+            col = sub.column(align=True)
+            col.prop(scene, "blendermcp_tripo_model", text="Model")
+            endpoints = tripo_endpoints(context)
+            # The domain picker only matters for tripo3d.com (China) accounts, so
+            # the sidebar shows it for a Chinese UI or once it is set; it is
+            # always in the add-on preferences.
+            show_domain = endpoints["domain"] == "com" or bpy.app.translations.locale.startswith("zh")
+            if prefs:
+                if show_domain:
+                    col.prop(prefs, "tripo_domain", text="Domain", translate=False)
+                col.prop(prefs, "tripo_api_key", text="API Key")
+            else:
+                if show_domain:
+                    col.prop(scene, "blendermcp_tripo_domain", text="Domain", translate=False)
+                col.prop(scene, "blendermcp_tripo_api_key", text="API Key")
+            sub.operator("wm.url_open", text="Get Tripo API Key", icon='KEYINGSET').url = endpoints["keys"]
+
+        sub = self._integration_header(layout, scene, "blendermcp_use_meshy", "Meshy", 'OUTLINER_OB_MESH')
+        if sub and premium:
+            sub.label(text="Runs through Premium")
+        elif sub:
+            col = sub.column(align=True)
+            col.prop(scene, "blendermcp_meshy_model", text="Model")
+            if prefs:
+                col.prop(prefs, "meshy_api_key", text="API Key")
+            else:
+                col.prop(scene, "blendermcp_meshy_api_key", text="API Key")
+            sub.operator("wm.url_open", text="meshy.ai keys", icon='URL').url = MESHY_KEY_URL
+
+        # Gaussian worlds
+        layout.separator()
+        layout.label(text="Gaussian Worlds", icon='WORLD')
+        if not worldlabs_supported():
+            # Splats need Blender 5.3, so show the option but don't offer it.
+            box = layout.box()
+            row = box.row()
+            row.enabled = False
+            row.prop(scene, "blendermcp_use_worldlabs", text="")
+            row.label(text="World Labs", icon='WORLD')
+            box.label(text="Needs Blender 5.3 or newer", icon='INFO')
+        else:
+            sub = self._integration_header(layout, scene, "blendermcp_use_worldlabs", "World Labs", 'WORLD')
+            if sub and premium:
                 sub.label(text="Runs through Premium")
+            elif sub:
+                col = sub.column(align=True)
+                col.prop(scene, "blendermcp_worldlabs_model", text="Model")
+                if prefs:
+                    col.prop(prefs, "worldlabs_api_key", text="API Key")
+                else:
+                    col.prop(scene, "blendermcp_worldlabs_api_key", text="API Key")
+                sub.operator("wm.url_open", text="World Labs keys", icon='URL').url = WORLDLABS_KEY_URL
 
         # Community section
         layout.separator()
@@ -6003,6 +7262,10 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
     bl_idname = "blendermcp.set_hyper3d_free_trial_api_key"
     bl_label = "Set Free Trial API Key"
 
+    @classmethod
+    def poll(cls, context):
+        return context.scene.blendermcp_hyper3d_mode == 'MAIN_SITE'
+
     def execute(self, context):
         prefs = get_blendermcp_addon_preferences(context)
         if prefs:
@@ -6026,16 +7289,31 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
 
     def execute(self, context):
         global _user_stopped_server
-        _user_stopped_server = False
         scene = context.scene
 
+        server = getattr(bpy.types, "blendermcp_server", None)
+        if server is not None and server.running:
+            scene.blendermcp_server_running = True
+            return {'FINISHED'}
+        try:
+            host = _blendermcp_bind_address(context)
+        except ValueError as exc:
+            scene.blendermcp_server_running = False
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        _user_stopped_server = False
+
         # Create a new server instance
-        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+        if server is None:
+            server = BlenderMCPServer(host=host, port=scene.blendermcp_port)
+            bpy.types.blendermcp_server = server
+        else:
+            server.host = host
+            server.port = scene.blendermcp_port
 
         # Start the server
-        bpy.types.blendermcp_server.start()
-        scene.blendermcp_server_running = bpy.types.blendermcp_server.running
+        server.start()
+        scene.blendermcp_server_running = server.running
 
         return {'FINISHED'}
 
@@ -6366,8 +7644,68 @@ def register():
 
     bpy.types.Scene.blendermcp_use_tripo = bpy.props.BoolProperty(
         name="Use Tripo",
-        description="Enable Tripo 3D model generation (Premium)",
-        default=False
+        description="Enable Tripo model generation",
+        default=False,
+    )
+
+    bpy.types.Scene.blendermcp_tripo_domain = bpy.props.EnumProperty(
+        name="Tripo Domain",
+        description="Tripo API region; use an API key from the selected domain",
+        items=TRIPO_DOMAINS,
+        default="ai",
+    )
+    bpy.types.Scene.blendermcp_tripo_model = bpy.props.EnumProperty(
+        name="Tripo Model",
+        description="Tripo model used for each generation",
+        items=[(ident, label, f"{label} model") for ident, label in TRIPO_MODELS.items()],
+        default=TRIPO_DEFAULT_MODEL,
+    )
+
+    bpy.types.Scene.blendermcp_tripo_api_key = bpy.props.StringProperty(
+        name="Tripo API Key",
+        subtype="PASSWORD",
+        description="API Key provided by Tripo",
+        default="",
+    )
+
+    bpy.types.Scene.blendermcp_use_meshy = bpy.props.BoolProperty(
+        name="Use Meshy",
+        description="Enable Meshy model generation",
+        default=False,
+    )
+
+    bpy.types.Scene.blendermcp_meshy_model = bpy.props.EnumProperty(
+        name="Meshy Model",
+        description="Meshy model used for each generation",
+        items=[(ident, label, f"{label} model") for ident, label in MESHY_MODELS.items()],
+        default=MESHY_DEFAULT_MODEL,
+    )
+
+    bpy.types.Scene.blendermcp_meshy_api_key = bpy.props.StringProperty(
+        name="Meshy API Key",
+        subtype="PASSWORD",
+        description="API Key provided by Meshy",
+        default="",
+    )
+
+    bpy.types.Scene.blendermcp_use_worldlabs = bpy.props.BoolProperty(
+        name="Use World Labs",
+        description="Enable World Labs world generation (needs Blender 5.3 or newer)",
+        default=False,
+    )
+
+    bpy.types.Scene.blendermcp_worldlabs_model = bpy.props.EnumProperty(
+        name="World Labs Model",
+        description="World Labs model used for each world",
+        items=[(ident, label, f"{label} model") for ident, label in WORLDLABS_MODELS.items()],
+        default=WORLDLABS_DEFAULT_MODEL,
+    )
+
+    bpy.types.Scene.blendermcp_worldlabs_api_key = bpy.props.StringProperty(
+        name="World Labs API Key",
+        subtype="PASSWORD",
+        description="API Key provided by World Labs",
+        default="",
     )
 
     bpy.types.Scene.blendermcp_use_polypizza = bpy.props.BoolProperty(
@@ -6439,6 +7777,15 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_sketchfab
     del bpy.types.Scene.blendermcp_sketchfab_api_key
     del bpy.types.Scene.blendermcp_use_tripo
+    del bpy.types.Scene.blendermcp_tripo_domain
+    del bpy.types.Scene.blendermcp_tripo_model
+    del bpy.types.Scene.blendermcp_tripo_api_key
+    del bpy.types.Scene.blendermcp_use_meshy
+    del bpy.types.Scene.blendermcp_meshy_model
+    del bpy.types.Scene.blendermcp_meshy_api_key
+    del bpy.types.Scene.blendermcp_use_worldlabs
+    del bpy.types.Scene.blendermcp_worldlabs_model
+    del bpy.types.Scene.blendermcp_worldlabs_api_key
     del bpy.types.Scene.blendermcp_use_polypizza
     del bpy.types.Scene.blendermcp_polypizza_api_key
     del bpy.types.Scene.blendermcp_use_hunyuan3d
