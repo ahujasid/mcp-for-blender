@@ -4237,34 +4237,16 @@ class BlenderMCPServer:
             with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
                 # More secure zip slip prevention
                 for file_info in zip_ref.infolist():
-                    # Get the path of the file
-                    file_path = file_info.filename
-
-                    # Convert directory separators to the current OS style
-                    # This handles both / and \ in zip entries
-                    target_path = os.path.join(temp_dir, os.path.normpath(file_path))
-
-                    # Get absolute paths for comparison
-                    abs_temp_dir = os.path.abspath(temp_dir)
-                    abs_target_path = os.path.abspath(target_path)
-
-                    # Ensure the normalized path doesn't escape the target directory
-                    if not abs_target_path.startswith(abs_temp_dir):
+                    if not _zip_member_is_inside(temp_dir, file_info.filename):
                         with suppress(Exception):
                             shutil.rmtree(temp_dir)
                         return {"error": "Security issue: Zip contains files with path traversal attempt"}
-
-                    # Additional explicit check for directory traversal
-                    if ".." in file_path:
-                        with suppress(Exception):
-                            shutil.rmtree(temp_dir)
-                        return {"error": "Security issue: Zip contains files with directory traversal sequence"}
 
                 # If all files passed security checks, extract them
                 zip_ref.extractall(temp_dir)
 
             # Find the main glTF file
-            gltf_files = [f for f in os.listdir(temp_dir) if f.endswith('.gltf') or f.endswith('.glb')]
+            gltf_files = [f for f in os.listdir(temp_dir) if f.lower().endswith(('.gltf', '.glb'))]
 
             if not gltf_files:
                 with suppress(Exception):
@@ -5125,24 +5107,15 @@ class BlenderMCPServer:
                     f.write(chunk)
             with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
                 # Mirror the Sketchfab zip-slip checks before extractall.
-                abs_temp_dir = os.path.abspath(temp_dir)
                 for file_info in zip_ref.infolist():
-                    file_path = file_info.filename
-                    target_path = os.path.join(temp_dir, os.path.normpath(file_path))
-                    abs_target_path = os.path.abspath(target_path)
-                    if not abs_target_path.startswith(abs_temp_dir + os.sep) and abs_target_path != abs_temp_dir:
+                    if not _zip_member_is_inside(temp_dir, file_info.filename):
                         return {
                             "succeed": False,
                             "error": "Security issue: Zip contains files with path traversal attempt",
                         }
-                    if ".." in file_path:
-                        return {
-                            "succeed": False,
-                            "error": "Security issue: Zip contains files with directory traversal sequence",
-                        }
                 zip_ref.extractall(temp_dir)
             for file in os.listdir(temp_dir):
-                if file.endswith(".obj"):
+                if file.lower().endswith(".obj"):
                     obj_file_path = osp.join(temp_dir, file)
             if not osp.exists(obj_file_path):
                 return {"succeed": False, "error": "OBJ file not found after extraction"}
@@ -5967,6 +5940,17 @@ def premium_integration_status(integration, enabled):
 
 
 IMAGE_FETCH_MAX_REDIRECTS = 3
+
+
+
+def _zip_member_is_inside(temp_dir, file_path):
+    """False if a zip member would be extracted outside temp_dir."""
+    if ".." in file_path:
+        return False
+    target_path = os.path.join(temp_dir, os.path.normpath(file_path))
+    abs_temp_dir = os.path.abspath(temp_dir)
+    abs_target_path = os.path.abspath(target_path)
+    return abs_target_path == abs_temp_dir or abs_target_path.startswith(abs_temp_dir + os.sep)
 
 
 def _is_image_bytes(data):
