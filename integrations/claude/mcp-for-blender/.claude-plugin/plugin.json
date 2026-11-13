@@ -1,7 +1,7 @@
 {
   "name": "mcp-for-blender",
   "displayName": "MCP for Blender",
-  "version": "2.2.8",
+  "version": "2.2.9",
   "description": "Community open-source Blender integration: build and edit 3D scenes in your running Blender (not affiliated with the Blender Foundation).",
   "author": {
     "name": "Siddharth Ahuja",

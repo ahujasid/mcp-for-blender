@@ -2,7 +2,7 @@
   "mcpServers": {
     "blender": {
       "command": "uvx",
-      "args": ["mcp-for-blender==2.2.8"]
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}/vendor/mcp_for_blender-2.2.9-py3-none-any.whl", "mcp-for-blender"]
     }
   }
 }

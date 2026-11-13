@@ -1,8 +1,10 @@
 """The Claude plugin pins the server to an exact release, which the directory requires.
 
-Anthropic's directory blocks an unpinned `uvx` launcher, so the plugin names
-`mcp-for-blender==<version>`. That pin has to move with every release, along with
-the plugin's own `version`, or the directory keeps serving the old server.
+Anthropic's directory doesn't accept a PyPI version as a pin, because a release can
+gain new files after it's published. So the plugin ships the release's wheel in
+vendor/ and runs it with `uvx --from`. The wheel, the launch command and the
+plugin's own `version` have to move with every release, or the directory keeps
+serving the old server.
 """
 
 import json
@@ -18,21 +20,29 @@ def _package_version() -> str:
     return tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
 
 
+def _wheel_name() -> str:
+    return f"mcp_for_blender-{_package_version()}-py3-none-any.whl"
+
+
 def test_plugin_version_matches_package():
     manifest = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     assert manifest["version"] == _package_version()
 
 
-def test_server_is_pinned_to_this_release():
+def test_vendor_holds_only_this_release():
+    assert [p.name for p in (PLUGIN / "vendor").iterdir()] == [_wheel_name()]
+
+
+def test_server_runs_the_shipped_wheel():
     servers = json.loads((PLUGIN / ".mcp.json").read_text())["mcpServers"]
     assert servers["blender"]["command"] == "uvx"
-    assert servers["blender"]["args"] == [f"mcp-for-blender=={_package_version()}"]
+    assert servers["blender"]["args"] == [
+        "--from", f"${{CLAUDE_PLUGIN_ROOT}}/vendor/{_wheel_name()}", "mcp-for-blender"
+    ]
 
 
-def test_every_pin_in_the_plugin_names_this_release():
+def test_every_version_in_the_readme_names_this_release():
     version = _package_version()
-    for path in PLUGIN.rglob("*"):
-        if path.suffix not in (".json", ".md"):
-            continue
-        for pinned in re.findall(r"mcp-for-blender==([\w.]+)", path.read_text()):
-            assert pinned == version, f"{path.relative_to(ROOT)} pins {pinned}, release is {version}"
+    readme = (PLUGIN / "README.md").read_text()
+    for pinned in re.findall(r"mcp[-_]for[-_]blender(?:==|-|/)(\d+\.\d+\.\d+)", readme):
+        assert pinned == version, f"README names {pinned}, release is {version}"

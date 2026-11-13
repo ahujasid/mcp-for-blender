@@ -19,7 +19,7 @@ The server talks to Blender on your machine, so it doesn't run in Claude chat on
 2. Install the Blender addon. From a terminal:
 
    ```bash
-   uvx mcp-for-blender==2.2.8 install-addon
+   uvx mcp-for-blender==2.2.9 install-addon
    ```
 
    Or download [`addon.py`](https://github.com/ahujasid/mcp-for-blender/blob/main/addon.py) and install it in Blender under **Edit → Preferences → Add-ons → Install…**.
@@ -50,7 +50,7 @@ If you added the server by hand before (`claude mcp add blender …`), remove th
 
 ## What it runs, sends and fetches
 
-- **Runs**: `uvx mcp-for-blender==2.2.8`, which downloads that exact version of the server from PyPI and starts it on your machine.
+- **Runs**: the server from the wheel shipped in this plugin (`vendor/mcp_for_blender-2.2.9-py3-none-any.whl`, the same file as the [2.2.9 release on PyPI](https://pypi.org/project/mcp-for-blender/2.2.9/)), started with `uvx`. uv installs its dependencies (`mcp` and `httpx`) from PyPI.
 - **Blender**: the server connects to the addon over a local socket (`localhost:9876` by default). `execute_blender_code` runs arbitrary Python in Blender, so save your work. The socket has no authentication, so keep it on `localhost`.
 - **Asset libraries**: when you switch them on in the addon, Blender searches and downloads from Poly Haven (`api.polyhaven.com`), Sketchfab (`api.sketchfab.com`, with your API key) and Poly Pizza (`api.poly.pizza`, with your API key). Search results show thumbnails from those services.
 - **3D generation**: when you switch a generator on, Blender sends your prompt or image to that provider with your own API key: Hyper3D Rodin (`hyperhuman.deemos.com`, or `queue.fal.run` in fal.ai mode), Hunyuan3D (Tencent Cloud), Meshy (`api.meshy.ai`), Tripo (`openapi.tripo3d.ai`, or `openapi.tripo3d.com` for China accounts) or World Labs (`api.worldlabs.ai`). With an MCP for Blender Premium subscription, the request goes through the MCP for Blender backend (hosted on Supabase) instead, which calls the provider for you.
