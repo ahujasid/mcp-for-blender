@@ -1,0 +1,19 @@
+{
+  "name": "mcp-for-blender",
+  "displayName": "MCP for Blender",
+  "version": "2.2.8",
+  "description": "Community open-source Blender integration: build and edit 3D scenes in your running Blender (not affiliated with the Blender Foundation).",
+  "author": {
+    "name": "Siddharth Ahuja",
+    "url": "https://mcp-for-blender.com"
+  },
+  "homepage": "https://mcp-for-blender.com",
+  "repository": "https://github.com/ahujasid/mcp-for-blender",
+  "license": "MIT",
+  "keywords": ["blender", "3d", "modeling", "rendering", "assets"],
+  "icon": "./assets/logo.png",
+  "documentationUrl": "https://github.com/ahujasid/mcp-for-blender#readme",
+  "supportUrl": "https://www.mcp-for-blender.com/support",
+  "privacyPolicyUrl": "https://www.mcp-for-blender.com/privacy",
+  "termsOfServiceUrl": "https://www.mcp-for-blender.com/terms"
+}

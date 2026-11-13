@@ -1,0 +1,15 @@
+{
+  "name": "mcp-for-blender",
+  "description": "MCP for Blender: community open-source Blender integration (not affiliated with the Blender Foundation).",
+  "owner": {
+    "name": "Siddharth Ahuja",
+    "url": "https://mcp-for-blender.com"
+  },
+  "plugins": [
+    {
+      "name": "mcp-for-blender",
+      "source": "./integrations/claude/mcp-for-blender",
+      "description": "Build and edit 3D scenes in your running Blender."
+    }
+  ]
+}
