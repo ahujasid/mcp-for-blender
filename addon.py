@@ -1353,19 +1353,35 @@ class BlenderMCPServer:
             "BLENDERMCP_POLYPIZZA_API_KEY",
         )
 
-    def _get_hunyuan3d_secret_id(self):
-        return self._get_config_value(
-            "blendermcp_hunyuan3d_secret_id",
-            "hunyuan3d_secret_id",
-            "BLENDERMCP_HUNYUAN3D_SECRET_ID",
+    def _get_hunyuan3d_credentials(self):
+        """(SecretId, SecretKey), both from one place: the addon preferences,
+        the scene or the environment, the first that holds both.
+
+        Read one at a time, the id could come from the preferences and the key
+        from a scene saved with an older one, and Tencent answers that pair
+        with AuthFailure.SignatureFailure (#340). Pasted keys also often carry
+        a trailing space or newline, which signs just as wrongly.
+        """
+        prefs = get_blendermcp_addon_preferences()
+        scene = bpy.context.scene
+        places = (
+            (getattr(prefs, "hunyuan3d_secret_id", ""), getattr(prefs, "hunyuan3d_secret_key", "")),
+            (getattr(scene, "blendermcp_hunyuan3d_secret_id", ""), getattr(scene, "blendermcp_hunyuan3d_secret_key", "")),
+            (os.getenv("BLENDERMCP_HUNYUAN3D_SECRET_ID", ""), os.getenv("BLENDERMCP_HUNYUAN3D_SECRET_KEY", "")),
         )
+        pairs = [((secret_id or "").strip(), (secret_key or "").strip()) for secret_id, secret_key in places]
+        for pair in pairs:
+            if all(pair):
+                return pair
+        # No place has both. Hand back the half there is, so the caller
+        # reports a missing SecretId or SecretKey instead of signing with it.
+        return next((pair for pair in pairs if any(pair)), ("", ""))
+
+    def _get_hunyuan3d_secret_id(self):
+        return self._get_hunyuan3d_credentials()[0]
 
     def _get_hunyuan3d_secret_key(self):
-        return self._get_config_value(
-            "blendermcp_hunyuan3d_secret_key",
-            "hunyuan3d_secret_key",
-            "BLENDERMCP_HUNYUAN3D_SECRET_KEY",
-        )
+        return self._get_hunyuan3d_credentials()[1]
 
     def _get_hunyuan3d_api_url(self):
         return self._get_config_value(
