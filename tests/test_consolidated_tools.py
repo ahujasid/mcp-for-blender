@@ -33,7 +33,8 @@ def test_guides_are_off_for_now():
 
 def test_scripts_compile_and_never_raise_systemexit():
     # The addon catches Exception around execute_code but not SystemExit.
-    for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS):
+    for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS,
+                   blender_scripts.PICK):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code

@@ -379,13 +379,14 @@ def test_clicking_the_viewport_returns_a_link_to_the_object(monkeypatch):
     server.viewport_capture()
     sent = []
 
-    def send_command(name, params):
+    def send_command(name, params, **_kwargs):
         sent.append((name, params))
         return {"object": {"name": "Desk Lamp", "type": "MESH", "detail": "Mesh object"}}
 
     monkeypatch.setattr(server, "get_blender_connection", lambda: types.SimpleNamespace(send_command=send_command))
     result = server.viewport_pick(seq=1, x=0.25, y=0.5)
-    assert sent == [("pick_viewport_object", {**VIEW, "x": 0.25, "y": 0.5})]
+    # A mesh click then asks which face it hit (tests/test_pick_surface.py).
+    assert sent[0] == ("pick_viewport_object", {**VIEW, "x": 0.25, "y": 0.5})
     link = result.structuredContent["object"]["link"]
     assert link["type"] == "resource_link" and link["uri"] == "blender://object/Desk%20Lamp"
 
