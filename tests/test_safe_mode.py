@@ -216,6 +216,20 @@ BLOCKED_SCRIPTS = {
     "libraries": "import bpy\nprint(bpy.data.libraries)",
     "url_open": "import bpy\nbpy.ops.wm.url_open(url='http://evil.example')",
     "save_homefile": "import bpy\nbpy.ops.wm.save_homefile()",
+    # Blender's own wm.context_* / wm.properties_* operators eval or exec
+    # their string arguments (scripts/startup/bl_operators/wm.py).
+    "wm_context_set_value": (
+        "import bpy\n"
+        "bpy.ops.wm.context_set_value(data_path='scene.frame_current', "
+        "value=\"__import__('os').system('id') or 1\")"
+    ),
+    "wm_context_toggle": "import bpy\nbpy.ops.wm.context_toggle(data_path='space_data.show_region_ui')",
+    "wm_properties_edit": (
+        "import bpy\nbpy.ops.wm.properties_edit(data_path='object', property_name='p', eval_string='1')"
+    ),
+    "wm_operator_pie_enum": (
+        "import bpy\nbpy.ops.wm.operator_pie_enum(data_path='x', prop_string='y')"
+    ),
     # bypass shapes
     "container_wrap": "import bpy\n[bpy][0].ops.script.python_file_run(filepath='/tmp/x.py')",
     "alias_walk": "import bpy\nd = bpy.data\nt = d.texts",
