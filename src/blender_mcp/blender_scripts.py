@@ -37,17 +37,54 @@ def parse_result(output: str) -> dict:
 
 # One line per object, carrying only the fields the caller asked for, so the
 # default listing stays a few tokens per object. Dimensions come from the
-# evaluated world bounding box, which is what matters for placement (modifiers
-# and parent scale included), and are only computed when asked for.
+# evaluated world bounding box, which is what matters for placement (modifiers,
+# bevels and parent scale included), and are only computed when asked for.
 # In the order they appear on a line.
 SCENE_FIELDS = ("location", "rotation", "scale", "size", "ground", "parent", "details", "materials",
                 "modifiers", "animation", "hidden", "children", "topology", "weights", "settings")
 SCENE_DEFAULT_FIELDS = ("location", "size", "children", "hidden")
 
+# Shared by the scene summary, look's auto-framing and import bounds.
+# bound_box on an evaluated curve, text or surface is the control cage: a small
+# beveled poly curve reports that cage (about 2 m) instead of the bevel the
+# viewport shows. to_mesh() on the evaluated object is that shape. Meshes keep
+# the evaluated bound_box, which already includes modifiers and is cheap.
+WORLD_BOUNDS_FN = r'''
+def world_bounds(obj, depsgraph):
+    if obj.type in {"EMPTY", "LIGHT", "CAMERA"}:
+        return None
+    try:
+        ev = obj.evaluated_get(depsgraph)
+    except Exception:
+        return None
+    mesh = None
+    try:
+        if ev.type in {"CURVE", "SURFACE", "FONT", "META"}:
+            mesh = ev.to_mesh()
+        if mesh is not None and len(mesh.vertices):
+            # Every vertex, not the local box's corners: a rotated curve does
+            # not fill that box, so the corners overstate the world size.
+            mw = ev.matrix_world
+            pts = [mw @ vert.co for vert in mesh.vertices]
+        else:
+            pts = [ev.matrix_world @ Vector(c) for c in ev.bound_box]
+        lo = [min(p[i] for p in pts) for i in range(3)]
+        hi = [max(p[i] for p in pts) for i in range(3)]
+        return lo, hi
+    except Exception:
+        return None
+    finally:
+        if mesh is not None:
+            try:
+                ev.to_mesh_clear()
+            except Exception:
+                pass
+'''
+
 SCENE_SUMMARY = r'''
 import bpy, math
 from mathutils import Vector
-
+''' + WORLD_BOUNDS_FN + r'''
 scene = bpy.context.scene
 F = set(ARGS.get("fields") or ())
 depsgraph = bpy.context.evaluated_depsgraph_get() if F & {"size", "ground"} else None
@@ -59,16 +96,7 @@ def r(v):
     return round(float(v), 2)
 
 def bounds(obj):
-    if obj.type in {"EMPTY", "LIGHT", "CAMERA"}:
-        return None
-    try:
-        ev = obj.evaluated_get(depsgraph)
-        pts = [ev.matrix_world @ Vector(c) for c in ev.bound_box]
-    except Exception:
-        return None
-    lo = [min(p[i] for p in pts) for i in range(3)]
-    hi = [max(p[i] for p in pts) for i in range(3)]
-    return lo, hi
+    return world_bounds(obj, depsgraph)
 
 def line(obj, depth=0):
     parts = [("  " * depth) + obj.name, obj.type.lower()]
@@ -214,7 +242,7 @@ import bpy, math
 import gpu
 import numpy as np
 from mathutils import Vector, Matrix
-
+''' + WORLD_BOUNDS_FN + r'''
 scene = bpy.context.scene
 depsgraph = bpy.context.evaluated_depsgraph_get()
 mode = ARGS["mode"]
@@ -309,6 +337,11 @@ def world_points(objs):
     for o in objs:
         if o.type in {"EMPTY"} and not o.children:
             pts.append(o.matrix_world.translation.copy())
+            continue
+        b = world_bounds(o, depsgraph)
+        if b is not None:
+            pts.append(Vector(b[0]))
+            pts.append(Vector(b[1]))
             continue
         try:
             ev = o.evaluated_get(depsgraph)
@@ -529,6 +562,7 @@ return info
 BOUNDS = r'''
 import bpy
 from mathutils import Vector
+''' + WORLD_BOUNDS_FN + r'''
 dg = bpy.context.evaluated_depsgraph_get()
 out = []
 for name in ARGS["names"]:
@@ -538,9 +572,13 @@ for name in ARGS["names"]:
     objs = [o] + list(o.children_recursive)
     pts = []
     for x in objs:
+        # Geometry only. An armature or lattice bound_box is not the model, and
+        # folding it in makes a rigged import look bigger than it is.
         if x.type in {"MESH", "CURVE", "SURFACE", "FONT", "META", "CURVES", "POINTCLOUD", "VOLUME"}:
-            ev = x.evaluated_get(dg)
-            pts.extend(ev.matrix_world @ Vector(c) for c in ev.bound_box)
+            b = world_bounds(x, dg)
+            if b is not None:
+                pts.append(Vector(b[0]))
+                pts.append(Vector(b[1]))
     if not pts:
         continue
     lo = [round(min(p[i] for p in pts), 3) for i in range(3)]
