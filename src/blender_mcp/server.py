@@ -721,7 +721,7 @@ def _store_capture(max_size: int, source: str) -> None:
 
 # In MCP Apps hosts the result also shows in the fullscreen Viewport app.
 def _viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> CallToolResult:
-    """look(mode="viewport"): the user's viewport, also shown in the Viewport app."""
+    """The addon's own viewport capture, also shown in the Viewport app; look's fallback."""
     try:
         _store_capture(max_size, "model")
         state, image_bytes = _viewport_snapshot()
@@ -1504,6 +1504,11 @@ def _look_caption(info: dict) -> str:
     if mode != "viewport":
         size = " x ".join(f"{v:g}" for v in info.get("size", []))
         parts.append(f"Framed {info.get('targets', 0)} objects, {size} m across, centred at {info.get('center')}.")
+    render = info.get("render")
+    if render:
+        samples = f" at {render['samples']} samples" if render.get("samples") else ""
+        parts.append(f"Quick render with {render['engine']}{samples}, {render['seconds']:.1f}s; "
+                     "a final render is cleaner.")
     return " ".join(parts)
 
 
@@ -1513,6 +1518,8 @@ def _look_params(kwargs: dict) -> dict:
         "mode", "target", "views", "distance", "shading", "frames", "frame_count", "view", "image", "max_size")
         if kwargs.get(key) is not None}
     params["mode"] = kwargs.get("mode") or ("image" if kwargs.get("image") is not None else "viewport")
+    if params["mode"] != "image":
+        params.setdefault("shading", "rendered")
     return params
 
 
@@ -1539,8 +1546,11 @@ async def look(
     - mode: viewport (what the user sees; default), camera (through the scene camera, at the
       render aspect), angles (the target from several sides, auto-framed; default front, right,
       top, three_quarter), frames (a strip over the animation).
-    - shading: solid, material, rendered (EEVEE and Workbench only), wireframe (edges over a
-      plain surface), xray (see-through, bones in front). Default: the viewport's.
+    - shading: rendered (default: a real render with the scene's engine, Cycles included, cut to
+      a few samples and denoised, so lights, materials and world look as they'll render; takes
+      seconds, more for angles and frames since each tile renders), material, solid, wireframe
+      (edges over a plain surface), xray (see-through, bones in front). All but rendered draw the
+      viewport and are instant.
     - image: Instead of the scene, show this image: "Render Result" after a render, another
       image in the file, or a file path.
 
@@ -1567,6 +1577,8 @@ async def look(
             return _app_error("image= shows an image instead of the scene; leave mode unset.")
         mode = "image"
     mode = mode or "viewport"
+    if mode != "image":
+        shading = shading or "rendered"
     if shading is not None and shading not in LOOK_SHADING:
         return _app_error(f"Unknown shading {shading!r}. Use one of: {', '.join(LOOK_SHADING)}")
     for v in (views or []) + ([view] if view is not None and view != "camera" else []):
@@ -1581,14 +1593,10 @@ async def look(
     def native():
         return _viewport_screenshot(ctx, max_size=max_size, user_prompt=user_prompt)
 
-    def scripted():
-        return _look_via_script(args)
-
-    # The plain viewport has a native command; everything else is a script.
-    # Each falls back to the other, since old addons may have only one of them.
-    first, second = (native, scripted) if mode == "viewport" and not shading else (scripted, native)
+    # Every look is a script; the addon's native viewport capture is the fallback,
+    # since old addons may have only that.
     try:
-        return first()
+        return _look_via_script(args)
     except _LookRefused as e:
         return _app_error(str(e))
     except Exception as e:
@@ -1598,13 +1606,12 @@ async def look(
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
         return _app_error(f"Couldn't show the image: {reason}{hint}")
     try:
-        result = second()
+        result = native()
     except Exception as e:
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
         return _app_error(f"Couldn't capture the view: {reason}{hint}")
-    if second is native:
-        note = f"look(mode=\"{mode}\") isn't available here ({reason}), so this is the plain viewport."
-        result.content.append(TextContent(type="text", text=note))
+    note = f"look(mode=\"{mode}\", shading=\"{shading}\") isn't available here ({reason}), so this is the plain viewport."
+    result.content.append(TextContent(type="text", text=note))
     return result
 
 

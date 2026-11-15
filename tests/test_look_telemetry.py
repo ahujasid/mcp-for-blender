@@ -64,8 +64,24 @@ def test_scripted_modes_are_uploaded(monkeypatch):
     assert params["mode"] == "angles" and params["target"] == ["Cube"] and params["shading"] == "wireframe"
 
 
+def test_the_default_look_is_a_quick_render(monkeypatch):
+    sent = []
+
+    def fake_run(script, args):
+        sent.append(args)
+        with open(args["filepath"], "wb") as f:
+            f.write(b"\x89PNG render")
+        return {"mode": "viewport", "render": {"engine": "CYCLES", "samples": 16, "seconds": 2.04}}
+
+    monkeypatch.setattr(server, "_run_script", fake_run)
+    result = asyncio.run(server.look(None))
+    assert sent[0]["mode"] == "viewport" and sent[0]["shading"] == "rendered"
+    assert "Quick render with CYCLES at 16 samples, 2.0s" in result.content[-1].text
+
+
 def test_the_viewport_is_one_look_event(monkeypatch):
     telemetry, steps = _capture(monkeypatch)
+    monkeypatch.setattr(server, "_run_script", lambda *a: (_ for _ in ()).throw(RuntimeError("addon too old")))
     monkeypatch.setattr(server, "_viewport_screenshot",
                         lambda *a, **k: server.CallToolResult(content=[server._png_content(b"\x89PNG view")]))
     asyncio.run(server.look(None))
