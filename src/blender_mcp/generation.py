@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -167,7 +168,12 @@ class Pending:
         if not isinstance(entries, list):
             return []
         oldest = self.clock() - PENDING_MAX_AGE_S
-        return [e for e in entries if isinstance(e, dict) and e.get("started_at", 0) >= oldest]
+        # started_at is read from a file a write can truncate or a user can edit.
+        # A non-numeric value must not break every generation call: drop the
+        # entry like an expired one instead of comparing it to a float.
+        return [e for e in entries if isinstance(e, dict)
+                and isinstance(ts := e.get("started_at"), (int, float))
+                and math.isfinite(ts) and ts >= oldest]
 
     def _save(self, entries: list[dict]) -> None:
         if not self.path:
