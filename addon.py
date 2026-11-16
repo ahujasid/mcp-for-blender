@@ -5108,17 +5108,28 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
+    def _check_public_url(self, url: str):
+        return _check_public_url(url)
+
     def import_generated_asset_hunyuan(self, *args, **kwargs):
         if premium_active():
             return premium_import_generated_asset_hunyuan(*args, **kwargs)
         return self.import_generated_asset_hunyuan_ai(*args, **kwargs)
             
     def _import_hunyuan_glb(self, name: str, glb_url: str):
+        if not glb_url:
+            return {"error": "No file URL provided"}
+        if not re.match(r'^https?://', glb_url, re.IGNORECASE):
+            return {"error": "Invalid URL format. Must start with http:// or https://"}
+        try:
+            self._check_public_url(glb_url)
+        except ValueError as e:
+            return {"succeed": False, "error": str(e)}
+
         temp_dir = tempfile.mkdtemp(prefix="hunyuan_glb_")
         glb_path = osp.join(temp_dir, "model.glb")
         try:
-            glb_response = requests.get(glb_url, stream=True, timeout=120)
-            glb_response.raise_for_status()
+            glb_response = _fetch_public_stream(glb_url, timeout=120)
             with open(glb_path, "wb") as f:
                 for chunk in glb_response.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -5148,9 +5159,13 @@ class BlenderMCPServer:
         if not zip_file_url:
             return {"error": "No file URL provided"}
         
-        # Validate URL
+        # Validate URL scheme and block local/private SSRF targets
         if not re.match(r'^https?://', zip_file_url, re.IGNORECASE):
             return {"error": "Invalid URL format. Must start with http:// or https://"}
+        try:
+            self._check_public_url(zip_file_url)
+        except ValueError as e:
+            return {"succeed": False, "error": str(e)}
 
         # Prefer GLB (self-contained with materials) over OBJ/ZIP (API 3.0 returns .glb URLs)
         url_path = zip_file_url.split('?', 1)[0].split('#', 1)[0].lower()
@@ -5162,8 +5177,7 @@ class BlenderMCPServer:
         zip_file_path = osp.join(temp_dir, "model.zip")
         obj_file_path = osp.join(temp_dir, "model.obj")
         try:
-            zip_response = requests.get(zip_file_url, stream=True, timeout=120)
-            zip_response.raise_for_status()
+            zip_response = _fetch_public_stream(zip_file_url, timeout=120)
             with open(zip_file_path, "wb") as f:
                 for chunk in zip_response.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -6413,6 +6427,22 @@ def _fetch_public_image(url):
             raise ValueError(f"Not a PNG, JPEG or WebP image: {url}")
         return response.content
     raise ValueError("Too many redirects fetching the image")
+
+
+def _fetch_public_stream(url, timeout=120):
+    """Open a streaming GET response to a public URL, checking every redirect hop
+    with _check_public_url so local/private hosts cannot be reached."""
+    for _ in range(IMAGE_FETCH_MAX_REDIRECTS + 1):
+        _check_public_url(url)
+        response = requests.get(url, stream=True, timeout=timeout, allow_redirects=False)
+        headers = getattr(response, "headers", None) or {}
+        location = headers.get("Location")
+        if 300 <= getattr(response, "status_code", 200) < 400 and location:
+            url = urljoin(url, location)
+            continue
+        response.raise_for_status()
+        return response
+    raise ValueError("Too many redirects fetching the asset")
 
 
 def _premium_image_payload(image):
