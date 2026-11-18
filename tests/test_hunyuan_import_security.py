@@ -1,6 +1,7 @@
-"""Regression coverage for Hunyuan import URL routing and zip-slip checks."""
+"""Regression coverage for Hunyuan import URL routing, SSRF, and zip-slip checks."""
 import importlib.util
 import io
+import socket
 import sys
 import types
 import zipfile
@@ -74,6 +75,19 @@ def _load_addon(monkeypatch):
     spec = importlib.util.spec_from_file_location("blender_mcp_addon_hunyuan_test", ADDON)
     addon = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(addon)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("127.0.0.1" if host in ("127.0.0.1", "localhost") else "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34", port or 0),
+            )
+        ],
+    )
     return addon, bpy
 
 
@@ -148,3 +162,26 @@ def test_hunyuan_zip_rejects_path_traversal(monkeypatch):
 
     assert result["succeed"] is False
     assert "path traversal" in result["error"].lower() or "directory traversal" in result["error"].lower()
+
+
+def test_hunyuan_import_rejects_local_or_private_urls(monkeypatch):
+    addon, _bpy = _load_addon(monkeypatch)
+    server = addon.BlenderMCPServer()
+    fetched = []
+    monkeypatch.setattr(
+        addon.requests,
+        "get",
+        lambda url, **_kwargs: fetched.append(url) or _FakeResponse(b"nope"),
+        raising=False,
+    )
+
+    for bad_url in (
+        "http://127.0.0.1:8080/internal.glb",
+        "http://169.254.169.254/latest/meta-data/model.zip",
+    ):
+        result = server.import_generated_asset_hunyuan_ai("Asset", bad_url)
+        assert result.get("succeed") is False
+        assert "local or private" in result["error"]
+
+    assert fetched == []
+
