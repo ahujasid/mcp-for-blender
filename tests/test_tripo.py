@@ -229,7 +229,7 @@ def test_tripo_image_url_skips_upload(monkeypatch, domain):
 @pytest.mark.parametrize("name, payload, mime", [
     ("ref.jpg", b"\xff\xd8\xff", "image/jpeg"),
     ("ref.jpeg", b"\xff\xd8\xff", "image/jpeg"),
-    ("ref.png", b"\x89PNG\r\n", "image/png"),
+    ("ref.png", b"\x89PNG\r\n\x1a\n", "image/png"),
 ])
 @pytest.mark.parametrize("domain", ["ai", "com"])
 def test_tripo_local_image_uploads_then_submits(monkeypatch, tmp_path, name, payload, mime, domain):
@@ -259,6 +259,45 @@ def test_tripo_rejects_bad_input_without_calling_api(monkeypatch, kwargs, needle
     result = addon.BlenderMCPServer().create_tripo_job(**kwargs)
     assert needle in result["error"]
     assert posts == []
+
+
+def test_tripo_uploads_the_image_bytes(monkeypatch, tmp_path):
+    image = tmp_path / "ref.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\1" * 8)
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon)
+    addon.BlenderMCPServer().create_tripo_job(image=str(image))
+    assert posts[0]["files"]["file"] == ("ref.png", image.read_bytes(), "image/png")
+
+
+def test_tripo_refuses_a_file_that_is_not_an_image(monkeypatch, tmp_path):
+    # A key or config file renamed to look like an image must not be uploaded (#405).
+    image = tmp_path / "credentials.jpg"
+    image.write_bytes(b"TRIPO_API_KEY=tsk-not-an-image\n")
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon)
+    result = addon.BlenderMCPServer().create_tripo_job(image=str(image))
+    assert "Not a PNG, JPEG or WebP image" in result["error"]
+    assert posts == []
+
+
+def test_tripo_refuses_webp_bytes_behind_a_png_name(monkeypatch, tmp_path):
+    image = tmp_path / "ref.png"
+    image.write_bytes(b"RIFF\x10\0\0\0WEBPVP8 " + b"\0" * 8)
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon)
+    result = addon.BlenderMCPServer().create_tripo_job(image=str(image))
+    assert result["error"] == "Tripo accepts JPEG or PNG images"
+    assert posts == []
+
+
+def test_tripo_names_the_image_by_its_bytes(monkeypatch, tmp_path):
+    image = tmp_path / "ref.png"
+    image.write_bytes(b"\xff\xd8\xff\xe0" + b"\0" * 8)
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon)
+    addon.BlenderMCPServer().create_tripo_job(image=str(image))
+    assert posts[0]["files"]["file"][2] == "image/jpeg"
 
 
 def test_tripo_rejects_images_over_20_mb(monkeypatch, tmp_path):
