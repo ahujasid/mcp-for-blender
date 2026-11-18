@@ -46,6 +46,8 @@ STILL BLOCKED (security properties, not app-architecture decisions):
     `lib_reload`) — a hostile .blend carries drivers that run on load
   * `bpy.data.texts` / `.scripts` / `.libraries`, `bpy.utils.execfile` and
     friends, `save_homefile`, `url_open` / `path_open`, `quit_blender`
+  * `wm.context_*`, `wm.properties_*` and `wm.operator_pie_enum` — Blender
+    implements them in Python and `eval`/`exec` their string arguments
 
 The attacker is assumed to have read this file, so the policy is structural
 rather than pattern-matching: anything that could produce an unbounded name or
@@ -312,6 +314,18 @@ _FORBIDDEN_OPS_PREFIXES: Final[tuple[str, ...]] = (
     "bpy.ops.console",      # the console executes arbitrary python
 )
 
+#: Operator-name prefixes inside an otherwise allowed namespace. Blender's own
+#: `scripts/startup/bl_operators/wm.py` builds code from these operators'
+#: string properties — `context_set_value` runs
+#: `exec("context.{:s} = {:s}".format(data_path, self.value))`, every
+#: `context_*` op `eval`s its `data_path`, `properties_edit` `eval`s
+#: `eval_string` — so a script that may call them may run any Python.
+_FORBIDDEN_OP_NAME_PREFIXES: Final[tuple[str, ...]] = (
+    "bpy.ops.wm.context_",
+    "bpy.ops.wm.properties_",
+    "bpy.ops.wm.operator_pie_enum",
+)
+
 #: Attribute names whose only purpose is to navigate from a module toward the
 #: still-blocked surface. Reading one of these off a receiver we could not
 #: resolve is refused outright — see `_fail_on_unrooted_navigation`. Smaller
@@ -501,6 +515,9 @@ def _path_is_blocked(path: str) -> str | None:
     for prefix in _FORBIDDEN_OPS_PREFIXES:
         if path == prefix or path.startswith(prefix + "."):
             return f"{prefix}.* executes code or installs addons"
+    for prefix in _FORBIDDEN_OP_NAME_PREFIXES:
+        if path.startswith(prefix):
+            return f"{prefix}* operators eval/exec their string arguments"
     return None
 
 
