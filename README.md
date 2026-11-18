@@ -791,6 +791,28 @@ Here are some examples of what you can ask Claude to do:
 | *"Make the lighting like a studio"* | |
 | *"Point the camera at the scene, and make it isometric"* | |
 
+#### Model to scale from a public reference
+
+Open and save a new Blender scene, then connect MCP for Blender. Use your
+client's web search to look up the dimensions. If you need a search tool, you
+can add Parallel separately in Claude Code with no API key:
+
+```sh
+claude mcp add --transport http parallel https://mcp.parallel.ai/mcp \
+  --header 'User-Agent: mcp-for-blender'
+```
+
+Then try this prompt:
+
+> Find the diameter and thickness of a circulating U.S. quarter on the U.S.
+> Mint website and link the source. If you can verify both measurements, use
+> MCP for Blender to make a plain cylinder at that size in this scene. Set
+> the scene to metric with one Blender unit equal to one millimeter, then
+> measure the cylinder and report the result in millimeters.
+
+The cylinder should measure 24.26 × 24.26 × 1.75 mm.
+See the [U.S. Mint quarter specifications](https://www.usmint.gov/content/usmint/us/en/learn/coins-and-medals/circulating-coins/quarter.html).
+
 ---
 
 ## Persistent API Credentials
