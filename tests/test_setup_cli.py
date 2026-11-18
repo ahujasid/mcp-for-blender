@@ -126,6 +126,11 @@ def test_strip_jsonc_keeps_strings():
         "url": "http://x/*y*/", "a": [1]}
 
 
+def test_strip_jsonc_keeps_a_comma_before_a_bracket_inside_a_string():
+    text = '{\n  // mine\n  "a": ["--re=[x,]", "{y, }", "q,\\"]"],\n  "b": [1, /* c */ ],\n}'
+    assert json.loads(_strip_jsonc(text)) == {"a": ["--re=[x,]", "{y, }", 'q,"]'], "b": [1]}
+
+
 def test_servers_state():
     assert servers_state({}).status == NEW
     assert servers_state({"b": {"command": "/x/uvx", "args": ["mcp-for-blender"]}}).status == CONFIGURED
