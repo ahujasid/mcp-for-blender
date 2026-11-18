@@ -139,7 +139,7 @@ Then in Blender: **Edit → Preferences → Add-ons** → enable **Interface: MC
 
 **4. Connect**
 
-The addon starts its server when Blender opens. To check, press `N` in the 3D viewport → open the **MCP for Blender** tab (click **Start MCP Server** if it isn't running). That's it — ask Claude to build something.
+The addon starts its server when Blender opens. To check, press `N` in the 3D viewport → open the **MCP for Blender** tab. While it is running the tab shows **Connected on port 9876** and a **Disconnect** button; if it says **Not connected**, click **Connect to MCP server**. That's it — ask Claude to build something.
 
 </details>
 
@@ -598,7 +598,7 @@ This copies the addon into your Blender addons folder as `blender_mcp.py`. It pr
 
 **5. Manual alternative** — if the command above can't find your Blender install, or you prefer doing it by hand: download `addon.py` from this repo → in Blender, **Edit → Preferences → Add-ons → Install…** → select the downloaded `addon.py` → enable it.
 
-Then open the **MCP for Blender** tab in Blender's sidebar (press `N` in the 3D viewport) and click **Start MCP Server**. See [Starting the Connection](#starting-the-connection) below.
+Then open the **MCP for Blender** tab in Blender's sidebar (press `N` in the 3D viewport). While the addon is running it shows **Connected on port 9876** and a **Disconnect** button; if it says **Not connected**, click **Connect to MCP server**. See [Starting the Connection](#starting-the-connection) below.
 
 ## Upgrading (existing users)
 
@@ -616,7 +616,7 @@ This updates the MCP server (refreshing uv's cached copy, or upgrading a `uv too
 
 **2.** Restart your MCP client (Claude Desktop, Cursor, ...) so it starts the new server.
 
-**3.** In Blender: restart it, or **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender**, then click **Start MCP Server** again.
+**3.** In Blender: restart it, or **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender**. The **MCP for Blender** tab should show **Connected on port 9876** with a **Disconnect** button; if it says **Not connected**, click **Connect to MCP server**.
 
 If a client is still set up with the old `blender-mcp` package name, `update` says so; `uvx mcp-for-blender setup` switches it over.
 
@@ -633,7 +633,7 @@ If a client is still set up with the old `blender-mcp` package name, `update` sa
 1. In Blender, go to the 3D View sidebar (press <kbd>N</kbd> if not visible)
 2. Find the **MCP for Blender** tab
 3. Turn on the checkboxes you'd like to use (see more under [Capabilities](#capabilities) below)
-4. Click **Connect to Claude**
+4. The tab shows **Connected on port 9876** and a **Disconnect** button while the addon is running. If it says **Not connected**, click **Connect to MCP server**
 5. Make sure the MCP server is running in your terminal
 
 ### Using with Claude

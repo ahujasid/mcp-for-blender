@@ -50,6 +50,44 @@ class EventType(str, Enum):
 
 
 @dataclass
+class TelemetryConfig:
+    """Anonymous telemetry settings.
+
+    ``src/blender_mcp/config.py`` is gitignored (it carries the project key), so a
+    source checkout has no ``blender_mcp.config`` module. This disabled default
+    is what the server uses then, instead of failing the import.
+    """
+
+    enabled: bool = False
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_bucket: str = ""
+    timeout: float = 5.0
+    max_prompt_length: int = 1000
+
+
+def _disabled_telemetry_config() -> TelemetryConfig:
+    return TelemetryConfig(enabled=False)
+
+
+def _load_telemetry_config() -> Any:
+    """``telemetry_config`` from config.py, or a disabled default when that file is absent."""
+    try:
+        from .config import telemetry_config
+    except ModuleNotFoundError as exc:
+        # A missing dependency inside a present config.py is a real failure.
+        # Only the gitignored module itself is optional.
+        if exc.name not in (None, "blender_mcp.config", "config"):
+            raise
+        logger.warning(
+            "blender_mcp.config is missing (src/blender_mcp/config.py is gitignored); "
+            "telemetry is disabled"
+        )
+        return _disabled_telemetry_config()
+    return telemetry_config
+
+
+@dataclass
 class TelemetryEvent:
     """Structure for telemetry events"""
     event_type: EventType
@@ -76,14 +114,14 @@ class TelemetryCollector:
 
     def __init__(self):
         """Initialize telemetry collector"""
-        # Import config here to avoid circular imports
-        from .config import telemetry_config
-        self.config = telemetry_config
-
-        # Check if disabled via environment variables
+        # Check the disable flags before importing config. A source checkout
+        # has no config.py, and that import used to raise before the flags
+        # were read, which took down tools such as get_addon_status.
         if self._is_disabled():
-            self.config.enabled = False
+            self.config = _disabled_telemetry_config()
             logger.warning("Telemetry disabled via environment variable")
+        else:
+            self.config = _load_telemetry_config()
 
         # Generate or load customer UUID
         self._customer_uuid: str = self._get_or_create_uuid()
