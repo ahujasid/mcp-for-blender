@@ -107,6 +107,83 @@ def test_update_replaces_old_package_and_keeps_env(tmp_path):
     assert json_client_state(client).status == CONFIGURED
 
 
+def test_update_keeps_the_users_uvx_flags(tmp_path):
+    # The README's "pin the Python version" entry, from before the rename.
+    path = tmp_path / "mcp.json"
+    _write(path, {"mcpServers": {"blender": {
+        "command": "uvx", "args": ["--python", "3.11", "blender-mcp"],
+        "env": {"UV_PYTHON_PREFERENCE": "only-managed"}}}})
+    client = _client(path)
+    configure_json_client(client, UVX, json_client_state(client))
+
+    entry = json.loads(path.read_text())["mcpServers"]["blender"]
+    assert entry == {"command": UVX, "args": ["--python", "3.11", "mcp-for-blender"],
+                     "env": {"UV_PYTHON_PREFERENCE": "only-managed"}}
+
+
+def test_update_keeps_opencode_uvx_flags(tmp_path):
+    path = tmp_path / "opencode.json"
+    _write(path, {"mcp": {"blender": {"type": "local", "environment": {"BLENDER_PORT": "9877"},
+                                      "command": ["uvx", "--python", "3.11", "blender-mcp"]}}})
+    client = _client(path, "opencode")
+    configure_json_client(client, UVX, json_client_state(client))
+
+    entry = json.loads(path.read_text())["mcp"]["blender"]
+    assert entry["command"] == [UVX, "--python", "3.11", "mcp-for-blender"]
+    assert entry["environment"] == {"BLENDER_PORT": "9877"}
+
+
+def test_update_of_a_non_uvx_entry_still_uses_uvx(tmp_path):
+    path = tmp_path / "mcp.json"
+    _write(path, {"mcpServers": {"blender": {"command": "/opt/venv/bin/blender-mcp", "args": []}}})
+    client = _client(path)
+    configure_json_client(client, UVX, json_client_state(client))
+
+    entry = json.loads(path.read_text())["mcpServers"]["blender"]
+    assert entry == {"command": UVX, "args": ["mcp-for-blender"]}
+
+
+def test_claude_code_update_keeps_env_and_uvx_flags(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {
+        "type": "stdio", "command": "uvx", "args": ["--python", "3.11", "blender-mcp"],
+        "env": {"DISABLE_TELEMETRY": "true", "BLENDER_PORT": "9877"}}}})
+    client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    ran = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: (ran.append(args), (True, ""))[1])
+
+    state = setup_cli.claude_code_state()
+    assert (state.status, state.entry_key) == (OUTDATED, "blender")
+    assert setup_cli.configure_cli_client(client, UVX, state).ok
+    remove, add = ran
+    assert remove == ["/bin/claude", "mcp", "remove", "--scope", "user", "blender"]
+    assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender",
+                   "-e", "DISABLE_TELEMETRY=true", "-e", "BLENDER_PORT=9877",
+                   "--", UVX, "--python", "3.11", "mcp-for-blender"]
+    assert "-e DISABLE_TELEMETRY=true" in setup_cli.describe_change(client, UVX, state)
+
+
+def test_codex_update_keeps_env_and_uvx_flags(tmp_path, monkeypatch):
+    if sys.version_info < (3, 11):
+        pytest.skip("reading the old entry's settings needs tomllib (Python 3.11+)")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers.blender]\ncommand = "uvx"\nargs = ["--python", "3.11", "blender-mcp"]\n'
+        '[mcp_servers.blender.env]\nDISABLE_TELEMETRY = "true"\nBLENDER_PORT = "9877"\n'
+    )
+    client = Client("codex", "Codex", "codex", cli_path="/bin/codex")
+    ran = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: (ran.append(args), (True, ""))[1])
+
+    assert setup_cli.configure_cli_client(client, UVX, codex_state()).ok
+    remove, add = ran
+    assert remove == ["/bin/codex", "mcp", "remove", "blender"]
+    assert add == ["/bin/codex", "mcp", "add", "blender",
+                   "--env", "DISABLE_TELEMETRY=true", "--env", "BLENDER_PORT=9877",
+                   "--env", "BLENDER_MCP_APPS=1", "--env", "BLENDER_MCP_OPENAI_FORMS=1",
+                   "--", UVX, "--python", "3.11", "mcp-for-blender"]
+
+
 def test_jsonc_is_read_and_invalid_json_left_alone(tmp_path):
     path = tmp_path / "mcp.json"
     _write(path, '{\n  // mine\n  "servers": {"a": {"command": "x // not a comment"},},\n}\n')
