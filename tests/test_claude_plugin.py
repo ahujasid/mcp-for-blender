@@ -43,6 +43,6 @@ def test_server_runs_the_shipped_wheel():
 
 def test_every_version_in_the_readme_names_this_release():
     version = _package_version()
-    readme = (PLUGIN / "README.md").read_text()
+    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
     for pinned in re.findall(r"mcp[-_]for[-_]blender(?:==|-|/)(\d+\.\d+\.\d+)", readme):
         assert pinned == version, f"README names {pinned}, release is {version}"
