@@ -230,3 +230,61 @@ def test_repeat_install_preserves_original_backup(tmp_path: Path):
     assert "USER LOCAL EDIT" in backup.read_text(encoding="utf-8"), (
         "repeat install clobbered the backup of the user's previous addon"
     )
+
+
+def test_install_targets_newest_blender_after_upgrade(tmp_path: Path, monkeypatch):
+    """#431: Blender 5.3 doesn't load 5.2's add-ons, so install there, not into 5.2."""
+    from blender_mcp import addon_manager as am
+
+    old = tmp_path / "5.2" / "scripts" / "addons"
+    new = tmp_path / "5.3" / "scripts" / "addons"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "blender_mcp.py").write_text(_stale_addon_source(), encoding="utf-8")
+
+    monkeypatch.setattr(am, "discover_blender_addon_dirs", lambda: [new, old])
+    result = am.install_addon()
+
+    assert result.success is True
+    assert result.target_path == str(new / "blender_mcp.py")
+
+
+def test_startup_check_flags_addon_missing_from_newest_blender(tmp_path: Path, monkeypatch):
+    from blender_mcp import addon_manager as am
+
+    old = tmp_path / "5.2" / "scripts" / "addons"
+    new = tmp_path / "5.3" / "scripts" / "addons"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "blender_mcp.py").write_text(
+        am.get_bundled_addon_path().read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    monkeypatch.setattr(am, "discover_blender_addon_dirs", lambda: [new, old])
+    report = am.check_addon_status_on_startup()
+
+    assert report.needs_action is True
+    assert report.reason == "not_in_newest_blender"
+    assert "Blender 5.2" in report.message and "Blender 5.3" in report.message
+    assert "install-addon" in report.message
+
+
+def test_discover_finds_flatpak_and_orders_by_version(tmp_path: Path, monkeypatch):
+    """Flatpak keeps its config under ~/.var/app; 5.10 is newer than 5.9."""
+    from blender_mcp import addon_manager as am
+
+    native = tmp_path / ".config" / "blender"
+    flatpak = tmp_path / ".var" / "app" / "org.blender.Blender" / "config" / "blender"
+    for version_dir in (native / "5.9", flatpak / "5.10", flatpak / "5.2"):
+        version_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(am.sys, "platform", "linux")
+    monkeypatch.setattr(am.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("BLENDER_USER_ADDONS", raising=False)
+    monkeypatch.delenv("BLENDERMCP_ADDONS_DIR", raising=False)
+
+    assert am.discover_blender_addon_dirs() == [
+        flatpak / "5.10" / "scripts" / "addons",
+        native / "5.9" / "scripts" / "addons",
+        flatpak / "5.2" / "scripts" / "addons",
+    ]

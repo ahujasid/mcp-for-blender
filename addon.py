@@ -8,6 +8,7 @@ import mathutils
 import json
 import threading
 import socket
+import select
 import ipaddress
 import queue
 import time
@@ -1555,6 +1556,14 @@ class BlenderMCPServer:
             except queue.Empty:
                 break
 
+            # A client that gave up while an earlier command held the main
+            # thread (a long import or boolean) isn't waiting for this one.
+            # Running it anyway kept Blender busy with abandoned retries long
+            # after the long command finished (#430).
+            if self._client_gone(client):
+                print(f"Skipped command {command.get('type')}: client disconnected before it ran")
+                continue
+
             try:
                 response = self.execute_command(command)
                 response_json = json.dumps(response)
@@ -1569,6 +1578,21 @@ class BlenderMCPServer:
                 print("Failed to send response - client disconnected")
 
         return 0.05
+
+    def _client_gone(self, client):
+        """True if the client hung up. Never blocks and never consumes data."""
+        with self._clients_lock:
+            if client not in self._clients:
+                return True
+        try:
+            readable, _, _ = select.select([client], [], [], 0)
+            # Readable with nothing to peek at means the peer closed.
+            return bool(readable) and client.recv(1, socket.MSG_PEEK) == b''
+        except socket.timeout:
+            # Its handler thread read the pending data first; still connected.
+            return False
+        except (OSError, ValueError):
+            return True
 
     def _handle_client(self, client):
         """Handle connected client"""

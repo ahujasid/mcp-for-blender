@@ -118,6 +118,25 @@ def check_addon_status_on_startup() -> AddonStatusReport:
                 ),
             )
 
+        newest_version = _blender_version_of(dirs[0])
+        if newest_version and not find_existing_addon_installs(_newest_version_dirs(dirs)):
+            others = sorted({v for p in existing if (v := _blender_version_of(p.parent))})
+            installed_for = f"Blender {', '.join(others)}" if others else "another Blender"
+            return AddonStatusReport(
+                checked=True,
+                outdated_paths=[],
+                missing=True,
+                reason="not_in_newest_blender",
+                message=(
+                    f"MCP for Blender addon is installed for {installed_for} but not for "
+                    f"Blender {newest_version}. Blender doesn't carry add-ons over when it "
+                    f"updates. If you use Blender {newest_version}, run "
+                    "`uvx mcp-for-blender install-addon` to install it there, then in Blender: "
+                    "Preferences → Add-ons → enable 'Interface: MCP for Blender' and click "
+                    "Connect to MCP server."
+                ),
+            )
+
         outdated = [str(p) for p in existing if addon_file_needs_update(p)]
         if not outdated:
             return AddonStatusReport(
@@ -200,23 +219,38 @@ def blender_config_base() -> Path | None:
     return home / ".config" / "blender"
 
 
-def discover_blender_addon_dirs() -> list[Path]:
-    """Find Blender user scripts/addons directories across versions."""
-    dirs: list[Path] = []
+def blender_config_bases() -> list[Path]:
+    """Every per-user Blender folder: the native one, plus Flatpak's sandboxed one on Linux."""
     base = blender_config_base()
+    bases = [base] if base else []
+    if sys.platform.startswith("linux"):
+        # Flatpak Blender keeps its config inside the sandbox, not in ~/.config.
+        bases.append(Path.home() / ".var" / "app" / "org.blender.Blender" / "config" / "blender")
+    return bases
 
-    if base and base.is_dir():
-        for child in sorted(base.iterdir(), reverse=True):
-            if not child.is_dir():
-                continue
+
+_VERSION_DIR_RE = re.compile(r"^(\d+)\.(\d+)")
+
+
+def discover_blender_addon_dirs() -> list[Path]:
+    """Find Blender user scripts/addons directories across versions, newest version first."""
+    versions: list[tuple[tuple[int, int], Path]] = []
+    for base in blender_config_bases():
+        if not base.is_dir():
+            continue
+        for child in base.iterdir():
             # Blender versions look like 3.6, 4.0, 4.2
-            if not re.match(r"^\d+\.\d+", child.name):
-                continue
-            dirs.append(child / "scripts" / "addons")
-            # Blender 4.2+ installs through the extensions system.
-            extensions = child / "extensions" / "user_default"
-            if extensions.is_dir():
-                dirs.append(extensions)
+            match = _VERSION_DIR_RE.match(child.name)
+            if match and child.is_dir():
+                versions.append(((int(match.group(1)), int(match.group(2))), child))
+
+    dirs: list[Path] = []
+    for _version, child in sorted(versions, key=lambda v: v[0], reverse=True):
+        dirs.append(child / "scripts" / "addons")
+        # Blender 4.2+ installs through the extensions system.
+        extensions = child / "extensions" / "user_default"
+        if extensions.is_dir():
+            dirs.append(extensions)
 
     env = os.environ.get("BLENDER_USER_ADDONS") or os.environ.get("BLENDERMCP_ADDONS_DIR")
     if env:
@@ -231,6 +265,22 @@ def discover_blender_addon_dirs() -> list[Path]:
             seen.add(key)
             unique.append(d)
     return unique
+
+
+def _blender_version_of(addons_dir: Path) -> str | None:
+    """"5.3" for <config>/5.3/scripts/addons or <config>/5.3/extensions/user_default."""
+    name = addons_dir.parent.parent.name
+    return name if _VERSION_DIR_RE.match(name) else None
+
+
+def _newest_version_dirs(dirs: list[Path]) -> list[Path]:
+    """The addon dirs that belong to the same Blender version as dirs[0], the newest one.
+
+    Both scripts/addons and extensions/user_default sit two levels below the
+    version folder (5.3/scripts/addons), so their grandparent identifies it.
+    """
+    newest = dirs[0].parent.parent
+    return [d for d in dirs if d.parent.parent == newest]
 
 
 def _is_blendermcp_addon_file(path: Path) -> bool:
@@ -313,10 +363,14 @@ def install_addon(
                 "Set BLENDERMCP_ADDONS_DIR to your Blender scripts/addons path, "
                 "or install addon.py manually from the repo.",
             )
-        # Update where the addon already lives rather than the newest
-        # scripts/addons dir.
-        existing = find_existing_addon_installs(dirs)
-        addons_dir = existing[0].parent if existing else dirs[0]
+        # Install for the newest Blender: it doesn't carry add-ons over from the
+        # previous version's folder, so updating the copy that already lives
+        # there would leave the Blender the user just upgraded to without one
+        # (#431). Within that version, update the copy it loads (scripts/addons
+        # or extensions) rather than adding a second one.
+        candidates = _newest_version_dirs(dirs)
+        existing = find_existing_addon_installs(candidates)
+        addons_dir = existing[0].parent if existing else candidates[0]
 
     addons_dir = Path(addons_dir).expanduser()
     if not addons_dir.exists():

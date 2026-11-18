@@ -104,6 +104,19 @@ _addon_handshake = None
 _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
 
+# How long a command may run in Blender before we stop waiting for it.
+RESPONSE_TIMEOUT = 180.0
+CONNECT_TIMEOUT = 10.0
+TIMEOUT_MESSAGE = (
+    f"Blender didn't answer within {int(RESPONSE_TIMEOUT)}s. It is most likely still busy: "
+    "Blender runs commands one at a time on its main thread, and a long operation (a large "
+    "import, exact booleans, a render) can't be interrupted from here, so it carries on in "
+    "Blender. Before retrying, wait and check the scene with get_scene_info, since the work "
+    "may complete. Split long work into smaller steps. If Blender is running headless "
+    "(blender -b), commands never execute; run it with a GUI or via 'xvfb-run -a blender'."
+)
+
+
 @dataclass
 class BlenderConnection:
     host: str
@@ -121,7 +134,11 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Bounded, so a Blender too busy to accept (its listen backlog full of
+            # abandoned connections) fails the call instead of hanging it.
+            self.sock.settimeout(CONNECT_TIMEOUT)
             self.sock.connect((self.host, self.port))
+            self.sock.settimeout(RESPONSE_TIMEOUT)
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
@@ -143,7 +160,7 @@ class BlenderConnection:
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
         # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
+        sock.settimeout(RESPONSE_TIMEOUT)
         
         try:
             while True:
@@ -170,12 +187,12 @@ class BlenderConnection:
                 except socket.timeout:
                     # If we hit a timeout during receiving, break the loop and try to use what we have
                     logger.warning("Socket timeout during chunked receive")
+                    if not chunks:
+                        raise  # Nothing at all: let the caller report a timeout
                     break
                 except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
                     logger.error(f"Socket connection error during receive: {str(e)}")
                     raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
         except Exception as e:
             logger.error(f"Error during receive: {str(e)}")
             raise
@@ -230,7 +247,7 @@ class BlenderConnection:
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
+            self.sock.settimeout(RESPONSE_TIMEOUT)
             
             # Receive the response using the improved receive_full_response method
             response_data = self.receive_full_response(self.sock)
@@ -246,13 +263,14 @@ class BlenderConnection:
             return response.get("result", {})
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request. If Blender is running headless (blender -b), commands never execute; run Blender with a GUI or via 'xvfb-run -a blender' instead")
+            # Close rather than just drop the socket: the addon then sees this
+            # client is gone and skips the command if it hasn't started it yet,
+            # instead of running it long after anyone is waiting (#430).
+            self.disconnect()
+            raise Exception(TIMEOUT_MESSAGE)
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
@@ -263,7 +281,7 @@ class BlenderConnection:
         except Exception as e:
             logger.error(f"Error communicating with Blender: {str(e)}")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Communication error with Blender: {str(e)}")
 
 @asynccontextmanager
@@ -403,6 +421,23 @@ def _addon_protocol() -> int | None:
     return _addon_handshake.protocol_version if _addon_handshake else None
 
 
+def _connect_failure_message(host: str, port: int) -> str:
+    """Why we couldn't connect, with what the addon files on disk suggest (#431).
+
+    A refused connection looks the same whether Blender is closed, the server
+    isn't started, or Blender updated and no longer loads the addon at all.
+    """
+    message = (
+        f"Could not connect to Blender at {host}:{port}. Make sure Blender is open and "
+        "the addon's server is started (3D Viewport sidebar → MCP for Blender → "
+        "Connect to MCP server)."
+    )
+    status = check_addon_status_on_startup()
+    if status.needs_action:
+        message += " " + status.message
+    return message
+
+
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
     global _blender_connection
@@ -421,7 +456,7 @@ def get_blender_connection():
         if not _blender_connection.connect():
             logger.error("Failed to connect to Blender")
             _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
+            raise Exception(_connect_failure_message(host, port))
         logger.info("Created new persistent connection to Blender")
         _maybe_handshake_addon(_blender_connection)
 

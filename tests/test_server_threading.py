@@ -73,6 +73,7 @@ def _load_server_class():
     namespace = {
         "bpy": bpy,
         "socket": socket,
+        "select": __import__("select"),
         "threading": threading,
         "json": json,
         "time": time,
@@ -206,6 +207,60 @@ def test_stop_releases_client_threads():
             client.close()
         except OSError:
             pass
+
+
+def _wait_until_queued(server, count):
+    deadline = time.time() + 2.0
+    while time.time() < deadline and server.command_queue.qsize() < count:
+        time.sleep(0.01)
+    assert server.command_queue.qsize() == count, "commands were not queued"
+
+
+def test_command_from_disconnected_client_is_skipped():
+    """#430: a client that gave up while Blender was busy isn't waiting any more.
+
+    Its queued command must not run once the main thread frees up; a live
+    client's command queued behind it still must.
+    """
+    server = _make_server()
+    ran = []
+    server.execute_command = lambda command: ran.append(command["type"]) or {
+        "status": "success",
+        "result": {},
+    }
+    server.start()
+    try:
+        abandoned = socket.create_connection(("localhost", server.port), timeout=5)
+        abandoned.sendall(json.dumps({"type": "abandoned"}).encode())
+        _wait_until_queued(server, 1)
+        abandoned.close()
+
+        with socket.create_connection(("localhost", server.port), timeout=5) as live:
+            live.sendall(json.dumps({"type": "live"}).encode())
+            _wait_until_queued(server, 2)
+
+            server._drain_command_queue()
+            live.settimeout(5)
+            response = json.loads(live.recv(8192).decode())
+
+        assert response["status"] == "success"
+        assert ran == ["live"]
+    finally:
+        server.stop()
+
+
+def test_live_client_is_not_mistaken_for_gone():
+    """The disconnect probe must not misfire on an open, idle connection."""
+    server = _make_server()
+    server.start()
+    try:
+        with socket.create_connection(("localhost", server.port), timeout=5) as client:
+            client.sendall(json.dumps({"type": "ping"}).encode())
+            _wait_until_queued(server, 1)
+            _command, queued_client = server.command_queue.queue[0]
+            assert server._client_gone(queued_client) is False
+    finally:
+        server.stop()
 
 
 def bpy_timer_registered(server):
