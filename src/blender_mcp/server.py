@@ -1626,7 +1626,7 @@ async def look(
             "max_size": max(200, min(int(max_size or 768), 2000))}
 
     def native():
-        return _viewport_screenshot(ctx, max_size=max_size, user_prompt=user_prompt)
+        return _viewport_screenshot(ctx, max_size=args["max_size"], user_prompt=user_prompt)
 
     # Every look is a script; the addon's native viewport capture is the fallback,
     # since old addons may have only that.
