@@ -249,7 +249,7 @@ def test_failed_import_is_an_error():
 
 
 def test_bad_handles_are_rejected():
-    for handle in ("", "tripo", "meshy:rid:1", "tripo:rid:"):
+    for handle in ("", "tripo", "meshy:rid:1", "tripo:rid:", "hyper3d:main:abc"):
         with pytest.raises(GenerationError):
             Job.parse(handle, "X")
 
