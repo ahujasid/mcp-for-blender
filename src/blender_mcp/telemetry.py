@@ -66,6 +66,8 @@ class TelemetryEvent:
     duration_ms: float | None = None
     error_message: str | None = None
     blender_version: str | None = None
+    addon_version: str | None = None
+    addon_protocol: int | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -94,6 +96,11 @@ class TelemetryCollector:
         self._consent_cache: bool | None = None
         self._consent_cached_at: float = 0.0
         self._consent_lock = threading.Lock()
+
+        # Reported by the addon at handshake. Kept with or without consent: the
+        # consent default lives in the addon, so these say which default applied.
+        self.addon_version: str | None = None
+        self.addon_protocol: int | None = None
 
         # Background queue and worker
         self._queue: "queue.Queue[TelemetryEvent]" = queue.Queue(maxsize=1000)
@@ -187,6 +194,13 @@ class TelemetryCollector:
             self._consent_cached_at = time.time()
         return consent
 
+    def set_addon_info(self, addon_version: list[int] | None, protocol: int | None) -> None:
+        """Tag later events with the connected addon's version and protocol."""
+        self.addon_version = (
+            ".".join(str(part) for part in addon_version) if addon_version else None
+        )
+        self.addon_protocol = protocol
+
     def invalidate_consent_cache(self) -> None:
         """Force the next consent check to re-query Blender."""
         with self._consent_lock:
@@ -245,6 +259,8 @@ class TelemetryCollector:
             duration_ms=duration_ms,
             error_message=error_message,
             blender_version=blender_version,
+            addon_version=self.addon_version,
+            addon_protocol=self.addon_protocol,
             metadata=metadata
         )
 
@@ -288,6 +304,8 @@ class TelemetryCollector:
                 "version": event.version,
                 "platform": event.platform,
                 "blender_version": event.blender_version,
+                "addon_version": event.addon_version,
+                "addon_protocol": event.addon_protocol,
                 "metadata": event.metadata or {},
                 "event_timestamp": int(event.timestamp),
             }

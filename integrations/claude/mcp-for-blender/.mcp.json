@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "blender": {
+      "command": "uvx",
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}/vendor/mcp_for_blender-2.3.1-py3-none-any.whl", "mcp-for-blender"]
+    }
+  }
+}

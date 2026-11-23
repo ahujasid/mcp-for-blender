@@ -210,7 +210,7 @@ return {"header": header, "lines": lines, "total": total, "shown": len(lines)}
 # offscreen path matches the addon's own screenshot, which works while the
 # Blender window is in the background.
 LOOK = r'''
-import bpy, math
+import bpy, math, os
 import gpu
 import numpy as np
 from mathutils import Vector, Matrix
@@ -412,9 +412,110 @@ def set_attr(obj, attr, value):
         saved.pop()
 
 requested = ARGS.get("shading")
-shading_types = {"solid": "SOLID", "material": "MATERIAL", "rendered": "RENDERED", "wireframe": "SOLID", "xray": "SOLID"}
-if requested:
+# Rendered is a real render with the scene's engine, cut down to a quick one;
+# the other shadings draw the viewport.
+render = requested == "rendered"
+shading_types = {"solid": "SOLID", "material": "MATERIAL", "wireframe": "SOLID", "xray": "SOLID"}
+if requested in shading_types:
     set_attr(shading, "type", shading_types[requested])
+
+# Samples per render: enough for denoising to give a clean picture. Angles and
+# frames render once per tile, so each gets fewer.
+QUICK_SAMPLES = 16 if mode in {"viewport", "camera"} else 8
+QUICK_SECONDS = 8 if mode in {"viewport", "camera"} else 3
+temp = {}  # the camera a render looks through, removed at the end
+
+def setup_render():
+    r = scene.render
+    set_attr(r, "resolution_percentage", 100)
+    set_attr(r, "use_border", False)
+    set_attr(r, "use_motion_blur", False)
+    # With strips in the sequencer, a render shows those instead of the scene.
+    set_attr(r, "use_sequencer", False)
+    for attr, value in (("file_format", "PNG"), ("color_mode", "RGBA"), ("color_depth", "8")):
+        set_attr(r.image_settings, attr, value)
+    samples = None
+    if r.engine == "CYCLES":
+        c = scene.cycles
+        set_attr(c, "samples", min(c.samples, QUICK_SAMPLES))
+        set_attr(c, "use_adaptive_sampling", True)
+        set_attr(c, "use_denoising", True)
+        set_attr(c, "time_limit", min(c.time_limit or QUICK_SECONDS, QUICK_SECONDS))
+        samples = c.samples
+    elif hasattr(scene, "eevee") and "EEVEE" in r.engine:
+        set_attr(scene.eevee, "taa_render_samples", min(scene.eevee.taa_render_samples, QUICK_SAMPLES))
+        samples = scene.eevee.taa_render_samples
+    # Render into a slot of its own, so the user's last render survives.
+    result = next((i for i in bpy.data.images if i.type == "RENDER_RESULT"), None)
+    if result is not None:
+        slots = result.render_slots
+        if not any(s.name == "MCP look" for s in slots):
+            slots.new(name="MCP look")
+        index = next((i for i, s in enumerate(slots) if s.name == "MCP look"), None)
+        if index is not None:
+            set_attr(slots, "active_index", index)
+    info["render"] = {"engine": r.engine, "samples": samples, "seconds": 0.0}
+
+def view_camera(view, win, w, h):
+    """A temporary camera that sees what view and win see."""
+    if "camera" not in temp:
+        obj = bpy.data.objects.new("MCP look", bpy.data.cameras.new("MCP look"))
+        scene.collection.objects.link(obj)
+        temp["camera"] = obj
+    obj = temp["camera"]
+    cam, m, big = obj.data, win, max(w, h)
+    eye = view.inverted()
+    cam.sensor_fit = "AUTO"  # the angle spans the longer side
+    if m[3][3] == 0:
+        cam.type = "PERSP"
+        cam.angle = 2 * math.atan(1 / (m[0][0] if w >= h else m[1][1]))
+        cam.clip_start = m[2][3] / (m[2][2] - 1)
+        cam.clip_end = m[2][3] / (m[2][2] + 1)
+        cam.shift_x = m[0][2] * w / (2 * big)
+        cam.shift_y = m[1][2] * h / (2 * big)
+    else:
+        cam.type = "ORTHO"
+        cam.ortho_scale = 2 / (m[0][0] if w >= h else m[1][1])
+        near, far = (m[2][3] + 1) / m[2][2], (m[2][3] - 1) / m[2][2]
+        # An orthographic viewport sees behind its eye and a camera can't, so step back.
+        back = max(0.0, 0.001 - near)
+        eye = eye @ Matrix.Translation((0, 0, back))
+        cam.clip_start, cam.clip_end = near + back, far + back
+        cam.shift_x = -m[0][3] * w / (2 * big)
+        cam.shift_y = -m[1][3] * h / (2 * big)
+    obj.matrix_world = eye
+    return obj
+
+def render_through(cam, w, h):
+    import time
+    r = scene.render
+    set_attr(scene, "camera", cam)
+    set_attr(r, "resolution_x", w)
+    set_attr(r, "resolution_y", h)
+    if cam is temp.get("camera"):
+        set_attr(r, "pixel_aspect_x", 1.0)
+        set_attr(r, "pixel_aspect_y", 1.0)
+    start = time.perf_counter()
+    if "FINISHED" not in bpy.ops.render.render(write_still=False):
+        raise RuntimeError("the render was cancelled")
+    info["render"]["seconds"] += time.perf_counter() - start
+    result = next(i for i in bpy.data.images if i.type == "RENDER_RESULT")
+    path = ARGS["filepath"] + ".tile.png"
+    result.save_render(path, scene=scene)
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        iw, ih = img.size
+        buf = np.empty(iw * ih * 4, dtype=np.float32)
+        img.pixels.foreach_get(buf)
+    finally:
+        bpy.data.images.remove(img)
+        os.remove(path)
+    return buf.reshape(ih, iw, 4)
+
+def draw_or_render(view, win, w, h, cam=None):
+    if not render:
+        return draw(view, win, w, h)
+    return render_through(cam or view_camera(view, win, w, h), w, h)
 
 info = {"mode": mode, "targets": len(targets), "center": [round(v, 2) for v in center],
         "size": [round(v, 2) for v in (hi - lo)]}
@@ -429,13 +530,15 @@ if mode != "viewport":
         # Grid, light and camera gizmos aren't part of what's being judged.
         set_attr(overlay, "show_overlays", False)
     engine = scene.render.engine
-    if shading.type == "RENDERED" and "EEVEE" not in engine and engine != "BLENDER_WORKBENCH":
+    if not render and shading.type == "RENDERED" and "EEVEE" not in engine and engine != "BLENDER_WORKBENCH":
         # Progressive engines like Cycles draw nothing into an offscreen view.
         return {"error": f"Rendered shading can't be captured with {engine}. Render and look at "
                          "image=\"Render Result\", use material shading, or switch the engine."}
 frame_before = scene.frame_current
 
 try:
+    if render:
+        setup_render()
     if requested == "wireframe":
         # Edges over a plain matcap surface: topology and form in one picture.
         set_attr(shading, "light", "MATCAP")
@@ -458,8 +561,14 @@ try:
         w, h = region.width, region.height
         s = min(1.0, max_size / max(w, h))
         w, h = max(1, int(w * s)), max(1, int(h * s))
-        view, win = current_view()
-        image = draw(view, win, w, h)
+        if render and space.region_3d.view_perspective == "CAMERA" and scene.camera:
+            # Looking through the camera: render it, at the render's shape.
+            rx, ry = scene.render.resolution_x, scene.render.resolution_y
+            s = max_size / max(rx, ry)
+            w, h = max(1, int(rx * s)), max(1, int(ry * s))
+            image = draw_or_render(None, None, w, h, cam=scene.camera)
+        else:
+            image = draw_or_render(*current_view(), w, h)
     elif mode == "camera":
         rx, ry = scene.render.resolution_x, scene.render.resolution_y
         s = max_size / max(rx, ry)
@@ -468,7 +577,7 @@ try:
         if cv is None:
             return {"error": "The scene has no camera. Add one or use mode='angles'."}
         info["camera"] = scene.camera.name
-        image = draw(cv[0], cv[1], w, h)
+        image = draw_or_render(cv[0], cv[1], w, h, cam=scene.camera)
     elif mode == "frames":
         start, end = scene.frame_start, scene.frame_end
         frames = ARGS.get("frames") or []
@@ -489,7 +598,7 @@ try:
                 view, win = orbit(direction_of(ARGS["view"]), w / h)
             else:
                 view, win = current_view()
-            tiles.append(draw(view, win, w, h))
+            tiles.append(draw_or_render(view, win, w, h, cam=scene.camera if use_camera else None))
         info["frames"] = [int(f) for f in frames]
         image = sheet(tiles, cols)
     else:
@@ -498,7 +607,7 @@ try:
         cols = 1 if len(views) == 1 else (3 if len(views) > 4 else 2)
         w = max(64, max_size // cols)
         h = w
-        tiles = [draw(*orbit(direction_of(v), 1.0), w, h) for v in views]
+        tiles = [draw_or_render(*orbit(direction_of(v), 1.0), w, h) for v in views]
         info["views"] = [label(v) for v in views]
         image = sheet(tiles, cols)
 finally:
@@ -509,6 +618,10 @@ finally:
             setattr(obj, attr, value)
         except Exception:
             pass
+    if "camera" in temp:
+        data = temp["camera"].data
+        bpy.data.objects.remove(temp["camera"])
+        bpy.data.cameras.remove(data)
 
 h, w = image.shape[:2]
 img = bpy.data.images.new("mcp_look", w, h, alpha=True)

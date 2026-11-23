@@ -59,11 +59,14 @@ def test_newer_main_is_offered(monkeypatch, addon):
     assert addon._addon_update["source"] == newer
 
 
-@pytest.mark.parametrize("delta", [0, -1])
-def test_same_or_older_main_is_never_offered(monkeypatch, addon, delta):
+@pytest.mark.parametrize("older", [False, True])
+def test_same_or_older_main_is_never_offered(monkeypatch, addon, older):
     major, minor = addon.bl_info["version"][:2]
+    if older:
+        # x.0 is preceded by (x-1).something, not x.-1.
+        major, minor = (major, minor - 1) if minor else (major - 1, 9)
     _serve(monkeypatch, addon, types.SimpleNamespace(
-        status_code=200, text=_with_version((major, minor + delta), addon.ADDON_PROTOCOL_VERSION)))
+        status_code=200, text=_with_version((major, minor), addon.ADDON_PROTOCOL_VERSION)))
     addon.check_for_addon_update()
     assert addon._addon_update["status"] == "current"
     assert addon._addon_update["source"] is None

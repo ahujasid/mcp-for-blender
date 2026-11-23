@@ -1065,6 +1065,8 @@ class TrajectoryRecorder:
             "version": MCP_VERSION,
             "platform": platform.system().lower(),
             "blender_version": blender_version,
+            "addon_version": telemetry.addon_version,
+            "addon_protocol": telemetry.addon_protocol,
             "event_timestamp": int(time.time()),
         }
 

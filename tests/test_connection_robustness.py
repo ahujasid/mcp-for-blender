@@ -172,7 +172,7 @@ def test_drain_yields_to_blender_ui_between_slow_commands():
     import queue
 
     for i in range(5):
-        server.command_queue.put(({"type": f"c{i}"}, queue.Queue(maxsize=1)))
+        server.command_queue.put(({"type": f"c{i}"}, queue.Queue(maxsize=1), None))
     next_interval = server._drain_command_queue()
     assert ran == ["c0"]
     assert next_interval == 0.0, "should ask to run again right after the UI updates"
