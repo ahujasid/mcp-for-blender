@@ -84,7 +84,12 @@ ALLOWED_SCRIPTS = {
     ),
     "open_mainfile": (
         "import bpy\n"
-        "bpy.ops.wm.open_mainfile(filepath='/tmp/other.blend')\n"
+        "bpy.ops.wm.open_mainfile(filepath='/tmp/other.blend', load_ui=False)\n"
+    ),
+    "double_star_to_other_operator": (
+        "import bpy\n"
+        "params = {'size': 2.0, 'location': (0, 0, 1)}\n"
+        "bpy.ops.mesh.primitive_cube_add(**params)\n"
     ),
     "bmesh_and_math": (
         "import bpy\n"
@@ -238,6 +243,29 @@ BLOCKED_SCRIPTS = {
     "lambda_call": "f = lambda: 1\nf()",
     "unknown_name": "mystery_helper()",
     "class_def": "class Evil:\n    pass",
+    # Trusting a loaded file to auto-run its scripts, whatever the preference.
+    "open_mainfile_use_scripts": (
+        "import bpy\n"
+        "bpy.ops.wm.open_mainfile(filepath='/tmp/evil.blend', use_scripts=True)\n"
+    ),
+    "revert_mainfile_use_scripts": "import bpy\nbpy.ops.wm.revert_mainfile(use_scripts=True)\n",
+    "recover_auto_save_use_scripts": (
+        "import bpy\n"
+        "bpy.ops.wm.recover_auto_save(filepath='/tmp/evil.blend', use_scripts=True)\n"
+    ),
+    "recover_last_session_use_scripts": (
+        "import bpy\nbpy.ops.wm.recover_last_session(use_scripts=True)\n"
+    ),
+    "use_scripts_from_variable": (
+        "import bpy\n"
+        "trust = 1 > 0\n"
+        "bpy.ops.wm.open_mainfile(filepath='/tmp/evil.blend', use_scripts=trust)\n"
+    ),
+    "open_mainfile_double_star": (
+        "import bpy\n"
+        "kw = {'use_scripts': True}\n"
+        "bpy.ops.wm.open_mainfile(filepath='/tmp/evil.blend', **kw)\n"
+    ),
 }
 
 

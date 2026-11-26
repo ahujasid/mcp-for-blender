@@ -44,6 +44,9 @@ STILL BLOCKED (security properties, not app-architecture decisions):
     and the pre-3.6 `script_directory`, plus `use_scripts_auto_execute`
   * external .blend datablock loading (`wm.append`/`wm.link`/`lib_relocate`/
     `lib_reload`) — a hostile .blend carries drivers that run on load
+  * the `use_scripts` argument of the file-load operators (`open_mainfile`,
+    `revert_mainfile`, `recover_auto_save`, `recover_last_session`), which
+    trusts the loaded file to run its scripts whatever the preference says
   * `bpy.data.texts` / `.scripts` / `.libraries`, `bpy.utils.execfile` and
     friends, `save_homefile`, `url_open` / `path_open`, `quit_blender`
 
@@ -375,6 +378,20 @@ _FORBIDDEN_ASSIGN_ATTRS: Final[dict[str, str]] = {
     "script_directory": "redirects Blender's script search path",
     "use_scripts_auto_execute": "enables automatic execution of embedded scripts",
 }
+
+
+#: Blender's file-load operators take a `use_scripts` argument that overrides
+#: the auto-execution preference for the file being loaded, so
+#: `open_mainfile(filepath=..., use_scripts=True)` runs that file's drivers and
+#: registered text blocks. Opening a file stays allowed; trusting it does not.
+#: A `**` argument could carry the keyword, so these operators refuse it too.
+_TRUST_KEYWORD: Final[str] = "use_scripts"
+_FILE_LOAD_OPS: Final[frozenset[str]] = frozenset({
+    "bpy.ops.wm.open_mainfile",
+    "bpy.ops.wm.revert_mainfile",
+    "bpy.ops.wm.recover_auto_save",
+    "bpy.ops.wm.recover_last_session",
+})
 
 
 # --- node policy ----------------------------------------------------------
@@ -770,6 +787,22 @@ class _Validator(ast.NodeVisitor):
                 "targets cannot be validated",
                 node,
             )
+
+        # Checked on every call, not only the known operators, so a renamed
+        # or future load operator cannot be handed the keyword either.
+        for keyword in node.keywords:
+            if keyword.arg == _TRUST_KEYWORD:
+                self._fail(
+                    f"{_TRUST_KEYWORD}= lets the loaded .blend run its embedded "
+                    "scripts and drivers; leave it out to follow the preference",
+                    node,
+                )
+            if keyword.arg is None and _attr_chain(func) in _FILE_LOAD_OPS:
+                self._fail(
+                    f"** arguments to {_attr_chain(func)} could pass "
+                    f"{_TRUST_KEYWORD}=; spell the keywords out",
+                    node,
+                )
 
         self.generic_visit(node)
 
