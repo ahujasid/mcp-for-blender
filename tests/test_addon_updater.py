@@ -79,6 +79,27 @@ def test_a_protocol_bump_alone_counts_as_newer(monkeypatch, addon):
     assert addon._addon_update["status"] == "available"
 
 
+def test_version_still_known_when_loaded_as_an_extension(monkeypatch, addon):
+    # Blender deletes bl_info from a module it loads as an extension (#443).
+    monkeypatch.delattr(addon, "bl_info")
+    assert addon._local_release_key() == addon.ADDON_VERSION + (0, addon.ADDON_PROTOCOL_VERSION)
+    info = addon.BlenderMCPServer().get_addon_info()
+    assert (info["name"], info["addon_version"]) == ("MCP for Blender", list(addon.ADDON_VERSION))
+
+    sent = {}
+
+    def request(method, url, headers=None, **_kwargs):
+        sent.update(headers)
+        raise ConnectionError("offline")
+    monkeypatch.setattr(addon.requests, "request", request, raising=False)
+    addon.premium_request("GET", "/v1/usage", auth=False)
+    assert sent["X-Addon-Version"] == ".".join(str(part) for part in addon.ADDON_VERSION)
+
+    _serve(monkeypatch, addon, types.SimpleNamespace(status_code=200, text=SOURCE))
+    addon.check_for_addon_update()
+    assert addon._addon_update["status"] == "current"
+
+
 @pytest.mark.parametrize("response", [
     FakeResponse(status_code=404),
     types.SimpleNamespace(status_code=200, text="<html>rate limited</html>"),
