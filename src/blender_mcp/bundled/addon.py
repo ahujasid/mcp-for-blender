@@ -1981,6 +1981,27 @@ class BlenderMCPServer:
         return relations
 
     @staticmethod
+    def _action_fcurves(anim_data, action):
+        """Return F-curves for `action` across legacy (<4.4) and slotted (4.4+/5.0+) actions."""
+        if hasattr(anim_data, "action_slot"):
+            slot = getattr(anim_data, "action_slot", None)
+            if slot is not None:
+                try:
+                    from bpy_extras import anim_utils
+                    channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
+                    return channelbag.fcurves if channelbag is not None else ()
+                except Exception:
+                    pass
+                for layer in getattr(action, "layers", None) or ():
+                    for strip in getattr(layer, "strips", None) or ():
+                        for channelbag in getattr(strip, "channelbags", None) or ():
+                            if getattr(channelbag, "slot", None) == slot:
+                                return getattr(channelbag, "fcurves", None) or ()
+            if not hasattr(action, "fcurves"):
+                return ()
+        return getattr(action, "fcurves", None) or ()
+
+    @staticmethod
     def _snapshot_animation(obj):
         """Action name and per-channel keyframe summary for one object, or {}.
 
@@ -2002,7 +2023,7 @@ class BlenderMCPServer:
                 channels = []
                 total_keyframes = 0
                 frame_min, frame_max = None, None
-                for fcurve in action.fcurves:
+                for fcurve in BlenderMCPServer._action_fcurves(anim_data, action):
                     keyframe_points = fcurve.keyframe_points
                     count = len(keyframe_points)
                     total_keyframes += count
