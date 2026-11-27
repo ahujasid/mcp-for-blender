@@ -17,7 +17,7 @@ import re
 
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, EventType
-from .telemetry_decorator import telemetry_tool, trajectory_tool
+from .telemetry_decorator import observe_tool, telemetry_tool, trajectory_tool
 from .addon_manager import (
     handshake_addon,
     format_handshake_log,
@@ -104,6 +104,19 @@ _addon_handshake = None
 _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
 
+# How long a command may run in Blender before we stop waiting for it.
+RESPONSE_TIMEOUT = 180.0
+CONNECT_TIMEOUT = 10.0
+TIMEOUT_MESSAGE = (
+    f"Blender didn't answer within {int(RESPONSE_TIMEOUT)}s. It is most likely still busy: "
+    "Blender runs commands one at a time on its main thread, and a long operation (a large "
+    "import, exact booleans, a render) can't be interrupted from here, so it carries on in "
+    "Blender. Before retrying, wait and check the scene with get_scene_info, since the work "
+    "may complete. Split long work into smaller steps. If Blender is running headless "
+    "(blender -b), commands never execute; run it with a GUI or via 'xvfb-run -a blender'."
+)
+
+
 @dataclass
 class BlenderConnection:
     host: str
@@ -121,7 +134,11 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Bounded, so a Blender too busy to accept (its listen backlog full of
+            # abandoned connections) fails the call instead of hanging it.
+            self.sock.settimeout(CONNECT_TIMEOUT)
             self.sock.connect((self.host, self.port))
+            self.sock.settimeout(RESPONSE_TIMEOUT)
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
@@ -143,7 +160,7 @@ class BlenderConnection:
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
         # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
+        sock.settimeout(RESPONSE_TIMEOUT)
         
         try:
             while True:
@@ -170,12 +187,12 @@ class BlenderConnection:
                 except socket.timeout:
                     # If we hit a timeout during receiving, break the loop and try to use what we have
                     logger.warning("Socket timeout during chunked receive")
+                    if not chunks:
+                        raise  # Nothing at all: let the caller report a timeout
                     break
                 except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
                     logger.error(f"Socket connection error during receive: {str(e)}")
                     raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
         except Exception as e:
             logger.error(f"Error during receive: {str(e)}")
             raise
@@ -230,7 +247,7 @@ class BlenderConnection:
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
+            self.sock.settimeout(RESPONSE_TIMEOUT)
             
             # Receive the response using the improved receive_full_response method
             response_data = self.receive_full_response(self.sock)
@@ -246,13 +263,14 @@ class BlenderConnection:
             return response.get("result", {})
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request. If Blender is running headless (blender -b), commands never execute; run Blender with a GUI or via 'xvfb-run -a blender' instead")
+            # Close rather than just drop the socket: the addon then sees this
+            # client is gone and skips the command if it hasn't started it yet,
+            # instead of running it long after anyone is waiting (#430).
+            self.disconnect()
+            raise Exception(TIMEOUT_MESSAGE)
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
@@ -263,7 +281,7 @@ class BlenderConnection:
         except Exception as e:
             logger.error(f"Error communicating with Blender: {str(e)}")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Communication error with Blender: {str(e)}")
 
 @asynccontextmanager
@@ -407,6 +425,23 @@ def _addon_protocol() -> int | None:
     return _addon_handshake.protocol_version if _addon_handshake else None
 
 
+def _connect_failure_message(host: str, port: int) -> str:
+    """Why we couldn't connect, with what the addon files on disk suggest (#431).
+
+    A refused connection looks the same whether Blender is closed, the server
+    isn't started, or Blender updated and no longer loads the addon at all.
+    """
+    message = (
+        f"Could not connect to Blender at {host}:{port}. Make sure Blender is open and "
+        "the addon's server is started (3D Viewport sidebar → MCP for Blender → "
+        "Connect to MCP server)."
+    )
+    status = check_addon_status_on_startup()
+    if status.needs_action:
+        message += " " + status.message
+    return message
+
+
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
     global _blender_connection
@@ -425,7 +460,7 @@ def get_blender_connection():
         if not _blender_connection.connect():
             logger.error("Failed to connect to Blender")
             _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
+            raise Exception(_connect_failure_message(host, port))
         logger.info("Created new persistent connection to Blender")
         _maybe_handshake_addon(_blender_connection)
 
@@ -433,11 +468,11 @@ def get_blender_connection():
 
 
 def _integrations(blender: BlenderConnection, premium_generators) -> dict:
-    """Which libraries (search_assets) and generators (generate_3d) are on. Reads
-    local settings only: Premium generators come from the handshake rather than a
-    status call, which would ask the Premium server once per generator."""
+    """Which libraries (search_assets), generators (generate_3d) and world generators
+    (generate_gaussian_world) are on. Reads local settings only: Premium generators come from the
+    handshake rather than a status call, which would ask the Premium server once per generator."""
     status = {}
-    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy", "tripo"):
+    for name in ("polyhaven", "sketchfab", "polypizza", "hunyuan3d", "hyper3d", "meshy", "tripo", "worldlabs"):
         if name in (premium_generators or []):
             status[name] = "on (Premium)"
             continue
@@ -449,6 +484,7 @@ def _integrations(blender: BlenderConnection, premium_generators) -> dict:
     return {
         "libraries": {k: status[k] for k in ("polyhaven", "sketchfab", "polypizza")},
         "generators": {k: status[k] for k in ("tripo", "hunyuan3d", "hyper3d", "meshy")},
+        "worlds": {"worldlabs": status["worldlabs"]},
     }
 
 
@@ -458,8 +494,8 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
     Check the connected Blender: its version, whether the addon matches this server, and which
     asset libraries and 3D generators are switched on. Call it once at the start.
 
-    `libraries` are the search_assets sources and `generators` the generate_3d providers, each
-    on or off for this user. "(Premium)" ones come with MCP for Blender Premium and don't use the
+    `libraries` are the search_assets sources, `generators` the generate_3d providers and
+    `worlds` the generate_gaussian_world providers, each on or off for this user. "(Premium)" ones come with MCP for Blender Premium and don't use the
     user's own API keys. When pointing the user to Premium, link
     https://mcp-for-blender.com/premium?ref=mcp-status
 
@@ -724,72 +760,19 @@ def _store_capture(max_size: int, source: str) -> None:
 
 # In MCP Apps hosts the result also shows in the fullscreen Viewport app.
 def _viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "") -> CallToolResult:
-    """look(mode="viewport"): the user's viewport, also shown in the Viewport app."""
-    start_time = __import__('time').time()
-    screenshot_url = None
-    success = False
-    error_msg = None
-    
+    """The addon's own viewport capture, also shown in the Viewport app; look's fallback."""
     try:
         _store_capture(max_size, "model")
         state, image_bytes = _viewport_snapshot()
-
-        # Upload to storage for telemetry
-        try:
-            telemetry = get_telemetry()
-            if telemetry._check_user_consent():
-                screenshot_url = telemetry.upload_screenshot(image_bytes, "screenshot")
-        except Exception:
-            pass  # Silently fail - don't break screenshot for telemetry issues
-        
-        success = True
         # The state rides in _meta, which only the Viewport app reads, so the
         # model sees exactly the image it always did.
         return CallToolResult(
             content=[_png_content(image_bytes)],
             _meta={VIEWPORT_STATE_META: state},
         )
-        
     except Exception as e:
-        error_msg = str(e)
         logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
-    finally:
-        duration_ms = (__import__('time').time() - start_time) * 1000
-        # Record telemetry with screenshot URL in metadata
-        try:
-            telemetry = get_telemetry()
-            
-            metadata = None
-            if screenshot_url:
-                metadata = {"screenshot_url": screenshot_url}
-                
-            telemetry.record_event(
-                event_type=EventType.TOOL_EXECUTION,
-                tool_name="get_viewport_screenshot",
-                prompt_text=user_prompt,
-                success=success,
-                duration_ms=duration_ms,
-                error_message=error_msg,
-                metadata=metadata,
-            )
-        except Exception:
-            pass
-
-        try:
-            from .telemetry_decorator import _record_observe_step
-            _record_observe_step(
-                "get_viewport_screenshot",
-                modality="screenshot",
-                goal_text=user_prompt,
-                summary={"max_size": max_size},
-                screenshot_ref=screenshot_url,
-                success=success,
-                error=error_msg,
-                duration_ms=duration_ms,
-            )
-        except Exception:
-            pass
 
 
 @mcp.tool()
@@ -1560,11 +1543,27 @@ def _look_caption(info: dict) -> str:
     if mode != "viewport":
         size = " x ".join(f"{v:g}" for v in info.get("size", []))
         parts.append(f"Framed {info.get('targets', 0)} objects, {size} m across, centred at {info.get('center')}.")
+    render = info.get("render")
+    if render:
+        samples = f" at {render['samples']} samples" if render.get("samples") else ""
+        parts.append(f"Quick render with {render['engine']}{samples}, {render['seconds']:.1f}s; "
+                     "a final render is cleaner.")
     return " ".join(parts)
 
 
+def _look_params(kwargs: dict) -> dict:
+    """What a look call recorded, with the mode it resolved to, not None."""
+    params = {key: kwargs.get(key) for key in (
+        "mode", "target", "views", "distance", "shading", "frames", "frame_count", "view", "image", "max_size")
+        if kwargs.get(key) is not None}
+    params["mode"] = kwargs.get("mode") or ("image" if kwargs.get("image") is not None else "viewport")
+    if params["mode"] != "image":
+        params.setdefault("shading", "rendered")
+    return params
+
+
 @mcp.tool(meta={"ui": {"resourceUri": VIEWPORT_URI}})
-@telemetry_tool("look")
+@observe_tool("look", params=_look_params)
 async def look(
     ctx: Context,
     mode: str | None = None,
@@ -1586,8 +1585,11 @@ async def look(
     - mode: viewport (what the user sees; default), camera (through the scene camera, at the
       render aspect), angles (the target from several sides, auto-framed; default front, right,
       top, three_quarter), frames (a strip over the animation).
-    - shading: solid, material, rendered (EEVEE and Workbench only), wireframe (edges over a
-      plain surface), xray (see-through, bones in front). Default: the viewport's.
+    - shading: rendered (default: a real render with the scene's engine, Cycles included, cut to
+      a few samples and denoised, so lights, materials and world look as they'll render; takes
+      seconds, more for angles and frames since each tile renders), material, solid, wireframe
+      (edges over a plain surface), xray (see-through, bones in front). All but rendered draw the
+      viewport and are instant.
     - image: Instead of the scene, show this image: "Render Result" after a render, another
       image in the file, or a file path.
 
@@ -1614,6 +1616,8 @@ async def look(
             return _app_error("image= shows an image instead of the scene; leave mode unset.")
         mode = "image"
     mode = mode or "viewport"
+    if mode != "image":
+        shading = shading or "rendered"
     if shading is not None and shading not in LOOK_SHADING:
         return _app_error(f"Unknown shading {shading!r}. Use one of: {', '.join(LOOK_SHADING)}")
     for v in (views or []) + ([view] if view is not None and view != "camera" else []):
@@ -1626,16 +1630,12 @@ async def look(
             "max_size": max(200, min(int(max_size or 768), 2000))}
 
     def native():
-        return _viewport_screenshot(ctx, max_size=max_size, user_prompt=user_prompt)
+        return _viewport_screenshot(ctx, max_size=args["max_size"], user_prompt=user_prompt)
 
-    def scripted():
-        return _look_via_script(args)
-
-    # The plain viewport has a native command; everything else is a script.
-    # Each falls back to the other, since old addons may have only one of them.
-    first, second = (native, scripted) if mode == "viewport" and not shading else (scripted, native)
+    # Every look is a script; the addon's native viewport capture is the fallback,
+    # since old addons may have only that.
     try:
-        return first()
+        return _look_via_script(args)
     except _LookRefused as e:
         return _app_error(str(e))
     except Exception as e:
@@ -1645,13 +1645,12 @@ async def look(
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
         return _app_error(f"Couldn't show the image: {reason}{hint}")
     try:
-        result = second()
+        result = native()
     except Exception as e:
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
         return _app_error(f"Couldn't capture the view: {reason}{hint}")
-    if second is native:
-        note = f"look(mode=\"{mode}\") isn't available here ({reason}), so this is the plain viewport."
-        result.content.append(TextContent(type="text", text=note))
+    note = f"look(mode=\"{mode}\", shading=\"{shading}\") isn't available here ({reason}), so this is the plain viewport."
+    result.content.append(TextContent(type="text", text=note))
     return result
 
 
@@ -1679,6 +1678,8 @@ def _generation_send(command: str, params: dict):
                 raise generation.Unsupported(TRIPO_UNAVAILABLE)
             if "meshy" in command:
                 raise generation.Unsupported(missing_feature("Meshy", "Meshy"))
+            if "worldlabs" in command:
+                raise generation.Unsupported(missing_feature("World Labs", "World Labs"))
             label = "Hunyuan3D" if "hunyuan" in command else "Hyper3D Rodin"
             raise generation.Unsupported(missing_feature(label, label))
         raise
@@ -1789,6 +1790,7 @@ async def generate_3d(
     - prompt: Short English description of one object ("weathered wooden treasure chest").
     - image: Instead of a prompt: an absolute image file path or an http(s) URL. Images attached in
       chat can't be passed: ask the user for a path or URL, don't fall back to text without asking.
+      hyper3d also takes a folder of up to 5 images, as views of one object (Premium uses the first).
     - name: Object name in the scene. Defaults to one made from the prompt.
     - provider: auto (default), tripo, hunyuan3d, hyper3d or meshy. Auto prefers the user's MCP for
       Blender Premium generators, then their own API keys.
@@ -1810,7 +1812,10 @@ async def generate_3d(
     wait_seconds = max(10, min(int(wait_seconds or 50), generation.MAX_CALL_S))
     try:
         if job:
-            return await _generation_reply(ctx, generation.Job.parse(job, name or "Generated"), wait_seconds)
+            parsed = generation.Job.parse(job, name or "Generated")
+            if parsed.is_world:
+                return f'Error: that is a world. Resume it with generate_gaussian_world(job="{job}").'
+            return await _generation_reply(ctx, parsed, wait_seconds)
         if bool(prompt) == bool(image):
             return "Error: give exactly one of prompt or image."
         if pose_mode:

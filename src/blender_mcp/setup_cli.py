@@ -22,6 +22,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    tomllib = None
+
 from .addon_manager import (
     blender_config_base,
     find_existing_addon_installs,
@@ -72,6 +77,7 @@ class ClientResult:
     ok: bool
     message: str
     backup: Path | None = None
+    key: str = SERVER_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -409,23 +415,49 @@ def _codex_home(env) -> Path:
     return Path(home) if home else Path.home() / ".codex"
 
 
-_TOML_HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", re.MULTILINE)
+_TOML_HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$", re.MULTILINE)
+_TOML_KEY = r"""(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+)"""
+# `blender = { ... }` or `blender.command = ...` under [mcp_servers], and
+# `mcp_servers.blender... = ...` before the first table.
+_TOML_SERVER_KEY_RE = re.compile(rf"^[ \t]*({_TOML_KEY})[ \t]*(?:\.|=[ \t]*\{{)", re.MULTILINE)
+_TOML_ROOT_SERVER_KEY_RE = re.compile(rf"^[ \t]*mcp_servers[ \t]*\.[ \t]*({_TOML_KEY})[ \t]*[.=]", re.MULTILINE)
 
 
 def _codex_mcp_sections(text: str) -> dict[str, str]:
-    """{server name: its table body} for [mcp_servers.<name>] tables in config.toml.
+    """{server name: its settings as text} for the mcp_servers in config.toml.
 
-    A regex rather than a TOML parser: tomllib only arrived in Python 3.11,
-    and all this needs is each table's name and the text beneath it.
+    Read with tomllib where there is one (Python 3.11+). Python 3.10 falls back
+    to a regex that knows the forms a hand-written config uses: [mcp_servers.<name>]
+    tables, and inline tables or dotted keys under [mcp_servers] or at the top.
     """
-    headers = list(_TOML_HEADER_RE.finditer(text))
+    if tomllib is not None:
+        try:
+            servers = tomllib.loads(text).get("mcp_servers")
+        except tomllib.TOMLDecodeError:
+            pass
+        else:
+            return {name: json.dumps(body, default=str) for name, body in servers.items()} if isinstance(servers, dict) else {}
+
     sections: dict[str, str] = {}
+
+    def add(name: str, body: str) -> None:
+        name = name.strip().strip('"\'')
+        sections[name] = sections.get(name, "") + body
+
+    def add_keys(pattern: re.Pattern, body: str) -> None:
+        for m in pattern.finditer(body):
+            line_end = body.find("\n", m.end())
+            add(m.group(1), body[m.start():line_end if line_end >= 0 else len(body)] + "\n")
+
+    headers = list(_TOML_HEADER_RE.finditer(text))
+    add_keys(_TOML_ROOT_SERVER_KEY_RE, text[:headers[0].start()] if headers else text)
     for i, match in enumerate(headers):
         parts = [p.strip().strip('"\'') for p in re.split(r"\.(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", match.group(1))]
-        if len(parts) < 2 or parts[0] != "mcp_servers":
-            continue
         end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
-        sections[parts[1]] = sections.get(parts[1], "") + text[match.end():end]
+        if parts == ["mcp_servers"]:
+            add_keys(_TOML_SERVER_KEY_RE, text[match.end():end])
+        elif len(parts) >= 2 and parts[0] == "mcp_servers":
+            add(parts[1], text[match.end():end])
     return sections
 
 
@@ -469,8 +501,30 @@ def _run_cli(args: list[str]) -> tuple[bool, str]:
     return proc.returncode == 0, output
 
 
-def _cli_commands(client: Client, uvx: str, state: ClientState) -> list[list[str]]:
-    key = state.entry_key if state.status == OUTDATED else SERVER_NAME
+def _cli_server_names(client: Client, env=None) -> dict:
+    """The servers Claude Code or Codex already has at user scope, by name."""
+    env = os.environ if env is None else env
+    try:
+        if client.kind == "claude-code":
+            config, _ = read_json_config(_claude_json_path(env))
+            servers = config.get("mcpServers")
+            return servers if isinstance(servers, dict) else {}
+        return _codex_mcp_sections((_codex_home(env) / "config.toml").read_text(encoding="utf-8"))
+    except (ConfigError, OSError):
+        return {}
+
+
+def _cli_key(client: Client, state: ClientState, env=None) -> str:
+    """The name to configure under. A new entry mustn't reuse the name of an
+    unrelated server: `claude mcp add` refuses it and `codex mcp add` overwrites it."""
+    if state.status == OUTDATED:
+        return state.entry_key
+    return _free_key(_cli_server_names(client, env))
+
+
+def _cli_commands(client: Client, uvx: str, state: ClientState, key: str | None = None) -> list[list[str]]:
+    if key is None:
+        key = state.entry_key if state.status == OUTDATED else SERVER_NAME
     commands: list[list[str]] = []
     if client.kind == "claude-code":
         if state.status == OUTDATED:
@@ -485,15 +539,15 @@ def _cli_commands(client: Client, uvx: str, state: ClientState) -> list[list[str
 
 
 def configure_cli_client(client: Client, uvx: str, state: ClientState) -> ClientResult:
-    for command in _cli_commands(client, uvx, state):
+    key = _cli_key(client, state)
+    for command in _cli_commands(client, uvx, state, key):
         ok, output = _run_cli(command)
         if not ok:
             shown = " ".join(Path(command[0]).name if i == 0 else a for i, a in enumerate(command))
             return ClientResult(client, False, f"`{shown}` failed: {output or 'no output'}")
     verb = "Updated" if state.status == OUTDATED else "Added"
-    key = state.entry_key if state.status == OUTDATED else SERVER_NAME
     where = "user scope, all projects" if client.kind == "claude-code" else "~/.codex/config.toml"
-    return ClientResult(client, True, f'{verb} "{key}" ({where})')
+    return ClientResult(client, True, f'{verb} "{key}" ({where})', key=key)
 
 
 def client_state(client: Client) -> ClientState:
@@ -513,10 +567,17 @@ def configure_client(client: Client, uvx: str, state: ClientState) -> ClientResu
 def describe_change(client: Client, uvx: str, state: ClientState) -> str:
     """What configure_client would do, for --dry-run."""
     if client.kind == "json":
-        verb = f'update "{state.entry_key}"' if state.status == OUTDATED else f'add "{SERVER_NAME}"'
+        if state.status == OUTDATED:
+            verb = f'update "{state.entry_key}"'
+        else:
+            try:
+                servers = read_json_config(client.config_path)[0].get(_servers_key(client.style))
+            except (ConfigError, OSError):
+                servers = None
+            verb = f'add "{_free_key(servers if isinstance(servers, dict) else {})}"'
         return f"would {verb} in {client.config_path}"
     return "would run: " + " && ".join(
-        " ".join([Path(c[0]).name, *c[1:]]) for c in _cli_commands(client, uvx, state)
+        " ".join([Path(c[0]).name, *c[1:]]) for c in _cli_commands(client, uvx, state, _cli_key(client, state))
     )
 
 
@@ -824,10 +885,11 @@ def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool 
     for r in results:
         if r.ok:
             print(f"  • {r.client.restart_hint}")
-    if any(r.ok and r.client.kind == "codex" for r in results):
+    codex = next((r for r in results if r.ok and r.client.kind == "codex"), None)
+    if codex:
         print("  • Codex: the MCP for Blender plugin adds viewport branding and suggested prompts;")
         print("    see the README. Model generation can outlast Codex's 60s tool timeout; to raise it,")
-        print("    add `tool_timeout_sec = 600` under [mcp_servers.blender] in ~/.codex/config.toml.")
+        print(f"    add `tool_timeout_sec = 600` under [mcp_servers.{codex.key}] in ~/.codex/config.toml.")
     if addon and addon.installed:
         print("  • Open Blender. The addon starts its server on launch (MCP for Blender tab, press N).")
     print("  • Then ask your assistant to build something in Blender.")

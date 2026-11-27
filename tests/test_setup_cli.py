@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -171,6 +172,97 @@ def test_claude_code_uses_user_scope():
     client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
     [add] = setup_cli._cli_commands(client, UVX, ClientState(NEW))
     assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, "mcp-for-blender"]
+
+
+def test_cli_clients_pick_a_free_name_beside_an_unrelated_blender(tmp_path):
+    claude = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    codex = Client("codex", "Codex", "codex", cli_path="/bin/codex")
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path), "CODEX_HOME": str(tmp_path)}
+    assert setup_cli._cli_key(claude, ClientState(NEW), env) == "blender"
+    assert setup_cli._cli_key(codex, ClientState(NEW), env) == "blender"
+
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {"command": "my-own-blender-tool"}}})
+    (tmp_path / "config.toml").write_text('[mcp_servers.blender]\ncommand = "my-own-blender-tool"\n')
+    assert setup_cli._cli_key(claude, ClientState(NEW), env) == "blender-2"
+    assert setup_cli._cli_key(codex, ClientState(NEW), env) == "blender-2"
+    [add] = setup_cli._cli_commands(claude, UVX, ClientState(NEW), "blender-2")
+    assert add[5] == "blender-2"
+
+    # Updating an old entry keeps its name.
+    assert setup_cli._cli_key(claude, ClientState(OUTDATED, "blender"), env) == "blender"
+    assert setup_cli._cli_key(codex, ClientState(OUTDATED, "blender"), env) == "blender"
+
+
+def test_cli_success_and_dry_run_report_the_name_used(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {"command": "my-own-blender-tool"}}})
+    client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    ran = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: (ran.append(args), (True, ""))[1])
+
+    assert '--scope user blender-2 --' in setup_cli.describe_change(client, UVX, ClientState(NEW))
+    result = setup_cli.configure_cli_client(client, UVX, ClientState(NEW))
+    assert result.ok and result.key == "blender-2" and '"blender-2"' in result.message
+    assert [args[5] for args in ran] == ["blender-2"]
+
+
+_CODEX_HAND_WRITTEN = {
+    "header-comment": '[mcp_servers.blender] # mine\ncommand = "python3"\nargs = ["/opt/mine.py"]\n',
+    "inline-table": '[mcp_servers]\nblender = { command = "python3", args = ["/opt/mine.py"] }\n',
+    "dotted-keys": 'mcp_servers.blender.command = "python3"\nmcp_servers.blender.args = ["/opt/mine.py"]\n',
+}
+
+
+@pytest.fixture(params=["tomllib", "regex"])
+def toml_reader(request, monkeypatch):
+    """Run a test with tomllib (3.11+) and with the Python 3.10 regex fallback."""
+    if request.param == "regex":
+        monkeypatch.setattr(setup_cli, "tomllib", None, raising=False)
+    elif sys.version_info < (3, 11):
+        pytest.skip("tomllib needs Python 3.11+")
+    return request.param
+
+
+@pytest.mark.parametrize("form", sorted(_CODEX_HAND_WRITTEN))
+def test_codex_never_takes_a_hand_written_blender(form, toml_reader, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(_CODEX_HAND_WRITTEN[form])
+    client = Client("codex", "Codex", "codex", cli_path="/bin/codex")
+    ran = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: (ran.append(args), (True, ""))[1])
+
+    state = codex_state()
+    assert state.status == NEW
+    assert "codex mcp add blender-2 " in setup_cli.describe_change(client, UVX, state)
+    result = setup_cli.configure_cli_client(client, UVX, state)
+    assert result.ok and result.key == "blender-2" and '"blender-2"' in result.message
+    assert [args[3] for args in ran] == ["blender-2"]
+
+
+@pytest.mark.parametrize("form", sorted(_CODEX_HAND_WRITTEN))
+def test_codex_state_reads_hand_written_installs(form, toml_reader, tmp_path):
+    env = {"CODEX_HOME": str(tmp_path)}
+    old = _CODEX_HAND_WRITTEN[form].replace('"/opt/mine.py"', '"blender-mcp"')
+    (tmp_path / "config.toml").write_text(old)
+    state = codex_state(env)
+    assert (state.status, state.entry_key) == (OUTDATED, "blender")
+    (tmp_path / "config.toml").write_text(old.replace("blender-mcp", "mcp-for-blender"))
+    assert codex_state(env).status == CONFIGURED
+
+
+def test_codex_regex_fallback_ignores_other_tables(monkeypatch):
+    monkeypatch.setattr(setup_cli, "tomllib", None, raising=False)
+    text = ('model = "x"\nprofile.blender = "y"\n[mcp_servers]\nstartup_timeout = 5\n'
+            '"my blender" = { command = "x" }\n[profiles.blender]\nmodel = "y"\n'
+            '[mcp_servers.other]\ncommand = "z"\n')
+    assert sorted(setup_cli._codex_mcp_sections(text)) == ["my blender", "other"]
+
+
+def test_json_dry_run_reports_the_free_name(tmp_path):
+    path = tmp_path / "mcp.json"
+    _write(path, {"mcpServers": {"blender": {"command": "my-own-blender-tool"}}})
+    assert 'add "blender-2"' in setup_cli.describe_change(_client(path), UVX, ClientState(NEW))
+    assert 'add "blender"' in setup_cli.describe_change(_client(tmp_path / "none.json"), UVX, ClientState(NEW))
 
 
 # --- detection ---------------------------------------------------------------

@@ -25,14 +25,14 @@ logger = logging.getLogger("blender-mcp-telemetry")
 
 def get_package_version() -> str:
     """Get the installed package version"""
-    try:
-        return version("mcp-for-blender")
-    except PackageNotFoundError:
-        # Pre-rename distribution name.
+    for name in ("mcp-for-blender", "blender-mcp"):  # current, pre-rename
         try:
-            return version("blender-mcp")
+            # None, rather than an error, for a dist-info folder left without
+            # its METADATA; the telemetry table rejects a null version.
+            return version(name) or "unknown"
         except PackageNotFoundError:
-            return "unknown"
+            continue
+    return "unknown"
 
 
 MCP_VERSION = get_package_version()
