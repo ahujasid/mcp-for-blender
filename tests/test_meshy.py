@@ -329,9 +329,13 @@ def test_meshy_image_url_is_one_textured_task(monkeypatch):
     }
 
 
+WEBP = b"RIFF\x10\0\0\0WEBPVP8 " + b"\0" * 8
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
+
+
 def test_meshy_local_image_becomes_a_data_uri(monkeypatch, tmp_path):
     image = tmp_path / "ref.webp"
-    image.write_bytes(b"RIFF-webp")
+    image.write_bytes(WEBP)
     addon, _bpy, _scene = _ready(monkeypatch)
     posts = _capture_posts(addon, {"result": "img_2"})
     server = addon.BlenderMCPServer()
@@ -340,8 +344,32 @@ def test_meshy_local_image_becomes_a_data_uri(monkeypatch, tmp_path):
 
     assert result["task_id"] == "img_2"
     assert len(posts) == 1
-    expected = "data:image/webp;base64," + base64.b64encode(b"RIFF-webp").decode("ascii")
+    expected = "data:image/webp;base64," + base64.b64encode(WEBP).decode("ascii")
     assert posts[0]["json"]["image_url"] == expected
+
+
+def test_meshy_refuses_a_file_that_is_not_an_image(monkeypatch, tmp_path):
+    # A key or config file renamed to look like an image must not be uploaded (#405).
+    image = tmp_path / "credentials.png"
+    image.write_bytes(b"MESHY_API_KEY=msy-not-an-image\n")
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon)
+
+    result = addon.BlenderMCPServer().create_meshy_job(image=str(image))
+
+    assert "Not a PNG, JPEG or WebP image" in result["error"]
+    assert posts == []
+
+
+def test_meshy_names_the_image_by_its_bytes(monkeypatch, tmp_path):
+    image = tmp_path / "ref.jpg"
+    image.write_bytes(PNG)
+    addon, _bpy, _scene = _ready(monkeypatch)
+    posts = _capture_posts(addon, {"result": "img_3"})
+
+    addon.BlenderMCPServer().create_meshy_job(image=str(image))
+
+    assert posts[0]["json"]["image_url"].startswith("data:image/png;base64,")
 
 
 @pytest.mark.parametrize("kwargs, endpoint", [
