@@ -148,3 +148,58 @@ def test_hunyuan_zip_rejects_path_traversal(monkeypatch):
 
     assert result["succeed"] is False
     assert "path traversal" in result["error"].lower() or "directory traversal" in result["error"].lower()
+
+
+def test_zip_member_is_inside_rejects_prefix_sibling(tmp_path, monkeypatch):
+    """A member whose path only shares a string prefix with temp_dir must be rejected.
+
+    ``startswith(temp_dir)`` without a trailing separator would accept
+    ``/tmp/tmpXYZ-evil/x`` when extracting into ``/tmp/tmpXYZ``.
+    """
+    addon, _bpy = _load_addon(monkeypatch)
+    temp_dir = tmp_path / "tmpXYZ"
+    temp_dir.mkdir()
+    assert addon._zip_member_is_inside(str(temp_dir), "model.obj")
+    assert addon._zip_member_is_inside(str(temp_dir), "subdir/model.obj")
+    assert not addon._zip_member_is_inside(str(temp_dir), "../evil.txt")
+    assert not addon._zip_member_is_inside(str(temp_dir), str(tmp_path / "tmpXYZ-evil" / "x"))
+
+
+def test_hunyuan_zip_imports_uppercase_obj(monkeypatch, tmp_path):
+    addon, bpy = _load_addon(monkeypatch)
+    server = addon.BlenderMCPServer()
+    called = {"obj": False}
+
+    def obj_import(filepath):
+        called["obj"] = True
+        assert filepath.lower().endswith(".obj")
+        mesh = types.SimpleNamespace(
+            type="MESH",
+            name="Imported",
+            location=types.SimpleNamespace(x=0, y=0, z=0),
+            rotation_euler=types.SimpleNamespace(x=0, y=0, z=0),
+            scale=types.SimpleNamespace(x=1, y=1, z=1),
+        )
+        bpy.context.selected_objects = [mesh]
+
+    bpy.ops.wm.obj_import = obj_import
+    monkeypatch.setattr(server, "_get_aabb", lambda _obj: [0, 0, 0, 1, 1, 1])
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("MODEL.OBJ", "o test\n")
+    payload = buf.getvalue()
+    monkeypatch.setattr(
+        addon.requests,
+        "get",
+        lambda *_args, **_kwargs: _FakeResponse(payload),
+        raising=False,
+    )
+
+    result = server.import_generated_asset_hunyuan_ai(
+        "UpperObj",
+        "https://example.com/models/asset.zip",
+    )
+    assert called["obj"] is True
+    assert result["succeed"] is True
+    assert result["name"] == "UpperObj"
