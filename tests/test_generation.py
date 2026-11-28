@@ -8,6 +8,7 @@ refine tasks.
 
 import asyncio
 import base64
+import json
 
 import pytest
 
@@ -287,6 +288,24 @@ def test_pending_jobs_survive_on_disk_until_settled(tmp_path):
     asyncio.run(generation.wait_and_import(send, job, 100, sleep=lambda _: asyncio.sleep(0),
                                            pending=generation.Pending(path)))
     assert generation.Pending(path).find(key) is None
+
+
+@pytest.mark.parametrize("bad_timestamp", ["1000000", None, float("inf"), float("nan")])
+def test_pending_file_with_a_bad_timestamp_never_raises(tmp_path, bad_timestamp):
+    """A half-written or hand-edited entry must not break every generation call."""
+    path = tmp_path / "pending.json"
+    path.write_text(json.dumps([
+        {"key": "bad", "handle": "tripo:rid:bad", "name": "Bad", "started_at": bad_timestamp},
+        {"key": "good", "handle": "tripo:rid:good", "name": "Good", "started_at": 9999999999.0},
+    ]))
+
+    pending = generation.Pending(path)
+    assert pending.find("good") == Job("tripo", "rid", "good", "Good")
+    assert pending.find("bad") is None
+    assert pending.refine_for("bad") is None
+    # A write must still work so a new generation can recover the file.
+    pending.add("fresh", Job("tripo", "rid", "new", "New"))
+    assert pending.find("fresh") == Job("tripo", "rid", "new", "New")
 
 
 def test_failed_jobs_leave_pending_but_interrupted_ones_stay(tmp_path):
