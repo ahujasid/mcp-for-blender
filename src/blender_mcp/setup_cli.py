@@ -252,6 +252,7 @@ class ConfigError(Exception):
 def _strip_jsonc(text: str) -> str:
     """Drop // and /* */ comments and trailing commas, leaving strings intact."""
     out: list[str] = []
+    comma = None  # index in out of a comma that only whitespace has followed
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
@@ -260,6 +261,7 @@ def _strip_jsonc(text: str) -> str:
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
             out.append(text[i:j + 1])
+            comma = None
             i = j + 1
         elif text.startswith("//", i):
             while i < n and text[i] != "\n":
@@ -268,9 +270,15 @@ def _strip_jsonc(text: str) -> str:
             end = text.find("*/", i + 2)
             i = n if end < 0 else end + 2
         else:
+            if ch in "}]" and comma is not None:
+                out[comma] = ""
+            if ch == ",":
+                comma = len(out)
+            elif not ch.isspace():
+                comma = None
             out.append(ch)
             i += 1
-    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    return "".join(out)
 
 
 def read_json_config(path: Path) -> tuple[dict, bool]:
