@@ -316,6 +316,29 @@ def _entry_text(entry) -> str:
     return " ".join(str(p) for p in parts if p)
 
 
+def _uvx_args(old_args) -> list[str] | None:
+    """The old entry's uvx arguments with the old package name swapped for this
+    one, so flags such as `--python 3.11` survive an update. None when they
+    aren't a plain uvx call naming the old package exactly once."""
+    if not isinstance(old_args, list) or not all(isinstance(a, str) for a in old_args):
+        return None
+    if old_args.count(OLD_PACKAGE) != 1:
+        return None
+    return [PACKAGE if a == OLD_PACKAGE else a for a in old_args]
+
+
+def _runs_uvx(command) -> bool:
+    return isinstance(command, str) and Path(command).name.lower() in ("uvx", "uvx.exe")
+
+
+def _updated_uvx_args(old: dict) -> list[str] | None:
+    """`_uvx_args` for an old server entry in any client's format."""
+    command = old.get("command")
+    if isinstance(command, list):  # opencode: [uvx, *args]
+        return _uvx_args(command[1:]) if command and _runs_uvx(command[0]) else None
+    return _uvx_args(old.get("args")) if _runs_uvx(command) else None
+
+
 def servers_state(servers: dict) -> ClientState:
     """Whether a client's server map already runs this package."""
     old_key = None
@@ -365,7 +388,14 @@ def configure_json_client(client: Client, uvx: str, state: ClientState) -> Clien
     entry = server_entry(client.style, uvx)
     if state.status == OUTDATED and isinstance(servers.get(key), dict):
         # Keep the user's env, enabled flag and so on; replace only the command.
-        entry = {**servers[key], **entry}
+        old = servers[key]
+        entry = {**old, **entry}
+        args = _updated_uvx_args(old)
+        if args is not None:
+            if client.style == "opencode":
+                entry["command"] = [uvx, *args]
+            else:
+                entry["args"] = args
     servers[key] = entry
     if client.style == "opencode":
         config.setdefault("$schema", "https://opencode.ai/config.json")
@@ -514,6 +544,21 @@ def _cli_server_names(client: Client, env=None) -> dict:
         return {}
 
 
+def _cli_old_entry(client: Client, state: ClientState, env=None) -> dict:
+    """The entry an update replaces, as a dict, so its env and uvx flags can be
+    passed back to `mcp add`. Empty when it can't be read (Codex on Python 3.10,
+    whose regex fallback doesn't parse values)."""
+    if state.status != OUTDATED:
+        return {}
+    entry = _cli_server_names(client, env).get(state.entry_key)
+    if isinstance(entry, str):  # Codex: the section as JSON text via tomllib
+        try:
+            entry = json.loads(entry)
+        except ValueError:
+            return {}
+    return entry if isinstance(entry, dict) else {}
+
+
 def _cli_key(client: Client, state: ClientState, env=None) -> str:
     """The name to configure under. A new entry mustn't reuse the name of an
     unrelated server: `claude mcp add` refuses it and `codex mcp add` overwrites it."""
@@ -522,25 +567,33 @@ def _cli_key(client: Client, state: ClientState, env=None) -> str:
     return _free_key(_cli_server_names(client, env))
 
 
-def _cli_commands(client: Client, uvx: str, state: ClientState, key: str | None = None) -> list[list[str]]:
+def _cli_commands(client: Client, uvx: str, state: ClientState, key: str | None = None,
+                  old: dict | None = None) -> list[list[str]]:
+    """`old` is the entry an update replaces: remove-then-add would drop its env
+    and uvx flags, so they are passed back to `mcp add`."""
     if key is None:
         key = state.entry_key if state.status == OUTDATED else SERVER_NAME
+    old = old or {}
+    old_env = old.get("env") if isinstance(old.get("env"), dict) else {}
+    run = [uvx, *(_updated_uvx_args(old) or [PACKAGE])]
     commands: list[list[str]] = []
     if client.kind == "claude-code":
         if state.status == OUTDATED:
             commands.append([client.cli_path, "mcp", "remove", "--scope", "user", key])
-        commands.append([client.cli_path, "mcp", "add", "--scope", "user", key, "--", uvx, PACKAGE])
+        env_flags = [flag for k, v in old_env.items() for flag in ("-e", f"{k}={v}")]
+        commands.append([client.cli_path, "mcp", "add", "--scope", "user", key, *env_flags, "--", *run])
     else:
         if state.status == OUTDATED:
             commands.append([client.cli_path, "mcp", "remove", key])
-        env_flags = [flag for k, v in CODEX_ENV.items() for flag in ("--env", f"{k}={v}")]
-        commands.append([client.cli_path, "mcp", "add", key, *env_flags, "--", uvx, PACKAGE])
+        env = {**old_env, **CODEX_ENV}
+        env_flags = [flag for k, v in env.items() for flag in ("--env", f"{k}={v}")]
+        commands.append([client.cli_path, "mcp", "add", key, *env_flags, "--", *run])
     return commands
 
 
 def configure_cli_client(client: Client, uvx: str, state: ClientState) -> ClientResult:
     key = _cli_key(client, state)
-    for command in _cli_commands(client, uvx, state, key):
+    for command in _cli_commands(client, uvx, state, key, _cli_old_entry(client, state)):
         ok, output = _run_cli(command)
         if not ok:
             shown = " ".join(Path(command[0]).name if i == 0 else a for i, a in enumerate(command))
@@ -577,7 +630,8 @@ def describe_change(client: Client, uvx: str, state: ClientState) -> str:
             verb = f'add "{_free_key(servers if isinstance(servers, dict) else {})}"'
         return f"would {verb} in {client.config_path}"
     return "would run: " + " && ".join(
-        " ".join([Path(c[0]).name, *c[1:]]) for c in _cli_commands(client, uvx, state, _cli_key(client, state))
+        " ".join([Path(c[0]).name, *c[1:]])
+        for c in _cli_commands(client, uvx, state, _cli_key(client, state), _cli_old_entry(client, state))
     )
 
 
