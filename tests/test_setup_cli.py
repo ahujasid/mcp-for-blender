@@ -126,6 +126,22 @@ def test_strip_jsonc_keeps_strings():
         "url": "http://x/*y*/", "a": [1]}
 
 
+def test_strip_jsonc_keeps_commas_inside_strings():
+    """#423: a comma before ] or } inside a string is a value, not a trailing comma."""
+    text = '{"args": ["--filter=[a,]", "--json={x, }", "q\\",]"], "b": [1, // c\n],}'
+    assert json.loads(_strip_jsonc(text)) == {
+        "args": ["--filter=[a,]", "--json={x, }", 'q",]'], "b": [1]}
+
+
+def test_jsonc_rewrite_leaves_other_servers_values_alone(tmp_path):
+    path = tmp_path / "opencode.jsonc"
+    _write(path, '{\n  // my servers\n  "mcp": {\n    "other": {"type": "local", '
+                 '"command": ["tool", "--filter=[a,]", "--json={x, }"]}\n  }\n}\n')
+    assert configure_json_client(_client(path, "opencode"), UVX, ClientState(NEW)).ok
+    assert json.loads(path.read_text())["mcp"]["other"]["command"] == [
+        "tool", "--filter=[a,]", "--json={x, }"]
+
+
 def test_servers_state():
     assert servers_state({}).status == NEW
     assert servers_state({"b": {"command": "/x/uvx", "args": ["mcp-for-blender"]}}).status == CONFIGURED

@@ -249,6 +249,14 @@ class ConfigError(Exception):
     pass
 
 
+def _string_end(text: str, i: int) -> int:
+    """Index just past the string literal that opens at text[i]."""
+    j = i + 1
+    while j < len(text) and text[j] != '"':
+        j += 2 if text[j] == "\\" else 1
+    return j + 1
+
+
 def _strip_jsonc(text: str) -> str:
     """Drop // and /* */ comments and trailing commas, leaving strings intact."""
     out: list[str] = []
@@ -256,11 +264,9 @@ def _strip_jsonc(text: str) -> str:
     while i < n:
         ch = text[i]
         if ch == '"':
-            j = i + 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            out.append(text[i:j + 1])
-            i = j + 1
+            j = _string_end(text, i)
+            out.append(text[i:j])
+            i = j
         elif text.startswith("//", i):
             while i < n and text[i] != "\n":
                 i += 1
@@ -270,7 +276,30 @@ def _strip_jsonc(text: str) -> str:
         else:
             out.append(ch)
             i += 1
-    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+    # Trailing commas go in a second pass, once comments are gone, so a comma
+    # followed by a comment and then a bracket still counts. It skips strings:
+    # a regex over the whole text also ate the comma in values like "[a,]",
+    # rewriting another server's args (#423).
+    text, out = "".join(out), []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            j = _string_end(text, i)
+            out.append(text[i:j])
+            i = j
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def read_json_config(path: Path) -> tuple[dict, bool]:
