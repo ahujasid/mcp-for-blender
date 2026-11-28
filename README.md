@@ -5,9 +5,11 @@
 *formerly `blender-mcp` — the PyPI package is now [`mcp-for-blender`](https://pypi.org/project/mcp-for-blender/).*
 *Existing setups keep working; no config change is required. [Read more](https://github.com/ahujasid/mcp-for-blender/issues/366)*
 
+Prompt-assisted 3D modeling, scene creation, and manipulation, driven by AI.
+
 **Disclaimer:** This is a third-party integration and not made by Blender
 
-Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
+The only official repository for this is [ahujasid/mcp-for-blender](https://github.com/ahujasid/mcp-for-blender). We do not distribute ZIP files from other accounts.
 
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/blender-mcp?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/blender-mcp)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/SNqPn4TcKQ)
