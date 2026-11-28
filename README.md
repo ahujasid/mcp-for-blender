@@ -323,6 +323,15 @@ pipx ensurepath          # then restart your shell / client
 
 Use the resulting absolute path as `"command"` (find it with `which mcp-for-blender` / `where mcp-for-blender`) and omit `args`.
 
+**Windows with Smart App Control:** it blocks the unsigned `mcp-for-blender.exe` launcher that uvx and pipx create (OS error 4551). Run the package through Python instead. Install Python from [python.org](https://www.python.org/downloads/windows/), whose `python.exe` is signed, then:
+
+```powershell
+py -m pip install mcp-for-blender
+py -m blender_mcp install-addon
+```
+
+and configure your client with `"command": "py", "args": ["-m", "blender_mcp"]`. Every subcommand works the same way, e.g. `py -m blender_mcp setup`.
+
 ### Run with Docker
 
 You can run the MCP server in a container instead of installing it. Blender itself still runs on your machine — the container only hosts the MCP server, which connects out to the Blender addon.
@@ -837,6 +846,7 @@ requires your own fal.ai API key. The trial key button is hidden in fal.ai mode.
 | Problem | Fix |
 |---|---|
 | **Connection issues** | Make sure the Blender addon server is running, and the MCP server is configured on Claude. **Do not** run the `uvx` command in the terminal. Sometimes the first command won't go through, but after that it starts working. |
+| **Windows: OS error 4551 / Code Integrity blocks `mcp-for-blender.exe`** | Smart App Control blocks the unsigned launcher. Run it with `py -m blender_mcp` instead; see [Install without uv](#install-without-uv). |
 | **Timeout errors** | Try simplifying your requests or breaking them into smaller steps. |
 | **Blender freezes during a Poly Haven download** | Assets are downloaded on Blender's main thread, so the UI stops responding until the transfer finishes. File size grows roughly fourfold per resolution step, so ask for 1k or 2k unless the asset is held close to camera. |
 | **Poly Pizza download fails with a Cloudflare challenge** | `static.poly.pizza` is behind bot protection and blocks datacenter, VPN and cloud IPs. Your API key is fine - the CDN never sees it. Retry from a normal connection, or download the `.glb` by hand and use **File → Import → glTF 2.0**. |
