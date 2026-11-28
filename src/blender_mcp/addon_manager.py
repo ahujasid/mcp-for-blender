@@ -76,7 +76,7 @@ class AddonStatusReport:
 _UPDATE_HINT = (
     "Run `uvx mcp-for-blender install-addon` to update it, then in Blender: "
     "Preferences → Add-ons → disable and re-enable 'Interface: MCP for Blender' "
-    "(or restart Blender) and click Start MCP Server."
+    "(or restart Blender); if the MCP for Blender tab says Not connected, click Connect to MCP server."
 )
 
 
@@ -406,7 +406,7 @@ def install_addon(
     msg = (
         f"Installed MCP for Blender addon to {target}. "
         "In Blender: Preferences → Add-ons → disable then enable "
-        "'Interface: MCP for Blender', or restart Blender, then click Start MCP Server."
+        "'Interface: MCP for Blender', or restart Blender; if the MCP for Blender tab says Not connected, click Connect to MCP server."
     )
     if len(replaced) > 1:
         msg += f" Also updated: {', '.join(replaced[:-1])}."
@@ -532,7 +532,7 @@ def handshake_addon(blender_connection) -> AddonHandshake:
                 f"expected {EXPECTED_ADDON_PROTOCOL_VERSION}. "
                 "Run `uvx mcp-for-blender install-addon` to update it, then "
                 "restart Blender or disable/enable 'Interface: MCP for Blender', "
-                "then Start MCP Server. Trajectory still works via fallbacks."
+                "then, if the MCP for Blender tab says Not connected, click Connect to MCP server. Trajectory still works via fallbacks."
             )
         return AddonHandshake(
             up_to_date=up_to_date,
@@ -551,7 +551,7 @@ def handshake_addon(blender_connection) -> AddonHandshake:
                 "Blender addon is outdated (no get_addon_info). "
                 "Run `uvx mcp-for-blender install-addon` to update it, then "
                 "restart Blender or disable/enable 'Interface: MCP for Blender', "
-                "then Start MCP Server. Fallbacks keep working in the meantime."
+                "then, if the MCP for Blender tab says Not connected, click Connect to MCP server. Fallbacks keep working in the meantime."
             )
             return AddonHandshake(
                 up_to_date=False,
