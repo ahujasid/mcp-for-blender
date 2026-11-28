@@ -257,7 +257,7 @@ def test_live_client_is_not_mistaken_for_gone():
         with socket.create_connection(("localhost", server.port), timeout=5) as client:
             client.sendall(json.dumps({"type": "ping"}).encode())
             _wait_until_queued(server, 1)
-            _command, queued_client = server.command_queue.queue[0]
+            _command, _reply, queued_client = server.command_queue.queue[0]
             assert server._client_gone(queued_client) is False
     finally:
         server.stop()

@@ -20,22 +20,44 @@ chunks - deterministic, no network, no flakiness.
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import time
 
 import pytest
 from test_server_threading import BlenderMCPServer
 
 
 class _ScriptedSocket:
-    """Fake client socket returning pre-scripted recv() chunks, one per call."""
+    """Fake client socket returning pre-scripted recv() chunks, one per call.
 
-    def __init__(self, chunks):
+    Once the chunks run out the client hangs up, after it has had
+    `replies_before_hangup` replies; until then it is connected and idle. The
+    disconnect probe select()s before it peeks, so the fake hands out a real
+    descriptor: a readable one while there is data or after the hang-up, an
+    idle one otherwise.
+    """
+
+    def __init__(self, chunks, replies_before_hangup=0):
         self._chunks = list(chunks)
+        self._replies_before_hangup = replies_before_hangup
         self.sent = []
+        self._readable, self._writer = socket.socketpair()
+        self._writer.sendall(b"x")
+        self._idle, self._idle_peer = socket.socketpair()
+
+    def _hung_up(self):
+        return not self._chunks and len(self.sent) >= self._replies_before_hangup
+
+    def fileno(self):
+        return (self._readable if self._chunks or self._hung_up() else self._idle).fileno()
 
     def settimeout(self, timeout):
         pass
 
-    def recv(self, bufsize):
+    def recv(self, bufsize, flags=0):
+        if flags & socket.MSG_PEEK:
+            return self._chunks[0][:1] if self._chunks else b""
         if self._chunks:
             return self._chunks.pop(0)
         return b""
@@ -44,7 +66,8 @@ class _ScriptedSocket:
         self.sent.append(data)
 
     def close(self):
-        pass
+        for s in (self._readable, self._writer, self._idle, self._idle_peer):
+            s.close()
 
 
 def _make_server():
@@ -86,7 +109,7 @@ def test_split_multibyte_utf8_boundary_is_not_dropped():
         "recv() chunk boundary killed the connection instead of waiting for "
         "the rest of the buffer"
     )
-    command, _client = server.command_queue.get_nowait()
+    command, _reply, _client = server.command_queue.get_nowait()
     assert command["type"] == "ping"
     assert command["params"]["note"] == "café ☕ 日本語"
 
@@ -103,14 +126,22 @@ def test_split_multibyte_utf8_boundary_keeps_handler_loop_alive():
     second = json.dumps({"type": "ping", "params": {}}).encode("utf-8")
 
     server = _make_server()
-    server.running = True
-    server._handle_client(
-        _ScriptedSocket([first[:split_idx], first[split_idx:], second])
-    )
-
     queued = []
-    while not server.command_queue.empty():
-        command, _client = server.command_queue.get_nowait()
-        queued.append(command)
+    server.execute_command = lambda command: (
+        queued.append(command) or {"status": "success", "result": {}}
+    )
+    server.running = True
+    client = _ScriptedSocket([first[:split_idx], first[split_idx:], second], replies_before_hangup=2)
+    handler = threading.Thread(target=server._handle_client, args=(client,))
+    handler.start()
+
+    # Play Blender's main loop: each command waits for its reply before the
+    # handler reads the next one off the connection.
+    deadline = time.time() + 5.0
+    while handler.is_alive() and time.time() < deadline:
+        server._drain_command_queue()
+        time.sleep(0.01)
+    server.running = False
+    handler.join(2.0)
 
     assert len(queued) == 2, f"expected both commands queued, got {queued}"
