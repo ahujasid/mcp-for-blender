@@ -40,14 +40,27 @@ def _load_server_class():
     source = ROOT_ADDON.read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    body = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BlenderMCPServer"
-    ]
-    assert body, "BlenderMCPServer not found in addon.py"
+    # execute_code also uses a few module-level helpers next to the class.
+    helpers = {"_FACTORY_RESET_RE", "FACTORY_RESET_MESSAGE", "_script_context"}
+
+    def _wanted(node):
+        if isinstance(node, ast.ClassDef):
+            return node.name == "BlenderMCPServer"
+        if isinstance(node, ast.FunctionDef):
+            return node.name in helpers
+        if isinstance(node, ast.Assign):
+            return any(getattr(t, "id", None) in helpers for t in node.targets)
+        return False
+
+    body = [node for node in tree.body if _wanted(node)]
+    assert {getattr(n, "name", None) or n.targets[0].id for n in body} == helpers | {
+        "BlenderMCPServer"
+    }, "BlenderMCPServer or its helpers not found in addon.py"
 
     main_thread = threading.current_thread()
+    # Keyed by id(): like the real bpy.app.timers, a callback matches only
+    # the very object registered, so a fresh bound method of the same
+    # function does not.
     registered = {}
 
     class _Timers:
@@ -58,13 +71,15 @@ def _load_server_class():
                 raise AssertionError(
                     "bpy.app.timers.register() called from a non-main thread"
                 )
-            registered[fn] = True
+            registered[id(fn)] = fn
 
         def unregister(self, fn):
-            registered.pop(fn, None)
+            if id(fn) not in registered:
+                raise ValueError("function is not registered")
+            del registered[id(fn)]
 
         def is_registered(self, fn):
-            return fn in registered
+            return id(fn) in registered
 
     bpy = types.ModuleType("bpy")
     bpy.app = types.SimpleNamespace(background=False, timers=_Timers())
@@ -77,6 +92,11 @@ def _load_server_class():
         "threading": threading,
         "json": json,
         "time": time,
+        "re": __import__("re"),
+        "io": __import__("io"),
+        "redirect_stdout": __import__("contextlib").redirect_stdout,
+        "suppress": __import__("contextlib").suppress,
+        "contextmanager": contextmanager,
         "queue": __import__("queue"),
         "traceback": __import__("traceback"),
         "os": __import__("os"),
@@ -264,7 +284,9 @@ def test_live_client_is_not_mistaken_for_gone():
 
 
 def bpy_timer_registered(server):
-    return server._drain_command_queue in _registered
+    return any(
+        getattr(fn, "__self__", None) is server for fn in _registered.values()
+    )
 
 
 def test_restart_rebinds_port_cleanly():
@@ -294,3 +316,102 @@ def test_restart_rebinds_port_cleanly():
         assert response["status"] == "success"
     finally:
         second.stop()
+
+
+def _script_error(server, code):
+    """Run code through execute_code and return the decoded error payload."""
+    try:
+        server.execute_code(code)
+    except Exception as e:
+        return json.loads(str(e))
+    raise AssertionError("execute_code did not report an error")
+
+
+def test_script_that_exits_reports_an_error_instead_of_quitting():
+    """#429: SystemExit escaping a timer callback quits Blender outright."""
+    server = BlenderMCPServer(port=_free_port())
+    for code in ("import sys\nsys.exit()", "raise SystemExit(3)", "raise KeyboardInterrupt"):
+        detail = _script_error(server, code)
+        assert detail["exception_type"] in {"SystemExit", "KeyboardInterrupt"}
+    assert "Blender kept running" in _script_error(server, "raise SystemExit")["message"]
+
+
+def test_script_output_and_ordinary_errors_still_come_back():
+    server = BlenderMCPServer(port=_free_port())
+    assert server.execute_code("print('hi')") == {"executed": True, "result": "hi\n"}
+    detail = _script_error(server, "x = 1\nraise ValueError('nope')")
+    assert detail["exception_type"] == "ValueError"
+    assert detail["message"] == "nope"
+    assert "line 2" in detail["traceback"]
+
+
+def test_factory_reset_is_refused_before_running():
+    """#437: read_factory_settings disables the add-on and closes the socket for good."""
+    server = BlenderMCPServer(port=_free_port())
+    code = "print('ran')\nimport bpy\nbpy.ops.wm.read_factory_settings(use_empty=True)"
+    try:
+        server.execute_code(code)
+    except Exception as e:
+        # Refused up front: a plain message, not the JSON payload a script
+        # that ran and failed would produce.
+        assert str(e).startswith("bpy.ops.wm.read_factory_settings() is refused")
+        assert "read_homefile(use_empty=True)" in str(e)
+    else:
+        raise AssertionError("read_factory_settings was not refused")
+
+
+def test_drain_survives_a_command_that_raises_base_exception():
+    """A BaseException must not end the drain timer: the client gets an error and
+    the next command still runs."""
+    server = _make_server()
+
+    def execute(command):
+        if command["type"] == "exit":
+            raise SystemExit
+        return {"status": "success", "result": {}}
+
+    server.execute_command = execute
+    server.start()
+    try:
+        with socket.create_connection(("localhost", server.port), timeout=5) as client:
+            client.settimeout(5)
+            client.sendall(json.dumps({"type": "exit"}).encode())
+            _wait_until_queued(server, 1)
+            assert server._drain_command_queue() == 0.05
+            assert json.loads(client.recv(8192).decode())["status"] == "error"
+
+            client.sendall(json.dumps({"type": "ping"}).encode())
+            _wait_until_queued(server, 1)
+            server._drain_command_queue()
+            assert json.loads(client.recv(8192).decode())["status"] == "success"
+    finally:
+        server.stop()
+
+
+def test_is_serving_tracks_the_thread_and_timer_not_the_flag():
+    """#437: a server whose drain timer is gone answers nothing, whatever `running` says."""
+    server = _make_server()
+    assert not server.is_serving()
+    server.start()
+    try:
+        assert server.is_serving()
+        _registered.pop(id(server._drain_timer))
+        assert server.running and not server.is_serving()
+    finally:
+        server.stop()
+    assert not server.is_serving()
+
+
+def test_stop_unregisters_the_drain_timer_it_registered():
+    """bpy.app.timers matches by identity: stop() must unregister the same
+    bound method start() registered, and a restart must leave exactly one."""
+    server = _make_server()
+    server.start()
+    server.stop()
+    assert not bpy_timer_registered(server)
+    server.start()
+    try:
+        assert sum(getattr(fn, "__self__", None) is server for fn in _registered.values()) == 1
+        assert server.is_serving()
+    finally:
+        server.stop()

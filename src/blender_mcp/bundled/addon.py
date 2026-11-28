@@ -178,8 +178,13 @@ def _blendermcp_ensure_server_running():
         return None
 
     if server is not None and server.running:
-        scene.blendermcp_server_running = True
-        return None
+        if server.is_serving():
+            scene.blendermcp_server_running = True
+            return None
+        # Flagged running, but its listener thread or drain timer is gone, so
+        # it accepts nothing. Tear it down and start it again below.
+        print("BlenderMCP: server was marked running but wasn't serving; restarting it.")
+        server.stop()
 
     try:
         host = _blendermcp_bind_address()
@@ -1295,6 +1300,43 @@ def _object_detail(obj):
     return detail
 
 
+# read_factory_settings resets preferences, which disables this add-on: its
+# server stops and the handlers that would restart it are removed, so the
+# socket stays closed until someone clicks Connect again (#437).
+_FACTORY_RESET_RE = re.compile(r"\bread_factory_settings\b")
+FACTORY_RESET_MESSAGE = (
+    "bpy.ops.wm.read_factory_settings() is refused: it resets Blender's preferences, "
+    "which disables the MCP for Blender add-on and closes this connection for good. "
+    "To start from an empty scene, use bpy.ops.wm.read_homefile(use_empty=True)."
+)
+
+
+@contextmanager
+def _script_context():
+    """The context a script would have if run from the 3D Viewport.
+
+    Commands run from a timer, where bpy.context has no area or region and, on
+    some setups (xvfb), no window either. Operators that poll for one then
+    fail, and bpy.context.object can be missing (#429).
+    """
+    override = {}
+    with suppress(Exception):
+        if hasattr(bpy.context, "temp_override"):
+            window = bpy.context.window or bpy.context.window_manager.windows[0]
+            override["window"] = window
+            area = next((a for a in window.screen.areas if a.type == "VIEW_3D"), None)
+            if area is not None:
+                override["area"] = area
+                region = next((r for r in area.regions if r.type == "WINDOW"), None)
+                if region is not None:
+                    override["region"] = region
+    if not override:
+        yield
+        return
+    with bpy.context.temp_override(**override):
+        yield
+
+
 class BlenderMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
@@ -1308,6 +1350,11 @@ class BlenderMCPServer:
         # approach) could silently drop the callback - on Windows especially -
         # leaving the client blocked in recv() until its socket timeout.
         self.command_queue = queue.Queue()
+        # bpy.app.timers matches callbacks by identity, and every
+        # self._drain_command_queue lookup makes a new bound method, so that
+        # never matched: stop() couldn't unregister the timer and a restart
+        # could leave two running. Register, check and unregister this one.
+        self._drain_timer = self._drain_command_queue
         # Live client sockets, so stop() can unblock threads parked in recv().
         self._clients = set()
         self._clients_lock = threading.Lock()
@@ -1443,7 +1490,7 @@ class BlenderMCPServer:
             self.socket.listen(5)
 
             # Start server thread
-            self.server_thread = threading.Thread(target=self._server_loop)
+            self.server_thread = threading.Thread(target=self._server_loop, args=(self.socket,))
             self.server_thread.daemon = True
             self.server_thread.start()
 
@@ -1451,8 +1498,8 @@ class BlenderMCPServer:
 
             # start() is called from the operator, i.e. the main thread, so
             # this is the only safe place to touch bpy.app.timers.
-            if not bpy.app.timers.is_registered(self._drain_command_queue):
-                bpy.app.timers.register(self._drain_command_queue, persistent=True)
+            if not bpy.app.timers.is_registered(self._drain_timer):
+                bpy.app.timers.register(self._drain_timer, persistent=True)
 
             print(f"BlenderMCP server started on {self.host}:{self.port}")
         except Exception as e:
@@ -1466,8 +1513,8 @@ class BlenderMCPServer:
         get_edit_recorder().drain()
 
         try:
-            if bpy.app.timers.is_registered(self._drain_command_queue):
-                bpy.app.timers.unregister(self._drain_command_queue)
+            if bpy.app.timers.is_registered(self._drain_timer):
+                bpy.app.timers.unregister(self._drain_timer)
         except Exception:
             pass
 
@@ -1514,16 +1561,21 @@ class BlenderMCPServer:
 
         print("BlenderMCP server stopped")
 
-    def _server_loop(self):
-        """Main server loop in a separate thread"""
-        print("Server thread started")
-        self.socket.settimeout(1.0)  # Timeout to allow for stopping
+    def _server_loop(self, listener):
+        """Main server loop in a separate thread.
 
-        while self.running:
+        It serves only the socket it was started with: after a quick stop()
+        and start(), a thread that outlived stop()'s join must exit rather
+        than read self.socket, which is then closed, None or the new one.
+        """
+        print("Server thread started")
+
+        while self.running and self.socket is listener:
             try:
                 # Accept new connection
                 try:
-                    client, address = self.socket.accept()
+                    listener.settimeout(1.0)  # Timeout to allow for stopping
+                    client, address = listener.accept()
                     print(f"Connected to client: {address}")
 
                     # Handle client in a separate thread
@@ -1541,7 +1593,7 @@ class BlenderMCPServer:
                     time.sleep(0.5)
             except Exception as e:
                 print(f"Error in server loop: {str(e)}")
-                if not self.running:
+                if not self.running or self.socket is not listener:
                     break
                 time.sleep(0.5)
 
@@ -1573,7 +1625,10 @@ class BlenderMCPServer:
             try:
                 response = self.execute_command(command)
                 response_json = json.dumps(response)
-            except Exception as e:
+            except BaseException as e:
+                # Blender unregisters a timer that raises, and nothing would
+                # drain the queue after that: every later command would wait
+                # forever on a server that still looks up.
                 print(f"Error executing command: {str(e)}")
                 traceback.print_exc()
                 response_json = json.dumps({"status": "error", "message": str(e)})
@@ -1584,6 +1639,19 @@ class BlenderMCPServer:
                 print("Failed to send response - client disconnected")
 
         return 0.05
+
+    def is_serving(self):
+        """True only if the listener thread and the drain timer are both alive.
+
+        `running` alone is a flag set by start(): if either piece died while it
+        stayed True, the server would look up and answer nothing (#437).
+        """
+        return (
+            self.running
+            and self.server_thread is not None
+            and self.server_thread.is_alive()
+            and bpy.app.timers.is_registered(self._drain_timer)
+        )
 
     def _client_gone(self, client):
         """True if the client hung up. Never blocks and never consumes data."""
@@ -1659,7 +1727,9 @@ class BlenderMCPServer:
             with get_edit_recorder().agent_command():
                 return self._execute_command_internal(command)
 
-        except Exception as e:
+        # BaseException: whatever escapes here would end the drain timer, or
+        # with a SystemExit, Blender itself.
+        except BaseException as e:
             print(f"Error executing command: {str(e)}")
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
@@ -2472,18 +2542,26 @@ class BlenderMCPServer:
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
         # This is powerful but potentially dangerous - use with caution
+        if _FACTORY_RESET_RE.search(code):
+            raise Exception(FACTORY_RESET_MESSAGE)
         try:
             # Create a local namespace for execution
             namespace = {"bpy": bpy}
 
             # Capture stdout during execution, and return it as result
             capture_buffer = io.StringIO()
-            with redirect_stdout(capture_buffer):
+            with redirect_stdout(capture_buffer), _script_context():
                 exec(code, namespace)
 
             captured_output = capture_buffer.getvalue()
             return {"executed": True, "result": captured_output}
-        except Exception as e:
+        except BaseException as e:
+            # BaseException, not Exception: this runs inside a bpy.app.timers
+            # callback, and a SystemExit (sys.exit(), exit()) escaping one
+            # quits Blender on the spot, without asking to save (#429).
+            message = str(e)
+            if isinstance(e, SystemExit):
+                message = "The script called sys.exit(); it stopped there and Blender kept running."
             # Give the caller the same detail we have: exception type, message,
             # and a full traceback (with line numbers into the submitted code),
             # instead of collapsing everything into one string. Callers that ran
@@ -2492,7 +2570,7 @@ class BlenderMCPServer:
             raise Exception(
                 json.dumps({
                     "exception_type": type(e).__name__,
-                    "message": str(e),
+                    "message": message,
                     "traceback": tb,
                 })
             )
@@ -7326,9 +7404,11 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         scene = context.scene
 
         server = getattr(bpy.types, "blendermcp_server", None)
-        if server is not None and server.running:
+        if server is not None and server.is_serving():
             scene.blendermcp_server_running = True
             return {'FINISHED'}
+        if server is not None and server.running:
+            server.stop()
         try:
             host = _blendermcp_bind_address(context)
         except ValueError as exc:

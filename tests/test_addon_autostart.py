@@ -51,13 +51,25 @@ class _Server:
         self.host = host
         self.port = port
         self.running = False
+        self.dead = False
         self.start_attempts = 0
+        self.stop_calls = 0
         self.__class__.instances.append(self)
 
     def start(self):
         self.start_attempts += 1
         if self.start_attempts > self.__class__.failures_before_start:
             self.running = True
+            self.dead = False
+
+    def stop(self):
+        self.stop_calls += 1
+        self.running = False
+
+    def is_serving(self):
+        # `dead` stands for a listener thread or drain timer that died while
+        # `running` stayed True.
+        return self.running and not self.dead
 
 
 def _load_autostart_helpers():
@@ -381,6 +393,36 @@ def test_manual_connect_does_not_retarget_a_running_server():
     assert reports == []
     assert (server.host, server.port) == ("localhost", 9876)
     assert server.start_attempts == 1
+
+
+def test_auto_start_restarts_a_server_that_stopped_serving():
+    """#437: a server flagged running whose thread or timer died must be restarted."""
+    namespace, bpy, _timers, scene = _load_autostart_helpers()
+    server = _Server(host="127.0.0.1", port=9876)
+    server.start()
+    server.dead = True
+    bpy.types.blendermcp_server = server
+
+    assert namespace["_blendermcp_ensure_server_running"]() is None
+    assert server.stop_calls == 1
+    assert server.start_attempts == 2
+    assert server.is_serving()
+    assert scene.blendermcp_server_running is True
+
+
+def test_manual_connect_restarts_a_server_that_stopped_serving():
+    namespace, bpy, _timers, scene = _load_autostart_helpers()
+    server = _Server(port=9876)
+    server.start()
+    server.dead = True
+    bpy.types.blendermcp_server = server
+
+    result, _reports = _manual_connect(namespace, bpy.context)
+
+    assert result == {"FINISHED"}
+    assert server.stop_calls == 1
+    assert server.start_attempts == 2
+    assert server.is_serving()
 
 
 def test_manual_disconnect_survives_loading_another_file():
