@@ -177,6 +177,7 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
   - [Using with Claude](#using-with-claude)
   - [Capabilities](#capabilities)
   - [Example Commands](#example-commands)
+- [Textures with your ChatGPT subscription](#textures-with-your-chatgpt-subscription)
 - [Persistent API Credentials](#persistent-api-credentials)
 - [Troubleshooting](#troubleshooting)
 - [Technical Details](#technical-details)
@@ -198,7 +199,8 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
 | **Material control** | Apply and modify materials and colors |
 | **Visual verification** | Multi-angle, camera, wireframe, X-ray and animation-strip views, plus renders, so the AI checks its own work |
 | **Code execution** | The AI writes Blender Python directly |
-| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, AI-generated 3D models via Meshy, Tripo, Hyper3D Rodin and Hunyuan3D, and whole Gaussian-splat worlds via World Labs |
+| **Textures from ChatGPT** | Tileable textures made with your own ChatGPT plan in a browser window, applied as materials |
+| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Meshy, Tripo, Hyper3D Rodin and Hunyuan3D |
 
 ## Premium
 
@@ -794,6 +796,52 @@ Here are some examples of what you can ask Claude to do:
 | *"Point the camera at the scene, and make it isometric"* | |
 
 ---
+
+## Textures with your ChatGPT subscription
+
+`generate_texture` asks ChatGPT for a texture image and turns it into a material, using **your
+own ChatGPT plan** (no OpenAI API key, no extra billing; your plan's image limits apply).
+
+How it works:
+
+1. The MCP server opens Google Chrome (or Edge/Chromium) with its own profile in
+   `~/.mcp-for-blender/chatgpt-profile`, separate from your everyday Chrome.
+2. **The first time, sign in to ChatGPT in that window yourself.** The AI never types your
+   password. The session is kept for next time.
+3. It sends a prompt asking for a seamless, flat, evenly lit texture (plus your reference image,
+   if you give one), waits for the image and downloads it to `~/.mcp-for-blender/textures/`.
+4. In Blender it builds a material (box-projected, so objects without UVs work; repeats every
+   `tile_size` metres; light bump from the image), packs the image into the .blend and applies it
+   to the objects you name.
+
+When ChatGPT needs you (signed out, a captcha or "verify you are human"), the window comes to the
+front, a desktop notification appears, and the AI tells you what to do. The job continues by
+itself once you are done. If ChatGPT answers in text instead (a question, a refusal or a usage
+limit) or something unexpected happens, the tool returns its reply and a screenshot of the window
+instead of hanging.
+
+Example: *"Make a dark purple shingle texture for the roof with my ChatGPT"*.
+
+Settings (environment variables, all optional): `BLENDERMCP_CHATGPT_BROWSER` (browser
+executable), `BLENDERMCP_CHATGPT_PROFILE` (profile folder), `BLENDERMCP_CHATGPT_CDP_PORT`
+(DevTools port, default 9333), `BLENDERMCP_TEXTURES_DIR` (where images are saved).
+
+Notes: chatgpt.com changes often, so the page selectors may need updating (`SELECTORS` in
+`src/blender_mcp/chatgpt_textures.py`). Automating the ChatGPT website may go against OpenAI's
+terms of use; use it for personal, low-volume work. ChatGPT images are about 1024-1536 px.
+
+**Using this fork:** this tool only exists in this fork, not in the PyPI package. Point your MCP
+client at the fork instead of `uvx mcp-for-blender`:
+
+```json
+"blender": {
+  "command": "uvx",
+  "args": ["--from", "git+https://github.com/MaxP7588/mcp-blender-max", "mcp-for-blender"]
+}
+```
+
+and install its addon with
+`uvx --from git+https://github.com/MaxP7588/mcp-blender-max mcp-for-blender install-addon`.
 
 ## Persistent API Credentials
 

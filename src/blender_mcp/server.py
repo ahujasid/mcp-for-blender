@@ -27,7 +27,7 @@ from .addon_manager import (
 )
 from .consent_prompt import maybe_prompt_for_consent
 from .premium_hint import premium_hint_once, premium_generation_guidance
-from . import blender_scripts, context_log, generation
+from . import blender_scripts, chatgpt_textures, context_log, generation
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
 from .openai_apps import (
     APP_MIME_TYPE,
@@ -366,7 +366,11 @@ Objects can also come from existing libraries (search_assets, then import_asset:
 Sketchfab, Poly Pizza) or be made to order (generate_3d: one new textured model from text or an
 image, 1-3 minutes, may cost the user a credit). A generation is one object, never a whole
 scene, the ground or parts to assemble. Imported and generated models arrive at arbitrary
-scale: use the reported world_bounding_box to size them and put them on the ground."""
+scale: use the reported world_bounding_box to size them and put them on the ground.
+
+generate_texture makes a tileable texture with the user's own ChatGPT (in a browser window) and
+puts it on objects as a material. If it waits for the user, relay what it asks; never ask for
+passwords."""
 
 # Create the MCP server with lifespan support
 mcp = FastMCP(
@@ -1854,135 +1858,95 @@ async def generate_3d(
         return f"Error generating model: {e}"
 
 
-def _worldlabs_status(blender: BlenderConnection) -> dict:
-    """The addon's World Labs status: off, no key, Blender too old, or ready."""
-    try:
-        reply = blender.send_command("get_worldlabs_status")
-    except Exception as e:
-        if _addon_lacks(e):
-            return {"enabled": False, "message": missing_feature("World Labs", "World Labs")}
-        return {"enabled": False, "message": f"Couldn't read the World Labs status: {e}"}
-    return reply if isinstance(reply, dict) else {"enabled": False, "message": str(reply)}
-
-
-def _describe_world(world: dict) -> str:
-    name = world.get("name") or "World"
-    splats, collider = world.get("splats"), world.get("collider")
-    model = f" {world['model']}" if world.get("model") else ""
-    reply = (f"Generated and imported the world '{name}' with World Labs{model}: an empty parenting '{splats}' "
-             f"(Gaussian splats, {world.get('resolution') or '500k'})")
-    if collider:
-        reply += f" and '{collider}' (a rough collision mesh, hidden and not rendered)"
-    reply += "."
-    if world.get("background"):
-        reply += f" Its panorama is now the world background ('{world['background']}'), which also lights the scene."
-    if world.get("metric"):
-        reply += " Units are metres with the ground at z=0."
+def _texture_material(job: "chatgpt_textures.Job", apply_to, tile_size, projection, bump) -> str:
+    result = get_blender_connection().send_command("execute_code", {"code": blender_scripts.build(
+        blender_scripts.TEXTURE_MATERIAL, {
+            "image_path": job.image_path, "name": job.name, "apply_to": apply_to or [],
+            "tile_size": tile_size, "projection": projection, "bump": bump})})
+    info = blender_scripts.parse_result(result.get("result", ""))
+    reply = f"Material '{info['material']}' made from a {info['size'][0]}x{info['size'][1]} image (packed into the .blend)."
+    if info["applied"]:
+        reply += f" Applied to {', '.join(info['applied'])} (their previous materials were replaced)."
     else:
-        reply += (" World Labs couldn't infer its real-world scale, so units are arbitrary: check sizes against "
-                  "something known before placing objects.")
-    if world.get("viewpoint"):
-        reply += (f" It was generated from a viewpoint at {world['viewpoint']} looking along +Y, a good "
-                  "first camera position; parts far from it are less detailed.")
-    if world.get("world_bounding_box"):
-        lo, hi = world["world_bounding_box"]
-        reply += f" world_bounding_box min {lo}, max {hi}."
-    reply += (f" Move or scale the whole world by '{name}' only. Splats light themselves, so scene lights "
-              "don't change them.")
-    if collider:
-        reply += (f" To stand an object on the ground, ray-cast down onto '{collider}' (Object.ray_cast works "
-                  "while it's hidden).")
-    for note in world.get("notes") or []:
-        reply += f" {note}"
-    return reply + f' Then look(mode="angles", target=["{name}"]).'
-
-
-async def _world_reply(ctx: Context, job: "generation.Job", wait_seconds: float, resolution: str,
-                       note: str = "") -> str:
-    async def progress(done, total):
-        await ctx.report_progress(done, total)
-
-    imported, detail = await generation.wait_and_import(
-        _generation_send, job, wait_seconds, progress, pending=_pending_generations(),
-        import_options={"resolution": resolution})
-    if not imported:
-        return f"Still generating the world ({detail}). {job.resume_hint}{note}"
-    return _describe_world(detail if isinstance(detail, dict) else {"name": job.name}) + note
+        reply += " Not applied to any object yet; it is kept with a fake user."
+    if info["missing"]:
+        reply += f" Not found or can't hold materials: {', '.join(info['missing'])}."
+    return reply + " Check it with look(shading=\"material\")."
 
 
 @mcp.tool()
-@trajectory_tool("generate_gaussian_world")
-async def generate_gaussian_world(
+@telemetry_tool("generate_texture")
+async def generate_texture(
     ctx: Context,
     prompt: str | None = None,
-    image: str | None = None,
+    reference_image: str | None = None,
     name: str | None = None,
-    resolution: str = "500k",
+    apply_to: list[str] | None = None,
+    tileable: bool = True,
+    tile_size: float = 1.0,
+    projection: str = "box",
+    bump: float = 0.25,
     job: str | None = None,
-    wait_seconds: int = 50,
+    wait_seconds: int = 45,
     user_prompt: str = "",
-) -> str:
+) -> CallToolResult:
     """
-    Generate a whole environment with World Labs Marble and import it as Gaussian splats (a
-    photoreal capture of the place, not editable meshes), with a hidden rough collision mesh for
-    placing objects and its panorama as the world background, in metres with the ground at z=0.
-    Needs Blender 5.3+.
+    Make a texture image with the user's own ChatGPT subscription and turn it into a material.
 
-    Use it sparingly: only when the user asks for a Gaussian splat or generated world, or for a
-    ready-made environment to set things in. Never for ordinary scene building, single objects
-    (generate_3d), or ground, rooms and backdrops you can model or get from search_assets.
-
-    Each call costs the user money or a high-quality monthly generation, and takes about 5
-    minutes. Waits up to wait_seconds (at most 45), then imports; if it isn't done in time you get
-    a job handle: call generate_gaussian_world(job=..., name=...) again to keep waiting.
-    Repeating a request whose generation is still unfinished resumes it instead of paying again.
+    Drives chatgpt.com in a Chrome window on the user's computer (no API key; it uses their
+    plan's image limits). The first time, or when ChatGPT signs them out or shows a captcha, the
+    reply says "waiting for the user": tell the user exactly what it asks (sign in, or complete
+    the check in that window), then call again with job=... to keep waiting. Never ask the user
+    for their password. Images take 30-90 seconds; past wait_seconds (at most 45) you get a job
+    handle to resume with.
 
     Parameters:
-    - prompt: English description of the place ("sunlit Mediterranean courtyard with a fountain").
-    - image: Instead of a prompt: an absolute image file path or an http(s) URL of the place; a
-      360° equirectangular panorama works too. On the user's own key, also a folder of up to 4
-      images of one place, in name order going around it (the first is the front). Images attached
-      in chat can't be passed: ask the user for a path or URL.
-    - name: Name of the world's parent object. Defaults to one made from the prompt.
-    - resolution: Splats to import: "100k", "500k" (default) or "full_res" (about 2 million; sharper
-      but slow in the viewport).
-    - job: A handle from an earlier call, to resume waiting for it.
+    - prompt: What the surface looks like ("mossy old cobblestones", "dark purple roof shingles").
+    - reference_image: Optional absolute file path or http(s) URL of an image to match.
+    - name: Material name. Defaults to one made from the prompt.
+    - apply_to: Object names to put the material on (replaces their materials).
+    - tileable: True (default) asks for a seamless repeating texture; False for a one-off image
+      such as a sign or a painting.
+    - tile_size: Metres one repeat of the texture covers (default 1.0; 0.3 for bricks up close).
+    - projection: "box" (default; works without UVs) or "uv" (use the objects' UV maps).
+    - bump: Bump strength from the image, 0 for none (default 0.25).
+    - job: Handle from an earlier call, to keep waiting.
     - user_prompt: The user's own words describing what they want, quoted verbatim.
     """
-    if resolution not in generation.WORLD_RESOLUTIONS:
-        return f"Error: resolution must be one of {', '.join(generation.WORLD_RESOLUTIONS)}"
-    call_start = time.monotonic()
-    wait_seconds = max(10, min(int(wait_seconds or 50), generation.MAX_CALL_S))
+    def reply(text: str, images: list[bytes] = ()) -> CallToolResult:
+        content = [TextContent(type="text", text=text)]
+        content += [ImageContent(type="image", data=base64.b64encode(b).decode("ascii"), mimeType="image/jpeg")
+                    for b in images if b]
+        return CallToolResult(content=content)
+
+    if projection not in ("box", "uv"):
+        return reply("Error: projection must be 'box' or 'uv'.")
+    browser = chatgpt_textures.get_browser()
+    wait_seconds = max(5, min(int(wait_seconds or 45), int(generation.MAX_CALL_S)))
+    if job:
+        current = browser.jobs.get(job)
+        if current is None:
+            return reply(f"Error: unknown job '{job}' (the server may have restarted). Start a new one with prompt=...")
+        await browser.wait(current, wait_seconds, stop_on_user_action=False)
+    else:
+        if not prompt:
+            return reply("Error: give a prompt describing the texture.")
+        current = browser.start(prompt, name, tileable, reference_image)
+        await browser.wait(current, wait_seconds)
+    if current.status != "done":
+        shot = [current.screenshot] if current.status == "failed" else []
+        if current.status == "failed" and current.screenshot:
+            current.screenshot = None  # Show it once.
+        return reply(chatgpt_textures.describe(current), shot)
+    if current.material_reply:
+        return reply(current.material_reply, [current.preview_jpeg])
     try:
-        if job:
-            parsed = generation.Job.parse(job, name or "World")
-            if not parsed.is_world:
-                return f'Error: that is a 3D model job. Resume it with generate_3d(job="{job}").'
-            return await _world_reply(ctx, parsed, wait_seconds, resolution)
-        if bool(prompt) == bool(image):
-            return "Error: give exactly one of prompt or image."
-        status = _worldlabs_status(get_blender_connection())
-        if not status.get("enabled"):
-            return "Error: " + " ".join(str(status.get("message") or "World Labs is not available.").split())
-        note = ""
-        pending = _pending_generations()
-        key = generation.request_key("worldlabs", prompt, image, None, None)
-        started = pending.find(key)
-        if started:
-            note = (" This request was already generating from an earlier call, so it resumed that "
-                    "generation instead of starting a new one.")
-        else:
-            started = generation.submit_world(
-                _generation_send, name or (generation.default_name(prompt) if prompt else "World"),
-                prompt, image)
-            pending.add(key, started)
-        remaining = wait_seconds - (time.monotonic() - call_start)
-        return await _world_reply(ctx, started, remaining, resolution, note)
-    except generation.GenerationError as e:
-        return f"Error: {e}"
+        current.material_reply = _texture_material(current, apply_to, tile_size, projection, bump)
     except Exception as e:
-        logger.error(f"Error generating world: {e}")
-        return f"Error generating world: {e}"
+        return reply(f"The image was made ({current.image_path}) but building the material failed: {e}. "
+                     f"Call generate_texture(job=\"{current.id}\", apply_to=[...]) to retry, or load the image "
+                     "with execute_blender_code.", [current.preview_jpeg])
+    return reply(f"{current.material_reply} Image file: {current.image_path}", [current.preview_jpeg])
 
 
 ASSET_SOURCES = ("polyhaven", "sketchfab", "polypizza")
