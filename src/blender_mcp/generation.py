@@ -113,7 +113,11 @@ class Job:
         provider, kind, ident = (handle.split(":", 2) + ["", ""])[:3]
         if (provider not in PROVIDERS + WORLD_PROVIDERS or not kind or not ident
                 or (provider == "meshy" and kind not in MESHY_KINDS)
-                or (provider == "worldlabs" and kind not in WORLDLABS_KINDS)):
+                or (provider == "worldlabs" and kind not in WORLDLABS_KINDS)
+                # A Rodin main-site job carries "<uuid>|<subscription_key>";
+                # poll() splits on "|" and would raise IndexError on a handle
+                # without it. Reject it here instead, like any other bad handle.
+                or (provider == "hyper3d" and kind == "main" and "|" not in ident)):
             raise GenerationError(f"Not a generation job handle: {handle!r}")
         return cls(provider, kind, ident, name)
 
